@@ -423,7 +423,7 @@ class DreamLoRA(LM):
             model_name="dream", 
             model_type="diffusion_lm",
             enforce_eager=True, 
-            tensor_parallel_size=1,
+            tensor_parallel_size=2,
             gpu_memory_utilization=0.60,
             max_num_batched_tokens=2048,
             max_num_seqs=20,
