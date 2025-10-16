@@ -29,6 +29,7 @@ base_model=/home/xiongjing/resource_dir/models/Dream-v0-Base-7B
 # Distributed training configuration
 master_addr="localhost"
 master_port=29522
+accelerate_port=29523  # Separate port for accelerate launch
 tensor_parallel_size=1  # Set to 1 for single GPU, 2 for dual GPU
 
 lora_models=(
@@ -109,7 +110,7 @@ for lora_model in "${lora_models[@]}"; do
         else
             humaneval_model_args="pretrained=${base_model},lora_path=${lora_model},max_new_tokens=${HUMANEVAL_LENGTHS_ARRAY[$i]},diffusion_steps=${HUMANEVAL_DIFFUSION_STEPS_ARRAY[$i]},temperature=${HUMANEVAL_TEMP_ARRAY[$i]},top_p=${HUMANEVAL_TOP_PS_ARRAY[$i]},add_bos_token=true,escape_until=true,block_size=${HUMANEVAL_BLOCK_SIZES_ARRAY[$i]},block_add_threshold=${HUMANEVAL_BLOCK_ADD_THRESHOLDS_ARRAY[$i]},skip_threshold=${HUMANEVAL_SKIP_THRESHOLDS_ARRAY[$i]},decoded_token_threshold=${HUMANEVAL_DECODED_TOKEN_THRESHOLDS_ARRAY[$i]},dtype=${HUMANEVAL_DTYPES_ARRAY[$i]},sampling_strategy=${HUMANEVAL_SAMPLING_STRATEGIES_ARRAY[$i]},tensor_parallel_size=${tensor_parallel_size},master_addr=${master_addr},master_port=${master_port},save_dir=${output_path}"
         fi
-        CUDA_VISIBLE_DEVICES=0 accelerate launch --main_process_port ${master_port} --num_processes 1 eval_dream_d2f_vllm.py --model dream_lora \
+        CUDA_VISIBLE_DEVICES=0 accelerate launch --main_process_port ${accelerate_port} --num_processes 1 eval_dream_d2f_vllm.py --model dream_lora \
             --model_args $humaneval_model_args \
             --tasks humaneval \
             --num_fewshot ${HUMANEVAL_NSHOTS_ARRAY[$i]} \
@@ -126,7 +127,7 @@ for lora_model in "${lora_models[@]}"; do
     #     else
     #         model_args="pretrained=${base_model},lora_path=${lora_model},max_new_tokens=${LENGTH_ARRAY[$i]},diffusion_steps=${LENGTH_ARRAY[$i]},add_bos_token=true,temperature=${TEMP_ARRAY[$i]},top_p=${TOP_PS_ARRAY[$i]},block_size=${BLOCK_SIZES_ARRAY[$i]},block_add_threshold=${BLOCK_ADD_THRESHOLDS_ARRAY[$i]},skip_threshold=${SKIP_THRESHOLDS_ARRAY[$i]},decoded_token_threshold=${DECODED_TOKEN_THRESHOLDS_ARRAY[$i]},dtype=${DTYPES_ARRAY[$i]},sampling_strategy=${SAMPLING_STRATEGIES_ARRAY[$i]},master_addr=${master_addr},master_port=${master_port},save_dir=${output_path}"
     #     fi
-    #     CUDA_VISIBLE_DEVICES=3,4 accelerate launch --main_process_port ${master_port} --num_processes 2 eval_dream_d2f_vllm.py --model dream_lora \
+    #     CUDA_VISIBLE_DEVICES=3,4 accelerate launch --main_process_port ${accelerate_port} --num_processes 2 eval_dream_d2f_vllm.py --model dream_lora \
     #         --model_args $model_args \
     #         --tasks ${TASKS_ARRAY[$i]} \
     #         --limit ${LIMITS_ARRAY[$i]} \

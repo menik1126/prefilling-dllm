@@ -240,6 +240,8 @@ class DreamLoRA(LM):
         sampling_strategy: Optional[str] = "default",  # Added sampling_strategy parameter
         save_dir: Optional[str] = None,
         tensor_parallel_size: Optional[int] = 1,  # Added tensor_parallel_size parameter
+        master_addr: Optional[str] = "localhost",  # Added master_addr parameter
+        master_port: Optional[int] = 2333,  # Added master_port parameter
         **kwargs,
     ) -> None:
         super().__init__()
@@ -309,6 +311,8 @@ class DreamLoRA(LM):
         self.decoded_token_threshold = decoded_token_threshold  # New decoded_token_threshold attribute
         self.save_dir = save_dir
         self.tensor_parallel_size = tensor_parallel_size  # Save tensor_parallel_size parameter
+        self.master_addr = master_addr  # Save master_addr parameter
+        self.master_port = master_port  # Save master_port parameter
         
         # Add metric tracking
         self.total_forward_passes = 0
@@ -426,6 +430,8 @@ class DreamLoRA(LM):
             model_type="diffusion_lm",
             enforce_eager=True, 
             tensor_parallel_size=self.tensor_parallel_size,
+            master_addr=self.master_addr,
+            master_port=self.master_port,
             gpu_memory_utilization=0.60,
             max_num_batched_tokens=2048,
             max_num_seqs=20,
