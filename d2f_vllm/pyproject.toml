@@ -1,0 +1,45 @@
+[project]
+name = "d2f_vllm"
+version = "0.0.1"
+authors = [
+    { name = "Drew Jin (Yijie Jin)", email = "drewjin0827@gmail.com"},
+]
+maintainers = [
+    { name = "SJTU DENG Lab" }
+]
+description = "vLLM implementation of Diffusion LLMs (based on D2F decoding paradigm)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    "accelerate>=1.9.0",
+    "bpytop>=1.0.68",
+    "datasets>=4.0.0",
+    "easydict>=1.13",
+    "einops>=0.8.1",
+    "keep-gpu>=0.2.0",
+    "numpy>=2.3.1",
+    "nvitop>=1.5.2",
+    "peft>=0.16.0",
+    "pip>=25.1.1",
+    "pytest>=8.4.1",
+    "pyyaml>=6.0.2",
+    "setuptools>=80.9.0",
+    "torch",
+    "tqdm>=4.67.1",
+    "transformers>=4.53.2",
+    "viztracer>=1.0.4",
+    "matplotlib>=3.10.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/zhijie-group/d2f_vllm"
+Repository = "https://zhijie-group.github.io/d2f_vllm"
+"Organization" = "https://github.com/zhijie-group"
+
+[tool.setuptools.packages.find]
+include = ["d2f_vllm"]
+
+[[tool.uv.index]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+default = true
