@@ -374,6 +374,7 @@ class RotaryEmbedding(nn.Module):
         self.__cache = cache
         # Warm up cache.
         self.rope_theta = config.rope_theta
+        self.ntk_scale_factor = 1.0
         self.get_rotary_embedding(config.max_sequence_length, _non_meta_init_device(config))
 
     def get_rotary_embedding(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -393,7 +394,19 @@ class RotaryEmbedding(nn.Module):
 
         with torch.autocast(device.type, enabled=False):
             dim = self.config.d_model // self.config.n_heads
-            inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim))
+            scale = self.ntk_scale_factor
+            freqs = self.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
+            inv_freq_base = 1.0 / freqs
+            if scale <= 1.0:
+                inv_freq = inv_freq_base
+            else:
+                # NTK-by-parts (YaRN): high-freq dims unchanged, low-freq dims linearly scaled
+                original_max_len = self.config.max_sequence_length
+                beta_fast = 32  # high-freq boundary
+                beta_slow = 1   # low-freq boundary
+                r = original_max_len * inv_freq_base / (2 * math.pi)
+                gamma = ((r - beta_slow) / (beta_fast - beta_slow)).clamp(0, 1)
+                inv_freq = (1 - gamma) * inv_freq_base / scale + gamma * inv_freq_base
             seq = torch.arange(seq_len, device=device, dtype=torch.float)
             freqs = einsum("i , j -> i j", seq, inv_freq)
             positions = torch.cat((freqs, freqs), dim=-1)

@@ -119,7 +119,7 @@ for lora_model in "${lora_models[@]}"; do
             --model_args $humaneval_model_args \
             --tasks humaneval \
             --num_fewshot ${HUMANEVAL_NSHOTS_ARRAY[$i]} \
-            --batch_size 5 \
+            --batch_size 1 \
             --output_path $output_path \
             --log_samples \
             --confirm_run_unsafe_code
@@ -143,7 +143,7 @@ for lora_model in "${lora_models[@]}"; do
             --tasks ${TASKS_ARRAY[$i]} \
             --limit ${LIMITS_ARRAY[$i]} \
             --num_fewshot ${NSHOTS_ARRAY[$i]} \
-            --batch_size 5 \
+            --batch_size 1 \
             --output_path $output_path \
             --log_samples \
             --confirm_run_unsafe_code \

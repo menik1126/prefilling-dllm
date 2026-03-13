@@ -224,6 +224,7 @@ class DreamGenerationMixin:
         """
         # priority: `generation_config` argument > `model.generation_config` (the default generation config)
         using_model_generation_config = False
+        _kwargs = kwargs
         if generation_config is None:
             generation_config = DreamGenerationConfig.from_model_config(self.config)
             using_model_generation_config = True
@@ -245,7 +246,7 @@ class DreamGenerationMixin:
                 if generation_config.mask_token_id is None:
                     generation_config.mask_token_id = self.generation_config.mask_token_id
 
-        return generation_config
+        return generation_config, _kwargs
 
     def _prepare_special_tokens(
         self,
@@ -301,7 +302,7 @@ class DreamGenerationMixin:
         **kwargs,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
-        generation_config = self._prepare_generation_config(generation_config, **kwargs)
+        generation_config, _ = self._prepare_generation_config(generation_config, **kwargs)
         generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
         generation_logits_hook_func = kwargs.pop("generation_logits_hook_func", lambda step, x, logits: logits)
 

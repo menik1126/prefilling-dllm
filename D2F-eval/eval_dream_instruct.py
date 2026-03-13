@@ -16,15 +16,12 @@ import torch
 mock_vlms = MagicMock()
 sys.modules["lm_eval.models.hf_vlms"] = mock_vlms
 
-# Stub out torch.distributed.tensor imports used by newer transformers on older or partial torch builds
-if not hasattr(torch.distributed, "tensor") or not hasattr(torch.distributed.tensor, "parallel"):
+# Stub out torch.distributed.tensor to fix PEFT/Lora loading issue on old torch versions
+if not hasattr(torch.distributed, "tensor"):
     class DTensorStub: pass
     mock_dist_tensor = MagicMock()
     mock_dist_tensor.DTensor = DTensorStub
-    mock_dist_parallel = MagicMock()
-    mock_dist_tensor.parallel = mock_dist_parallel
     sys.modules["torch.distributed.tensor"] = mock_dist_tensor
-    sys.modules["torch.distributed.tensor.parallel"] = mock_dist_parallel
     torch.distributed.tensor = mock_dist_tensor
 
 # Ensure transformers has the attribute too if anyone checks
@@ -64,52 +61,19 @@ def shift_logits(logits):
     shifted_logits[:, 0, :] = 1.0
     return shifted_logits
 
+
 def create_full_block_attention_mask(prompt_length, max_length, block_size, device=None, dtype=None):
-    """
-    Creates a complete attention mask for the entire sequence with block-based causal attention.
-    
-    Args:
-        prompt_length: Length of the prompt (first irregular block)
-        max_length: Maximum total sequence length
-        block_size: Size of each regular block
-        device: Device to create tensor on
-        dtype: Data type for the attention mask
-        
-    Returns:
-        attention_mask: Tensor of shape [1, 1, max_length, max_length]
-    """
-    # Use the provided dtype or default to bfloat16
-    if dtype is None:
-        dtype = torch.bfloat16
-    
-    # Initialize mask with -inf (no attention)
+    if dtype is None: dtype = torch.bfloat16
     attention_mask = torch.full((1, 1, max_length, max_length), -torch.inf, device=device, dtype=dtype)
-    
-    # Block 0: Prompt (can see itself)
-    attention_mask[:, :, :prompt_length, :prompt_length] = 0
-    
-    # Calculate the number of regular blocks after prompt
-    remaining_length = max_length - prompt_length
-    num_blocks = (remaining_length + block_size - 1) // block_size
-    
-    # Process each regular block
-    for b in range(num_blocks):
-        block_start = prompt_length + b * block_size
-        block_end = min(prompt_length + (b + 1) * block_size, max_length)
-        
-        # Current block can see the prompt
-        attention_mask[:, :, block_start:block_end, :prompt_length] = 0
-        
-        # Current block can see all previous regular blocks
-        for prev_b in range(b):
-            prev_start = prompt_length + prev_b * block_size
-            prev_end = min(prompt_length + (prev_b + 1) * block_size, max_length)
-            attention_mask[:, :, block_start:block_end, prev_start:prev_end] = 0
-        
-        # Current block can see itself (full attention within block)
-        attention_mask[:, :, block_start:block_end, block_start:block_end] = 0
-    
+    indices = torch.arange(max_length, device=device)
+    row_block = (indices - prompt_length) // block_size
+    row_block[indices < prompt_length] = -1
+    col_block = (indices - prompt_length) // block_size
+    col_block[indices < prompt_length] = -1
+    mask = (col_block[None, :] <= row_block[:, None])
+    attention_mask[0, 0, mask] = 0
     return attention_mask
+
 
 def extract_attention_mask(full_mask, start_pos, input_length, cache_length):
     """
@@ -227,12 +191,12 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
     
     return confidence, x0, initial_confidence
 
-@register_model("dream_lora")
-class DreamLoRA(LM):
+@register_model("dream_instruct")
+class DreamInstruct(LM):
     def __init__(
         self,
         pretrained: Union[str, transformers.PreTrainedModel],
-        lora_path: str,
+        lora_path: Optional[str] = None,
         batch_size: Optional[Union[int, str]] = 1,
         device: Optional[str] = "cuda",
         dtype: Optional[Union[str, torch.dtype]] = "auto",
@@ -454,9 +418,7 @@ class DreamLoRA(LM):
             **load_kwargs
         ).eval()
         
-        # Load LoRA config and model
-        config = PeftConfig.from_pretrained(self.lora_path)
-        self.model = PeftModel.from_pretrained(self.model, self.lora_path)
+        # LoRA loading skipped
         
         # Only convert data type if target_dtype is not None and not "auto"
         if target_dtype is not None and target_dtype != "auto":
@@ -605,10 +567,15 @@ class DreamLoRA(LM):
             step = 0
             eos_detected = False  # EOS detection flag
             
+            print(f"DEBUG: START LOOP max_new={self.max_new_tokens} block_size={block_size}"); step=0
+
+            
             while current_blocks >= 0:
                 step += 1
                 
                 # Check if a new block needs to be added
+                print(f"DEBUG: Step {step} check: len={len(block_states)} eos={eos_detected}");
+
                 if len(block_states)-1 < (self.max_new_tokens // block_size) and not eos_detected:
                     last_block_id = len(block_states) - 1
                     current_progress = (block_states[last_block_id]['total_masks'] - 
@@ -786,6 +753,8 @@ class DreamLoRA(LM):
                             all_indices = high_conf_indices
                         
                         # Update tokens
+                        print(f"DEBUG: Step {step} sampling: block={block_id} all_indices={all_indices} x0={x0[all_indices]}");
+
                         if len(all_indices) > 0:
                             x0_ = torch.zeros_like(x0, device=self.device, dtype=torch.long) + mask_id
                             x0_[all_indices] = x0[all_indices].clone()

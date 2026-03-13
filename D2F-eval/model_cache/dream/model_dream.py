@@ -265,7 +265,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Dream
 class DreamMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -803,7 +803,7 @@ class DreamBaseModel(DreamPreTrainedModel):
         config: DreamConfig
     """
 
-    def __init__(self, config: DreamConfig):
+    def __init__(self, config: DreamConfig, **kwargs):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -938,7 +938,7 @@ class DreamBaseModel(DreamPreTrainedModel):
 class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
         self.model = DreamBaseModel(config)
         self.vocab_size = config.vocab_size
