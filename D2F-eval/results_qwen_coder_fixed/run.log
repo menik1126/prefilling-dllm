@@ -1,0 +1,73 @@
+Model tag          : qwen2.5-coder-1.5b-fixed
+Prompt token limit : 16284
+Pre-truncation chars: 97,704  (=16284x6)
+Loading tokenizer from model_weights/Qwen2.5-Coder-1.5B ...
+Loading model from model_weights/Qwen2.5-Coder-1.5B ...
+Sliding Window Attention is enabled but not implemented for `sdpa`; unexpected results may be encountered.
+  Prompt token limit   : 16284
+  Newline token count  : 2178 tokens trigger stop
+
+============================================================
+Config: medium_context
+============================================================
+  Total: 224, top 100.0% = 224 items
+  Context length threshold: >= 73,735 chars
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+  [5/224] done
+  [10/224] done
+  [15/224] done
+  [20/224] done
+  [25/224] done
+  [30/224] done
+  [35/224] done
+  [40/224] done
+  [45/224] done
+  [50/224] done
+  [55/224] done
+  [60/224] done
+  [65/224] done
+  [70/224] done
+  [75/224] done
+  [80/224] done
+  [85/224] done
+  [90/224] done
+  [95/224] done
+  [100/224] done
+  [105/224] done
+  [110/224] done
+  [115/224] done
+  [120/224] done
+  [125/224] done
+  [130/224] done
+  [135/224] done
+  [140/224] done
+  [145/224] done
+  [150/224] done
+  [155/224] done
+  [160/224] done
+  [165/224] done
+  [170/224] done
+  [175/224] done
+  [180/224] done
+  [185/224] done
+  [190/224] done
+  [195/224] done
+  [200/224] done
+  [205/224] done
+  [210/224] done
+  [215/224] done
+  [220/224] done
+
+Predictions saved to: results_qwen_coder_fixed/qwen2.5-coder-1.5b-fixed_plcc_medium_context_top100pct_predictions.jsonl
+
+=== PLCC medium_context Metrics ===
+  commited            : EM=0.1302, ES=0.4119  (n_repos=89)
+  common              : EM=0.1165, ES=0.3788  (n_repos=127)
+  infile              : EM=0.1229, ES=0.3847  (n_repos=183)
+  inproject           : EM=0.1231, ES=0.3751  (n_repos=150)
+  non_informative     : EM=0.1751, ES=0.4526  (n_repos=224)
+  random              : EM=0.1502, ES=0.3735  (n_repos=224)
+  overall             : EM=0.1406, ES=0.3977  (n_repos=997)
+Metrics saved to: results_qwen_coder_fixed/qwen2.5-coder-1.5b-fixed_plcc_medium_context_top100pct_metrics.json
+
+All configs combined metrics: results_qwen_coder_fixed/qwen2.5-coder-1.5b-fixed_plcc_all_top100pct_metrics.json
