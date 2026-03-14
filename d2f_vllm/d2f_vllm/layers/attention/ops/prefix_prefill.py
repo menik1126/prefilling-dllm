@@ -57,12 +57,12 @@ def _fwd_kernel_d2f(Q, K, V, Mask,
     cur_head = tl.program_id(1)
     start_m = tl.program_id(2)
 
-    tl.device_print("=" * 60, cur_batch)
-    tl.device_print("Program Start", cur_batch)
-    tl.device_print("=" * 60, cur_batch)
-    tl.device_print("cur_batch", cur_batch)
-    tl.device_print("cur_head", cur_head)
-    tl.device_print("start_m", start_m)
+    # tl.device_print("=" * 60, cur_batch)
+    # tl.device_print("Program Start", cur_batch)
+    # tl.device_print("=" * 60, cur_batch)
+    # tl.device_print("cur_batch", cur_batch)
+    # tl.device_print("cur_head", cur_head)
+    # tl.device_print("start_m", start_m)
 
     cur_kv_head = cur_head // num_queries_per_kv
 
@@ -103,9 +103,9 @@ def _fwd_kernel_d2f(Q, K, V, Mask,
         start_n = tl.multiple_of(start_n, BLOCK_SIZE)
         # ---- compute qk ----
         bn = tl.load(B_Loc + cur_batch * stride_b_loc_b + (start_n // BLOCK_SIZE) * stride_b_loc_s)
-        tl.device_print("[CTX] start_n=", start_n)
-        tl.device_print("[CTX] bn=", bn)
-        tl.device_print("[CTX] ctx_len=", cur_batch_ctx_len)
+        # tl.device_print("[CTX] start_n=", start_n)
+        # tl.device_print("[CTX] bn=", bn)
+        # tl.device_print("[CTX] ctx_len=", cur_batch_ctx_len)
         # [D,BLOCK_SIZE]
         offs_k = (bn[None, :] * stride_k_cache_bs + cur_kv_head * stride_k_cache_h + 
                   (offs_d[:, None] // x) * stride_k_cache_d + 
@@ -185,9 +185,9 @@ def _fwd_kernel_d2f(Q, K, V, Mask,
     # compute query against itself (with custom dense mask)
     for start_n in tl.range(0, block_mask * (start_m + 1) * BLOCK_M, BLOCK_N, loop_unroll_factor=num_unroll_request):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        tl.device_print("[SELF] start_n=", start_n)
-        tl.device_print("[SELF] q_len=", cur_batch_query_len)
-        tl.device_print("[SELF] block_mask=", block_mask)
+        # tl.device_print("[SELF] start_n=", start_n)
+        # tl.device_print("[SELF] q_len=", cur_batch_query_len)
+        # tl.device_print("[SELF] block_mask=", block_mask)
         # ---- compute qk ----
         k = tl.load(k_ptrs + (cur_batch_in_all_start_index + start_n) * stride_kbs,
                     mask=dim_mask[:, None] & ((start_n + offs_n[None, :]) < cur_batch_query_len),
@@ -202,13 +202,13 @@ def _fwd_kernel_d2f(Q, K, V, Mask,
         #               float("-inf"))
         
         # TODO apply block-wise causal mask
-        offs_mask = offs_m[:, None] * stride_mask_m + (start_n + offs_n[None, :]) * stride_mask_n
+        offs_mask = (cur_batch_in_all_start_index + offs_m[:, None]) * stride_mask_m + (cur_batch_in_all_start_index + start_n + offs_n[None, :]) * stride_mask_n
         mask_ptrs = Mask + offs_mask
         m_mask = (offs_m[:, None] < cur_batch_query_len) & ((start_n + offs_n[None, :]) < cur_batch_query_len)
         mask = tl.load(mask_ptrs, mask=m_mask, other=False)
         qk = tl.where(mask, qk, float("-inf"))
         valid_cnt = tl.sum(mask, axis=1)
-        tl.device_print("[SELF] valid per-row row0=", valid_cnt)
+        # tl.device_print("[SELF] valid per-row row0=", valid_cnt)
         if SLIDING_WINDOW > 0:
             qk = tl.where(offs_m[:, None] - (start_n + offs_n[None, :]) < SLIDING_WINDOW, qk, -10000)
 
@@ -236,7 +236,7 @@ def _fwd_kernel_d2f(Q, K, V, Mask,
     off_o = (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs + cur_head * stride_oh + offs_d[None, :] * stride_od
     out_ptrs = Out + off_o
     tl.store(out_ptrs, acc, mask=dim_mask[None, :] & (offs_m[:, None] < cur_batch_query_len))
-    tl.device_print("\n\n", cur_batch)
+    # tl.device_print("\n\n", cur_batch)
     return
 
 
