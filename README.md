@@ -320,6 +320,57 @@ shell eval_llada.sh
 ```
 The results will be saved in the `output_path` specified within the shell scripts.
 
+### 2.1 PLCC with ParallelComp-Style Compression (Experimental)
+
+This repo also contains an experimental Dream-based integration of ParallelComp-style
+prompt/cache compression for project-level code completion (PLCC).
+
+Main files:
+
+- `D2F-eval/eval_dream.py`: core Dream runtime plus the added compression logic.
+- `D2F-eval/eval_d2f_plcc.py`: PLCC evaluation entrypoint with `parallelcomp_*` CLI flags.
+
+Example command:
+
+```shell
+cd D2F-eval
+
+python eval_d2f_plcc.py \
+  --model_type dream \
+  --pretrained /path/to/Dream-v0-Base-7B \
+  --configs medium_context \
+  --top_percent 30 \
+  --max_length 2048 \
+  --max_new_tokens 128 \
+  --rope_scale_factor 1.0 \
+  --local_input_data_template /path/to/artifacts/python/qwen2.5-coder-1.5b/{config}/in/model_inputs_composer_path_distance.json \
+  --parallelcomp_cache_compress_mode \
+  --parallelcomp_chunk_size 512 \
+  --parallelcomp_query_tokens 128 \
+  --parallelcomp_topk_chunks 6 \
+  --parallelcomp_min_prompt_tokens 1024 \
+  --parallelcomp_token_capacity 256 \
+  --parallelcomp_token_keep_min 32 \
+  --parallelcomp_structural_bias \
+  --output_dir ./results_parallelcomp_plcc
+```
+
+Key flags:
+
+- `--parallelcomp_cache_compress_mode`: enables the compression path in `eval_dream.py`.
+- `--parallelcomp_chunk_size`: size of each prompt/cache chunk before block ranking.
+- `--parallelcomp_topk_chunks`: number of chunks kept after global chunk scoring.
+- `--parallelcomp_query_tokens`: tail tokens used as the scoring query.
+- `--parallelcomp_token_capacity`: per-kept-chunk token budget after token eviction.
+- `--parallelcomp_token_keep_min`: minimum tokens preserved inside each kept chunk.
+- `--parallelcomp_structural_bias`: enables shallow/middle/deep layer structural priors during token eviction.
+
+Notes:
+
+- This path is experimental and is currently intended for Dream PLCC runs.
+- The current implementation lives entirely in the eval/runtime path; it does not modify training.
+- For our local PLCC setup, `--local_input_data_template` should point to preprocessed `model_inputs_*.json`.
+
 > ### ❗️ Important Notice for HumanEval
 > The `HumanEval` benchmark requires a post-processing step to sanitize the generated code and calculate the final `pass@1` score. After the evaluation script finishes, run the following command:
 > ```shell

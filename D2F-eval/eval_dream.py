@@ -2,6 +2,8 @@ import logging
 import gc
 import time
 import json
+import math
+import importlib
 from datetime import timedelta
 from typing import List, Optional, Tuple, Type, TypeVar, Union
 import torch
@@ -16,15 +18,13 @@ import torch
 mock_vlms = MagicMock()
 sys.modules["lm_eval.models.hf_vlms"] = mock_vlms
 
-# Stub out torch.distributed.tensor imports used by newer transformers on older or partial torch builds
-if not hasattr(torch.distributed, "tensor") or not hasattr(torch.distributed.tensor, "parallel"):
+# Stub out torch.distributed.tensor to fix PEFT/Lora loading issue on old torch versions
+dist_tensor_spec = importlib.util.find_spec("torch.distributed.tensor")
+if not hasattr(torch.distributed, "tensor") and dist_tensor_spec is None:
     class DTensorStub: pass
     mock_dist_tensor = MagicMock()
     mock_dist_tensor.DTensor = DTensorStub
-    mock_dist_parallel = MagicMock()
-    mock_dist_tensor.parallel = mock_dist_parallel
     sys.modules["torch.distributed.tensor"] = mock_dist_tensor
-    sys.modules["torch.distributed.tensor.parallel"] = mock_dist_parallel
     torch.distributed.tensor = mock_dist_tensor
 
 # Ensure transformers has the attribute too if anyone checks
@@ -139,6 +139,71 @@ def extract_attention_mask(full_mask, start_pos, input_length, cache_length):
     extracted_mask[:, :, :, cache_length:] = full_mask[:, :, start_pos:end_pos, start_pos:end_pos]
     
     return extracted_mask
+
+def build_sparse_block_attention_mask(
+    query_block_ids: torch.Tensor,
+    cached_length: int,
+    query_prompt_window_mask: Optional[torch.Tensor] = None,
+    update_kvcache: int = 0,
+    device=None,
+    dtype=None,
+):
+    """
+    Build the D2F block-structured attention mask from block ids in physical order.
+
+    RoPE positions are handled separately; this mask only controls which cached/current
+    tokens are visible according to D2F's block scheduling.
+    """
+    if dtype is None:
+        dtype = torch.bfloat16
+    if device is None:
+        device = query_block_ids.device
+
+    query_block_ids = query_block_ids.to(device=device, dtype=torch.long)
+
+    q_len = query_block_ids.shape[0]
+    k_len = cached_length + q_len
+    attention_mask = torch.full((1, 1, q_len, k_len), -torch.inf, device=device, dtype=dtype)
+
+    if q_len == 0:
+        return attention_mask
+
+    if cached_length > 0:
+        attention_mask[:, :, :, :cached_length] = 0
+
+    if query_prompt_window_mask is None:
+        query_prompt_window_mask = torch.zeros(q_len, device=device, dtype=torch.bool)
+    else:
+        query_prompt_window_mask = query_prompt_window_mask.to(device=device, dtype=torch.bool)
+
+    for row_idx, q_block_id in enumerate(query_block_ids.tolist()):
+        if row_idx < update_kvcache and query_prompt_window_mask[row_idx]:
+            visible_current = query_block_ids == q_block_id
+        else:
+            visible_current = query_block_ids <= q_block_id
+        attention_mask[0, 0, row_idx, cached_length:][visible_current] = 0
+
+    return attention_mask
+
+def build_per_layer_sparse_block_attention_mask(
+    query_block_ids: torch.Tensor,
+    cached_positions_per_layer: List[torch.Tensor],
+    query_prompt_window_mask: Optional[torch.Tensor] = None,
+    update_kvcache: int = 0,
+    device=None,
+    dtype=None,
+) -> List[torch.Tensor]:
+    return [
+        build_sparse_block_attention_mask(
+            query_block_ids=query_block_ids,
+            cached_length=layer_cached_positions.shape[0],
+            query_prompt_window_mask=query_prompt_window_mask,
+            update_kvcache=update_kvcache,
+            device=device,
+            dtype=dtype,
+        )
+        for layer_cached_positions in cached_positions_per_layer
+    ]
 
 def build_custom_float_attention_mask(input_ids, prompt_length, block_size, device=None, dtype=None):
     B, seq_len = input_ids.shape
@@ -261,6 +326,19 @@ class DreamLoRA(LM):
         skip_threshold: Optional[float] = 1.0,  # Added skip_threshold parameter
         sampling_strategy: Optional[str] = "default",  # Added sampling_strategy parameter
         save_dir: Optional[str] = None,
+        parallelcomp_mode: Optional[bool] = False,
+        parallelcomp_chunk_size: Optional[int] = 256,
+        parallelcomp_query_tokens: Optional[int] = 128,
+        parallelcomp_topk_chunks: Optional[int] = 4,
+        parallelcomp_min_prompt_tokens: Optional[int] = 1024,
+        parallelcomp_keep_first_chunk: Optional[bool] = False,
+        parallelcomp_hidden_topk: Optional[int] = 32,
+        parallelcomp_token_capacity: Optional[int] = 128,
+        parallelcomp_token_keep_min: Optional[int] = 32,
+        parallelcomp_high_score_threshold: Optional[float] = None,
+        parallelcomp_cache_compress_mode: Optional[bool] = False,
+        parallelcomp_structural_bias: Optional[bool] = True,
+        parallelcomp_structural_bias_strength: Optional[float] = 0.2,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -329,6 +407,19 @@ class DreamLoRA(LM):
         self.sampling_strategy = sampling_strategy  # Save sampling strategy parameter
         self.decoded_token_threshold = decoded_token_threshold  # New decoded_token_threshold attribute
         self.save_dir = save_dir
+        self.parallelcomp_mode = parallelcomp_mode
+        self.parallelcomp_chunk_size = parallelcomp_chunk_size
+        self.parallelcomp_query_tokens = parallelcomp_query_tokens
+        self.parallelcomp_topk_chunks = parallelcomp_topk_chunks
+        self.parallelcomp_min_prompt_tokens = parallelcomp_min_prompt_tokens
+        self.parallelcomp_keep_first_chunk = parallelcomp_keep_first_chunk
+        self.parallelcomp_hidden_topk = parallelcomp_hidden_topk
+        self.parallelcomp_token_capacity = parallelcomp_token_capacity
+        self.parallelcomp_token_keep_min = parallelcomp_token_keep_min
+        self.parallelcomp_high_score_threshold = parallelcomp_high_score_threshold
+        self.parallelcomp_cache_compress_mode = parallelcomp_cache_compress_mode
+        self.parallelcomp_structural_bias = parallelcomp_structural_bias
+        self.parallelcomp_structural_bias_strength = parallelcomp_structural_bias_strength
         
         # Add metric tracking
         self.total_forward_passes = 0
@@ -476,6 +567,1093 @@ class DreamLoRA(LM):
         return self.tokenizer(
             text, return_tensors="pt", add_special_tokens=add_special_tokens
         ).input_ids
+
+    def _build_full_visible_attention_mask(self, seq_len: int) -> torch.Tensor:
+        dtype = self.target_dtype if self.target_dtype is not None and self.target_dtype != "auto" else torch.bfloat16
+        return torch.zeros((1, 1, seq_len, seq_len), device=self.device, dtype=dtype)
+
+    def _build_causal_attention_mask(self, seq_len: int) -> torch.Tensor:
+        dtype = self.target_dtype if self.target_dtype is not None and self.target_dtype != "auto" else torch.bfloat16
+        mask = torch.full((1, 1, seq_len, seq_len), -torch.inf, device=self.device, dtype=dtype)
+        tri = torch.tril(torch.ones((seq_len, seq_len), device=self.device, dtype=torch.bool))
+        mask[0, 0, tri] = 0
+        return mask
+
+    def _analyze_chunk_with_attentions(
+        self, chunk_ids: List[int], query_ids: List[int]
+    ) -> Tuple[float, torch.Tensor]:
+        joint_ids = torch.tensor([chunk_ids + query_ids], device=self.device, dtype=torch.long)
+        attention_mask = self._build_full_visible_attention_mask(joint_ids.shape[1])
+
+        with torch.inference_mode():
+            outputs = self.model(
+                joint_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        attn_layers = outputs.attentions
+        if attn_layers is None or len(attn_layers) == 0:
+            return float("-inf"), torch.empty(0, device=self.device)
+
+        selected_layers = attn_layers[-4:] if len(attn_layers) >= 4 else attn_layers
+        stacked_attn = torch.stack(selected_layers, dim=0).mean(dim=0)[0]
+
+        chunk_len = len(chunk_ids)
+        query_len = len(query_ids)
+        if chunk_len == 0 or query_len == 0:
+            return float("-inf"), torch.empty(0, device=self.device)
+
+        cross_attn = stacked_attn[:, chunk_len:chunk_len + query_len, :chunk_len]
+        if cross_attn.numel() == 0:
+            return float("-inf"), torch.empty(0, device=self.device)
+
+        token_scores = cross_attn.mean(dim=0).sum(dim=0)
+        topk = min(max(1, self.parallelcomp_hidden_topk), token_scores.shape[0])
+        score = token_scores.topk(topk).values.mean().item()
+        return float(score), token_scores
+
+    def _score_chunk_with_self_information(
+        self, chunk_ids: List[int], query_ids: List[int]
+    ) -> float:
+        if len(chunk_ids) == 0 or len(query_ids) == 0:
+            return float("inf")
+
+        joint_ids = torch.tensor([chunk_ids + query_ids], device=self.device, dtype=torch.long)
+        attention_mask = self._build_causal_attention_mask(joint_ids.shape[1])
+
+        with torch.inference_mode():
+            outputs = self.model(
+                joint_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        logits = outputs.logits
+        chunk_len = len(chunk_ids)
+        query_len = len(query_ids)
+        if logits.shape[1] < chunk_len + query_len - 1:
+            return float("inf")
+
+        query_logits = logits[:, chunk_len - 1:chunk_len + query_len - 1, :]
+        query_labels = joint_ids[:, chunk_len:chunk_len + query_len]
+        log_probs = F.log_softmax(query_logits, dim=-1)
+        token_nll = -log_probs.gather(dim=-1, index=query_labels.unsqueeze(-1)).squeeze(-1)
+        return float(token_nll.mean().item())
+
+    def _score_prompt_blocks_with_hidden_resonance(
+        self,
+        x_t: torch.Tensor,
+        block_states,
+        candidate_block_ids: List[int],
+        query_block_id: int,
+        stable_prefix_len: int,
+    ) -> dict:
+        if not candidate_block_ids or query_block_id not in block_states or stable_prefix_len <= 0:
+            return {}
+
+        prompt_ids = x_t[:, :stable_prefix_len]
+        attention_mask = self._build_causal_attention_mask(prompt_ids.shape[1])
+
+        with torch.inference_mode():
+            outputs = self.model(
+                prompt_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        hidden_states = outputs.hidden_states
+        if hidden_states is None or len(hidden_states) <= 1:
+            return {}
+
+        selected_hidden_layers = hidden_states[-min(4, len(hidden_states) - 1):]
+        hidden = torch.stack([layer_hidden[0] for layer_hidden in selected_hidden_layers], dim=0).mean(dim=0)
+
+        query_state = block_states[query_block_id]
+        query_start = min(query_state["start_pos"], stable_prefix_len)
+        query_end = min(query_state["end_pos"], stable_prefix_len)
+        if query_end <= query_start:
+            return {}
+
+        query_hidden = hidden[query_start:query_end]
+        if query_hidden.numel() == 0:
+            return {}
+
+        query_hidden = F.normalize(query_hidden, dim=-1)
+        scores = {}
+        for block_id in candidate_block_ids:
+            state = block_states[block_id]
+            block_start = min(state["start_pos"], stable_prefix_len)
+            block_end = min(state["end_pos"], stable_prefix_len)
+            if block_end <= block_start:
+                continue
+            block_hidden = hidden[block_start:block_end]
+            if block_hidden.numel() == 0:
+                continue
+            block_hidden = F.normalize(block_hidden, dim=-1)
+            similarity = torch.matmul(query_hidden, block_hidden.transpose(0, 1))
+            token_resonance = similarity.max(dim=0).values
+            topk = min(max(1, int(self.parallelcomp_hidden_topk)), token_resonance.shape[0])
+            score = float(token_resonance.topk(topk).values.mean().item())
+            scores[block_id] = score
+
+        return scores
+
+    def _score_prompt_blocks_with_attention_resonance(
+        self,
+        x_t: torch.Tensor,
+        block_states,
+        candidate_block_ids: List[int],
+        query_block_id: int,
+        stable_prefix_len: int,
+    ) -> dict:
+        if not candidate_block_ids or query_block_id not in block_states or stable_prefix_len <= 0:
+            return {}
+
+        prompt_ids = x_t[:, :stable_prefix_len]
+        attention_mask = self._build_causal_attention_mask(prompt_ids.shape[1])
+
+        with torch.inference_mode():
+            outputs = self.model(
+                prompt_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        attn_layers = outputs.attentions
+        if attn_layers is None or len(attn_layers) == 0:
+            return {}
+
+        selected_layers = attn_layers[-min(4, len(attn_layers)):]
+        query_state = block_states[query_block_id]
+        query_start = min(query_state["start_pos"], stable_prefix_len)
+        query_end = min(query_state["end_pos"], stable_prefix_len)
+        if query_end <= query_start:
+            return {}
+
+        scores = {}
+        for block_id in candidate_block_ids:
+            state = block_states[block_id]
+            block_start = min(state["start_pos"], stable_prefix_len)
+            block_end = min(state["end_pos"], stable_prefix_len)
+            if block_end <= block_start:
+                continue
+
+            layer_scores = []
+            for layer_attn in selected_layers:
+                layer_attn = layer_attn[0]
+                cross_attn = layer_attn[:, query_start:query_end, block_start:block_end]
+                if cross_attn.numel() == 0:
+                    continue
+                token_scores = cross_attn.mean(dim=0).sum(dim=0)
+                topk = min(max(1, int(self.parallelcomp_hidden_topk)), token_scores.shape[0])
+                layer_scores.append(token_scores.topk(topk).values.mean())
+
+            if layer_scores:
+                scores[block_id] = float(torch.stack(layer_scores).mean().item())
+
+        return scores
+
+    def _analyze_chunk_with_attentions_per_layer(
+        self, chunk_ids: List[int], query_ids: List[int]
+    ) -> List[torch.Tensor]:
+        joint_ids = torch.tensor([chunk_ids + query_ids], device=self.device, dtype=torch.long)
+        attention_mask = self._build_full_visible_attention_mask(joint_ids.shape[1])
+
+        with torch.inference_mode():
+            outputs = self.model(
+                joint_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        attn_layers = outputs.attentions
+        if attn_layers is None or len(attn_layers) == 0:
+            return []
+
+        chunk_len = len(chunk_ids)
+        query_len = len(query_ids)
+        if chunk_len == 0 or query_len == 0:
+            return []
+
+        token_scores_per_layer = []
+        for layer_attn in attn_layers:
+            layer_attn = layer_attn[0]
+            cross_attn = layer_attn[:, chunk_len:chunk_len + query_len, :chunk_len]
+            if cross_attn.numel() == 0:
+                token_scores_per_layer.append(torch.empty(0, device=self.device))
+                continue
+            token_scores = cross_attn.mean(dim=0).sum(dim=0)
+            token_scores_per_layer.append(token_scores)
+        return token_scores_per_layer
+
+    def _analyze_chunk_with_attentions_per_layer_per_head(
+        self,
+        chunk_ids: List[int],
+        query_ids: List[int],
+        num_cache_heads_per_layer: List[int],
+    ) -> List[torch.Tensor]:
+        joint_ids = torch.tensor([chunk_ids + query_ids], device=self.device, dtype=torch.long)
+        attention_mask = self._build_full_visible_attention_mask(joint_ids.shape[1])
+
+        with torch.inference_mode():
+            outputs = self.model(
+                joint_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        attn_layers = outputs.attentions
+        if attn_layers is None or len(attn_layers) == 0:
+            return []
+
+        chunk_len = len(chunk_ids)
+        query_len = len(query_ids)
+        if chunk_len == 0 or query_len == 0:
+            return []
+
+        token_scores_per_layer_per_head = []
+        for layer_idx, layer_attn in enumerate(attn_layers):
+            layer_attn = layer_attn[0]
+            cross_attn = layer_attn[:, chunk_len:chunk_len + query_len, :chunk_len]
+            if cross_attn.numel() == 0:
+                num_cache_heads = num_cache_heads_per_layer[layer_idx] if layer_idx < len(num_cache_heads_per_layer) else 1
+                token_scores_per_layer_per_head.append(
+                    torch.empty((num_cache_heads, 0), device=self.device)
+                )
+                continue
+
+            query_head_scores = cross_attn.sum(dim=1)
+            num_cache_heads = num_cache_heads_per_layer[layer_idx] if layer_idx < len(num_cache_heads_per_layer) else query_head_scores.shape[0]
+            grouped_scores = []
+            for head_group in torch.tensor_split(query_head_scores, num_cache_heads, dim=0):
+                if head_group.shape[0] == 0:
+                    grouped_scores.append(torch.zeros(chunk_len, device=self.device, dtype=query_head_scores.dtype))
+                else:
+                    grouped_scores.append(head_group.mean(dim=0))
+            token_scores_per_layer_per_head.append(torch.stack(grouped_scores, dim=0))
+        return token_scores_per_layer_per_head
+
+    def _build_layer_structural_prior(
+        self,
+        seq_len: int,
+        layer_idx: int,
+        num_layers: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if seq_len <= 1 or num_layers <= 0:
+            return torch.zeros(seq_len, device=device, dtype=dtype)
+
+        position = torch.linspace(0.0, 1.0, steps=seq_len, device=device, dtype=dtype)
+        start_prior = 1.0 - position
+        end_prior = position
+        middle_prior = 1.0 - torch.abs(position - 0.5) * 2.0
+
+        early_end = max(1, int(math.ceil(num_layers * 0.25)))
+        middle_end = max(early_end + 1, int(math.ceil(num_layers * 0.5)))
+        deep_start = max(middle_end, int(math.floor(num_layers * 0.75)))
+
+        if layer_idx < early_end:
+            prior = start_prior
+        elif layer_idx < middle_end:
+            prior = end_prior
+        elif layer_idx >= deep_start:
+            prior = middle_prior
+        else:
+            prior = torch.zeros_like(position)
+
+        return prior - prior.mean()
+
+    def _apply_layer_structural_bias(
+        self,
+        token_scores: torch.Tensor,
+        layer_idx: int,
+        num_layers: int,
+    ) -> torch.Tensor:
+        if (
+            not self.parallelcomp_structural_bias
+            or token_scores.numel() == 0
+            or num_layers <= 0
+        ):
+            return token_scores
+
+        prior = self._build_layer_structural_prior(
+            seq_len=token_scores.shape[-1],
+            layer_idx=layer_idx,
+            num_layers=num_layers,
+            device=token_scores.device,
+            dtype=token_scores.dtype,
+        )
+        score_scale = token_scores.mean().abs().clamp_min(1e-6)
+        return token_scores + prior * score_scale * float(self.parallelcomp_structural_bias_strength)
+
+    def _select_token_indices_from_scores(
+        self,
+        token_scores: torch.Tensor,
+        keep_count: int,
+        keep_min: int,
+    ) -> Tuple[List[int], int]:
+        candidate_indices = torch.arange(token_scores.shape[0], device=token_scores.device)
+        high_threshold = self.parallelcomp_high_score_threshold
+        evicted_high = 0
+        evicted_pool = torch.empty(0, device=token_scores.device, dtype=torch.long)
+        if high_threshold is not None and token_scores.shape[0] > keep_min:
+            candidate_mask = token_scores <= float(high_threshold)
+            if candidate_mask.sum().item() >= keep_min:
+                evicted_high = int((~candidate_mask).sum().item())
+                evicted_pool = candidate_indices[~candidate_mask]
+                candidate_indices = candidate_indices[candidate_mask]
+
+        candidate_scores = token_scores[candidate_indices]
+        if candidate_scores.numel() >= keep_count:
+            selected_local = candidate_scores.topk(keep_count).indices
+            selected_indices = candidate_indices[selected_local]
+        else:
+            selected_indices = candidate_indices
+            need = keep_count - selected_indices.shape[0]
+            if need > 0:
+                if evicted_pool.numel() > 0:
+                    supplement_scores = token_scores[evicted_pool]
+                    supplement_local = supplement_scores.topk(min(need, evicted_pool.shape[0]), largest=False).indices
+                    supplement_indices = evicted_pool[supplement_local]
+                else:
+                    remaining_mask = torch.ones(token_scores.shape[0], dtype=torch.bool, device=token_scores.device)
+                    if selected_indices.numel() > 0:
+                        remaining_mask[selected_indices] = False
+                    remaining_indices = torch.arange(token_scores.shape[0], device=token_scores.device)[remaining_mask]
+                    remaining_scores = token_scores[remaining_indices]
+                    supplement_local = remaining_scores.topk(min(need, remaining_indices.shape[0]), largest=False).indices
+                    supplement_indices = remaining_indices[supplement_local]
+                selected_indices = torch.cat([selected_indices, supplement_indices], dim=0)
+
+        selected_indices = torch.sort(torch.unique(selected_indices)).values.tolist()
+        if len(selected_indices) > keep_count:
+            selected_indices = selected_indices[:keep_count]
+        if len(selected_indices) == 0 and token_scores.shape[0] > 0:
+            selected_indices = [int(torch.argmax(token_scores).item())]
+        return selected_indices, evicted_high
+
+    def _prune_chunk_tokens_parallelcomp(
+        self, chunk_ids: List[int], token_scores: torch.Tensor
+    ) -> Tuple[List[int], int]:
+        if len(chunk_ids) == 0 or token_scores.numel() == 0:
+            return chunk_ids, 0
+
+        keep_min = min(len(chunk_ids), max(1, int(self.parallelcomp_token_keep_min)))
+        token_capacity = max(1, int(self.parallelcomp_token_capacity))
+        keep_count = min(len(chunk_ids), max(keep_min, token_capacity))
+        keep_count = min(len(chunk_ids), keep_count)
+
+        candidate_indices = torch.arange(token_scores.shape[0], device=token_scores.device)
+        high_threshold = self.parallelcomp_high_score_threshold
+        evicted_high = 0
+        if high_threshold is not None and token_scores.shape[0] > keep_min:
+            candidate_mask = token_scores <= float(high_threshold)
+            if candidate_mask.sum().item() >= keep_min:
+                evicted_high = int((~candidate_mask).sum().item())
+                candidate_indices = candidate_indices[candidate_mask]
+
+        candidate_scores = token_scores[candidate_indices]
+        if candidate_scores.numel() <= keep_count:
+            selected_indices = candidate_indices
+        else:
+            selected_local = candidate_scores.topk(keep_count).indices
+            selected_indices = candidate_indices[selected_local]
+
+        selected_indices = torch.sort(selected_indices).values.tolist()
+        pruned_chunk_ids = [chunk_ids[idx] for idx in selected_indices]
+        return pruned_chunk_ids, evicted_high
+
+    def _select_cache_block_token_indices(
+        self, block_ids: List[int], query_ids: List[int]
+    ) -> Tuple[List[int], int]:
+        if len(block_ids) == 0:
+            return [], 0
+        score, token_scores = self._analyze_chunk_with_attentions(block_ids, query_ids)
+        del score
+        pruned_block_ids, evicted_high = self._prune_chunk_tokens_parallelcomp(block_ids, token_scores)
+        kept_token_set = set(pruned_block_ids)
+        kept_indices = [idx for idx, tok in enumerate(block_ids) if tok in kept_token_set]
+        if len(kept_indices) != len(pruned_block_ids):
+            # Fall back to positional top-k when repeated token ids make set matching ambiguous.
+            keep_count = len(pruned_block_ids)
+            candidate_indices = torch.arange(token_scores.shape[0], device=token_scores.device)
+            high_threshold = self.parallelcomp_high_score_threshold
+            if high_threshold is not None and token_scores.shape[0] > keep_count:
+                candidate_mask = token_scores <= float(high_threshold)
+                if candidate_mask.sum().item() >= keep_count:
+                    candidate_indices = candidate_indices[candidate_mask]
+            candidate_scores = token_scores[candidate_indices]
+            if candidate_scores.numel() <= keep_count:
+                selected_indices = candidate_indices
+            else:
+                selected_local = candidate_scores.topk(keep_count).indices
+                selected_indices = candidate_indices[selected_local]
+            kept_indices = torch.sort(selected_indices).values.tolist()
+        return kept_indices, evicted_high
+
+    def _select_cache_block_token_indices_per_layer(
+        self, block_ids: List[int], query_ids: List[int], num_layers: int
+    ) -> Tuple[List[List[int]], List[int]]:
+        token_scores_per_layer = self._analyze_chunk_with_attentions_per_layer(block_ids, query_ids)
+        if not token_scores_per_layer:
+            default_indices = [list(range(len(block_ids))) for _ in range(num_layers)]
+            return default_indices, [0 for _ in range(num_layers)]
+
+        keep_indices_per_layer = []
+        evicted_high_per_layer = []
+        total_layers = max(1, num_layers)
+        for layer_idx in range(num_layers):
+            if layer_idx < len(token_scores_per_layer):
+                token_scores = token_scores_per_layer[layer_idx]
+            else:
+                token_scores = token_scores_per_layer[-1]
+
+            if token_scores.numel() == 0:
+                keep_indices_per_layer.append(list(range(len(block_ids))))
+                evicted_high_per_layer.append(0)
+                continue
+
+            token_scores = self._apply_layer_structural_bias(
+                token_scores=token_scores,
+                layer_idx=layer_idx,
+                num_layers=total_layers,
+            )
+            keep_min = min(len(block_ids), max(1, int(self.parallelcomp_token_keep_min)))
+            token_capacity = max(1, int(self.parallelcomp_token_capacity))
+            keep_count = min(len(block_ids), max(keep_min, token_capacity))
+            selected_indices, evicted_high = self._select_token_indices_from_scores(
+                token_scores=token_scores,
+                keep_count=keep_count,
+                keep_min=keep_min,
+            )
+            keep_indices_per_layer.append(selected_indices)
+            evicted_high_per_layer.append(evicted_high)
+
+        return keep_indices_per_layer, evicted_high_per_layer
+
+    def _select_cache_block_token_indices_per_layer_per_head(
+        self,
+        block_ids: List[int],
+        query_ids: List[int],
+        num_cache_heads_per_layer: List[int],
+    ) -> Tuple[List[torch.Tensor], List[int]]:
+        token_scores_per_layer_per_head = self._analyze_chunk_with_attentions_per_layer_per_head(
+            block_ids,
+            query_ids,
+            num_cache_heads_per_layer,
+        )
+        if not token_scores_per_layer_per_head:
+            default_indices = []
+            for num_heads in num_cache_heads_per_layer:
+                base = torch.arange(len(block_ids), device=self.device, dtype=torch.long)
+                default_indices.append(base.unsqueeze(0).expand(num_heads, -1).clone())
+            return default_indices, [0 for _ in num_cache_heads_per_layer]
+
+        keep_indices_per_layer_per_head = []
+        evicted_high_per_layer = []
+        total_layers = max(1, len(token_scores_per_layer_per_head))
+        for layer_idx, head_scores in enumerate(token_scores_per_layer_per_head):
+            num_heads = num_cache_heads_per_layer[layer_idx] if layer_idx < len(num_cache_heads_per_layer) else head_scores.shape[0]
+            if head_scores.numel() == 0:
+                base = torch.arange(len(block_ids), device=self.device, dtype=torch.long)
+                keep_indices_per_layer_per_head.append(base.unsqueeze(0).expand(num_heads, -1).clone())
+                evicted_high_per_layer.append(0)
+                continue
+
+            keep_min = min(len(block_ids), max(1, int(self.parallelcomp_token_keep_min)))
+            token_capacity = max(1, int(self.parallelcomp_token_capacity))
+            keep_count = min(len(block_ids), max(keep_min, token_capacity))
+
+            head_keep_indices = []
+            biased_head_scores = []
+            evicted_high = 0
+            for head_idx in range(head_scores.shape[0]):
+                biased_scores = self._apply_layer_structural_bias(
+                    token_scores=head_scores[head_idx],
+                    layer_idx=layer_idx,
+                    num_layers=total_layers,
+                )
+                biased_head_scores.append(biased_scores)
+                selected_indices, head_evicted_high = self._select_token_indices_from_scores(
+                    token_scores=biased_scores,
+                    keep_count=keep_count,
+                    keep_min=keep_min,
+                )
+                head_keep_indices.append(torch.tensor(selected_indices, device=self.device, dtype=torch.long))
+                evicted_high += head_evicted_high
+
+            max_keep = max(index_tensor.shape[0] for index_tensor in head_keep_indices)
+            padded_head_indices = []
+            for head_idx, index_tensor in enumerate(head_keep_indices):
+                if index_tensor.shape[0] < max_keep:
+                    token_scores = biased_head_scores[head_idx]
+                    remaining_mask = torch.ones(token_scores.shape[0], dtype=torch.bool, device=token_scores.device)
+                    remaining_mask[index_tensor] = False
+                    remaining_indices = torch.arange(token_scores.shape[0], device=token_scores.device)[remaining_mask]
+                    if remaining_indices.numel() > 0:
+                        supplement_scores = token_scores[remaining_indices]
+                        supplement_local = supplement_scores.topk(
+                            min(max_keep - index_tensor.shape[0], remaining_indices.shape[0]),
+                            largest=False,
+                        ).indices
+                        supplement_indices = remaining_indices[supplement_local]
+                        index_tensor = torch.cat([index_tensor, supplement_indices], dim=0)
+                    if index_tensor.shape[0] < max_keep:
+                        pad_value = index_tensor[-1] if index_tensor.numel() > 0 else torch.tensor(0, device=self.device, dtype=torch.long)
+                        pad_tensor = pad_value.repeat(max_keep - index_tensor.shape[0])
+                        index_tensor = torch.cat([index_tensor, pad_tensor], dim=0)
+                padded_head_indices.append(index_tensor[:max_keep])
+
+            keep_indices_per_layer_per_head.append(torch.stack(padded_head_indices, dim=0))
+            evicted_high_per_layer.append(evicted_high)
+
+        return keep_indices_per_layer_per_head, evicted_high_per_layer
+
+    def _build_cache_query_ids(
+        self, x_t: torch.Tensor, stable_prefix_len: int, mask_id: int
+    ) -> List[int]:
+        suffix_tokens = x_t[0, stable_prefix_len:].tolist()
+        query_ids = [tok for tok in suffix_tokens if tok != mask_id]
+        if query_ids:
+            return query_ids[-self.parallelcomp_query_tokens:]
+        stable_prefix_ids = x_t[0, :stable_prefix_len].tolist()
+        if not stable_prefix_ids:
+            return []
+        fallback_query_len = min(self.parallelcomp_query_tokens, max(1, len(stable_prefix_ids) // 2))
+        return stable_prefix_ids[-fallback_query_len:]
+
+    def _get_reused_window_size(self, block_states) -> int:
+        if not block_states:
+            return 0
+        return max(
+            max(1, state.get("rope_span", state["end_pos"] - state["start_pos"]))
+            for state in block_states.values()
+        )
+
+    def _build_block_local_positions(self, block_len: int) -> torch.Tensor:
+        return torch.arange(block_len, device=self.device, dtype=torch.long)
+
+    def _should_split_prompt_windows(self, prompt_length: int) -> bool:
+        if not self.parallelcomp_cache_compress_mode:
+            return False
+        if self.parallelcomp_chunk_size is None or self.parallelcomp_chunk_size <= 0:
+            return False
+        min_prompt_tokens = max(1, int(self.parallelcomp_min_prompt_tokens))
+        return prompt_length >= min_prompt_tokens and prompt_length > self.parallelcomp_chunk_size
+
+    def _init_prompt_block_states(self, prompt_length: int):
+        if not self._should_split_prompt_windows(prompt_length):
+            return {
+                0: {
+                    'start_pos': 0,
+                    'end_pos': prompt_length,
+                    'mask_count': 0,
+                    'total_masks': prompt_length,
+                    'rope_span': prompt_length,
+                    'state': 'to_cache',
+                    'is_complete': True,
+                    'is_prompt_window': True,
+                },
+            }
+
+        block_states = {}
+        chunk_size = int(self.parallelcomp_chunk_size)
+        query_tail_len = min(max(1, int(self.parallelcomp_query_tokens)), max(1, prompt_length - 1))
+        context_prompt_len = max(0, prompt_length - query_tail_len)
+        cursor = 0
+        block_id = 0
+        while cursor < context_prompt_len:
+            block_end = min(cursor + chunk_size, context_prompt_len)
+            block_len = block_end - cursor
+            block_states[block_id] = {
+                'start_pos': cursor,
+                'end_pos': block_end,
+                'mask_count': 0,
+                'total_masks': block_len,
+                'rope_span': block_len,
+                'state': 'to_cache',
+                'is_complete': True,
+                'is_prompt_window': True,
+            }
+            cursor = block_end
+            block_id += 1
+
+        block_states[block_id] = {
+            'start_pos': context_prompt_len,
+            'end_pos': prompt_length,
+            'mask_count': 0,
+            'total_masks': prompt_length - context_prompt_len,
+            'rope_span': prompt_length - context_prompt_len,
+            'state': 'to_cache',
+            'is_complete': True,
+            'is_prompt_window': True,
+            'is_query_window': True,
+        }
+        return block_states
+
+    def _init_canonical_block_tokens(
+        self,
+        x_t: torch.Tensor,
+        block_states,
+    ) -> dict:
+        canonical_block_tokens = {}
+        for block_id, state in block_states.items():
+            canonical_block_tokens[block_id] = x_t[0, state["start_pos"]:state["end_pos"]].tolist()
+        return canonical_block_tokens
+
+    def _snapshot_canonical_block_tokens(
+        self,
+        x_t: torch.Tensor,
+        block_states,
+        block_ids: List[int],
+        canonical_block_tokens: dict,
+    ) -> None:
+        for block_id in block_ids:
+            if block_id in canonical_block_tokens:
+                continue
+            state = block_states.get(block_id)
+            if state is None:
+                continue
+            canonical_block_tokens[block_id] = x_t[0, state["start_pos"]:state["end_pos"]].tolist()
+
+    def _build_input_block_metadata(
+        self,
+        block_states,
+        process_start_pos: int,
+        input_length: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_end_pos = process_start_pos + input_length
+        block_ids = torch.full((input_length,), -1, device=self.device, dtype=torch.long)
+        prompt_window_mask = torch.zeros((input_length,), device=self.device, dtype=torch.bool)
+
+        for block_id in sorted(block_states.keys()):
+            state = block_states[block_id]
+            overlap_start = max(process_start_pos, state["start_pos"])
+            overlap_end = min(input_end_pos, state["end_pos"])
+            if overlap_end <= overlap_start:
+                continue
+            local_start = overlap_start - process_start_pos
+            local_end = overlap_end - process_start_pos
+            block_ids[local_start:local_end] = block_id
+            if state.get("is_prompt_window", False):
+                prompt_window_mask[local_start:local_end] = True
+
+        if (block_ids < 0).any():
+            raise ValueError("Failed to assign block ids to all input tokens")
+
+        return block_ids, prompt_window_mask
+
+    def _build_input_position_ids(
+        self,
+        block_states,
+        process_start_pos: int,
+        input_length: int,
+        update_kvcache: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        block_ids, prompt_window_mask = self._build_input_block_metadata(
+            block_states=block_states,
+            process_start_pos=process_start_pos,
+            input_length=input_length,
+        )
+
+        reused_window_size = self._get_reused_window_size(block_states)
+        rope_positions = torch.empty(input_length, device=self.device, dtype=torch.long)
+
+        active_tail_start = update_kvcache
+        if active_tail_start < input_length:
+            rope_positions[active_tail_start:] = torch.arange(
+                reused_window_size,
+                reused_window_size + (input_length - active_tail_start),
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        cursor = 0
+        if update_kvcache > 0:
+            for block_id in sorted(block_states.keys()):
+                state = block_states[block_id]
+                if state["state"] != "to_cache":
+                    continue
+                block_len = state["end_pos"] - state["start_pos"]
+                block_rope_span = max(1, state.get("rope_span", block_len))
+                take = min(block_len, update_kvcache - cursor)
+                if take <= 0:
+                    break
+                rope_positions[cursor:cursor + take] = self._build_block_local_positions(block_rope_span)[:take]
+                cursor += take
+                if cursor >= update_kvcache:
+                    break
+
+        if cursor < min(update_kvcache, input_length):
+            rope_positions[cursor:update_kvcache] = torch.arange(
+                reused_window_size,
+                reused_window_size + (update_kvcache - cursor),
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        return block_ids, prompt_window_mask, rope_positions
+
+    def _build_cache_write_positions(
+        self,
+        block_states,
+        update_kvcache: int,
+    ) -> torch.Tensor:
+        cache_positions = []
+        cursor = 0
+        for block_id in sorted(block_states.keys()):
+            state = block_states[block_id]
+            if state["state"] != "to_cache":
+                continue
+            block_len = state["end_pos"] - state["start_pos"]
+            block_rope_span = max(1, state.get("rope_span", block_len))
+            take = min(block_len, update_kvcache - cursor)
+            if take <= 0:
+                break
+            cache_positions.append(self._build_block_local_positions(block_rope_span)[:take])
+            cursor += take
+            if cursor >= update_kvcache:
+                break
+        if cache_positions:
+            return torch.cat(cache_positions, dim=0)
+        return torch.empty(0, device=self.device, dtype=torch.long)
+
+    def _count_generated_blocks(self, block_states) -> int:
+        return sum(1 for state in block_states.values() if not state.get("is_prompt_window", False))
+
+    def _select_global_cache_blocks(
+        self,
+        block_states,
+        stable_block_ids: List[int],
+        stable_prefix_len: int,
+        query_ids: List[int],
+        canonical_block_tokens: dict,
+        x_t: Optional[torch.Tensor] = None,
+        query_block_id: Optional[int] = None,
+    ) -> List[int]:
+        if len(stable_block_ids) <= 1:
+            return stable_block_ids
+
+        scored_blocks = []
+        self_information_scores = {}
+        attention_scores = {}
+        hidden_scores = {}
+
+        for block_id in stable_block_ids:
+            block_ids = canonical_block_tokens.get(block_id)
+            if block_ids is None:
+                block_ids = []
+            score = self._score_chunk_with_self_information(block_ids, query_ids)
+            if math.isfinite(score):
+                self_information_scores[block_id] = -score
+
+        if len(self_information_scores) != len(stable_block_ids) and x_t is not None and query_block_id is not None:
+            attention_scores = self._score_prompt_blocks_with_attention_resonance(
+                x_t=x_t,
+                block_states=block_states,
+                candidate_block_ids=[
+                    block_id for block_id in stable_block_ids if block_id not in self_information_scores
+                ],
+                query_block_id=query_block_id,
+                stable_prefix_len=stable_prefix_len,
+            )
+            if not attention_scores:
+                hidden_scores = self._score_prompt_blocks_with_hidden_resonance(
+                    x_t=x_t,
+                    block_states=block_states,
+                    candidate_block_ids=[
+                        block_id for block_id in stable_block_ids if block_id not in self_information_scores
+                    ],
+                    query_block_id=query_block_id,
+                    stable_prefix_len=stable_prefix_len,
+                )
+
+        if self_information_scores:
+            for block_id in stable_block_ids:
+                score = self_information_scores.get(block_id, float("-inf"))
+                scored_blocks.append((block_id, score))
+        elif attention_scores:
+            for block_id in stable_block_ids:
+                score = attention_scores.get(block_id, float("-inf"))
+                scored_blocks.append((block_id, score))
+        elif hidden_scores:
+            for block_id in stable_block_ids:
+                score = hidden_scores.get(block_id, float("-inf"))
+                scored_blocks.append((block_id, score))
+        else:
+            for block_id in stable_block_ids:
+                scored_blocks.append((block_id, float("-inf")))
+
+        keep_ids = set()
+        if self.parallelcomp_keep_first_chunk and 0 in stable_block_ids:
+            keep_ids.add(0)
+
+        candidates = [item for item in scored_blocks if item[0] not in keep_ids]
+        topk = len(candidates) if self.parallelcomp_topk_chunks is None else min(max(1, self.parallelcomp_topk_chunks), len(candidates))
+        selected = sorted(candidates, key=lambda item: item[1], reverse=True)[:topk]
+        keep_ids.update(block_id for block_id, _ in selected)
+
+        kept_block_ids = [block_id for block_id in stable_block_ids if block_id in keep_ids]
+        eval_logger.info(
+            "Prefix-aware global block selection: stable_blocks=%d, kept_blocks=%d, stable_prefix_tokens=%d, scoring=%s",
+            len(stable_block_ids),
+            len(kept_block_ids),
+            stable_prefix_len,
+            "self_information" if self_information_scores else ("attention" if attention_scores else ("hidden" if hidden_scores else "none")),
+        )
+        return kept_block_ids
+
+    def _compress_cached_prefix_blocks(
+        self,
+        x_t: torch.Tensor,
+        past_key_values,
+        block_states,
+        mask_id: int,
+        cached_positions_per_layer: List[torch.Tensor],
+        cached_block_ranges_per_layer: List[dict],
+        shared_cached_length: int,
+        canonical_block_tokens: dict,
+    ) -> Tuple[torch.Tensor, Optional[object], List[torch.Tensor], List[dict], int, bool]:
+        if not self.parallelcomp_cache_compress_mode or past_key_values is None:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False
+        if getattr(self, "_parallelcomp_prompt_cache_compression_done", False):
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False
+
+        stable_prompt_block_ids = [
+            block_id for block_id, state in sorted(block_states.items())
+            if state["state"] == "in_cache" and state.get("is_prompt_window", False)
+        ]
+        if not stable_prompt_block_ids:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False
+        if len(stable_prompt_block_ids) <= 1:
+            # If the prompt never split into multiple ParallelComp windows, skip
+            # prompt-side compression entirely.
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False
+
+        stable_prefix_len = shared_cached_length
+        if stable_prefix_len <= 0:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False
+
+        query_block_id = next(
+            (block_id for block_id in stable_prompt_block_ids if block_states[block_id].get("is_query_window", False)),
+            stable_prompt_block_ids[-1],
+        )
+        context_prompt_block_ids = stable_prompt_block_ids[:-1]
+        if query_block_id in context_prompt_block_ids:
+            context_prompt_block_ids = [block_id for block_id in context_prompt_block_ids if block_id != query_block_id]
+        if not context_prompt_block_ids:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False
+
+        query_state = block_states[query_block_id]
+        query_block_tokens = x_t[0, query_state["start_pos"]:query_state["end_pos"]].tolist()
+        query_ids = query_block_tokens[-self.parallelcomp_query_tokens:] if query_block_tokens else []
+        if not query_ids:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False
+
+        kept_block_ids = self._select_global_cache_blocks(
+            block_states=block_states,
+            stable_block_ids=context_prompt_block_ids,
+            stable_prefix_len=stable_prefix_len,
+            query_ids=query_ids,
+            canonical_block_tokens=canonical_block_tokens,
+            x_t=x_t,
+            query_block_id=query_block_id,
+        )
+        self._parallelcomp_prompt_cache_compression_done = True
+        if not kept_block_ids:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False
+
+        compressed_block_meta = []
+        total_evicted_high = 0
+        total_removed = 0
+        for block_id in kept_block_ids:
+            state = block_states[block_id]
+            block_ids = x_t[0, state["start_pos"]:state["end_pos"]].tolist()
+            num_cache_heads_per_layer = [layer_k.shape[1] for layer_k in past_key_values.key_cache]
+            if len(block_ids) <= self.parallelcomp_token_keep_min:
+                per_layer_kept_indices = []
+                for num_heads in num_cache_heads_per_layer:
+                    base = torch.arange(len(block_ids), device=self.device, dtype=torch.long)
+                    per_layer_kept_indices.append(base.unsqueeze(0).expand(num_heads, -1).clone())
+                evicted_high_layers = [0 for _ in range(len(past_key_values.key_cache))]
+            else:
+                per_layer_kept_indices, evicted_high_layers = self._select_cache_block_token_indices_per_layer_per_head(
+                    block_ids,
+                    query_ids,
+                    num_cache_heads_per_layer,
+                )
+            total_evicted_high += sum(evicted_high_layers)
+            layer_keep_width = max(
+                (kept_indices.shape[1] if isinstance(kept_indices, torch.Tensor) else len(kept_indices))
+                for kept_indices in per_layer_kept_indices
+            ) if per_layer_kept_indices else len(block_ids)
+            total_removed += max(0, len(block_ids) - layer_keep_width)
+            compressed_block_meta.append(
+                (block_id, state["start_pos"], state["end_pos"], per_layer_kept_indices)
+            )
+
+        dropped_block_ids = [block_id for block_id in context_prompt_block_ids if block_id not in kept_block_ids]
+        total_removed += sum(
+            block_states[block_id]["end_pos"] - block_states[block_id]["start_pos"]
+            for block_id in dropped_block_ids
+        )
+
+        if total_removed == 0 and not dropped_block_ids:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False
+
+        new_key_cache = []
+        new_value_cache = []
+        new_cached_positions_per_layer = []
+        new_cached_block_ranges_per_layer = []
+        for layer_idx, (layer_k, layer_v) in enumerate(zip(past_key_values.key_cache, past_key_values.value_cache)):
+            compressed_k_parts = []
+            compressed_v_parts = []
+            compressed_pos_parts = []
+            layer_cached_positions = cached_positions_per_layer[layer_idx]
+            layer_block_ranges = cached_block_ranges_per_layer[layer_idx] if layer_idx < len(cached_block_ranges_per_layer) else {}
+            new_layer_block_ranges = {}
+            layer_cursor = 0
+            for block_id, _, _, per_layer_kept_indices in compressed_block_meta:
+                if block_id not in layer_block_ranges:
+                    continue
+                layer_block_start, layer_block_end = layer_block_ranges[block_id]
+                per_head_kept_indices = per_layer_kept_indices[layer_idx] if layer_idx < len(per_layer_kept_indices) else per_layer_kept_indices[0]
+                per_head_kept_indices = per_head_kept_indices.to(device=layer_k.device, dtype=torch.long)
+                keep_count = per_head_kept_indices.shape[1]
+                expanded_index = per_head_kept_indices.unsqueeze(0).unsqueeze(-1).expand(
+                    layer_k.shape[0],
+                    per_head_kept_indices.shape[0],
+                    keep_count,
+                    layer_k.shape[-1],
+                )
+                block_slice_k = layer_k[:, :, layer_block_start:layer_block_end, :]
+                block_slice_v = layer_v[:, :, layer_block_start:layer_block_end, :]
+                block_k = block_slice_k.gather(2, expanded_index)
+                block_v = block_slice_v.gather(2, expanded_index)
+                block_pos = torch.arange(
+                    layer_cursor,
+                    layer_cursor + block_k.shape[2],
+                    device=layer_cached_positions.device,
+                    dtype=torch.long,
+                )
+                compressed_k_parts.append(block_k)
+                compressed_v_parts.append(block_v)
+                compressed_pos_parts.append(block_pos)
+                new_layer_block_ranges[block_id] = (layer_cursor, layer_cursor + block_k.shape[2])
+                layer_cursor += block_k.shape[2]
+
+            compressed_k = torch.cat(compressed_k_parts, dim=2) if compressed_k_parts else layer_k[:, :, :0, :]
+            compressed_v = torch.cat(compressed_v_parts, dim=2) if compressed_v_parts else layer_v[:, :, :0, :]
+            new_key_cache.append(compressed_k)
+            new_value_cache.append(compressed_v)
+            new_cached_positions_per_layer.append(
+                torch.cat(compressed_pos_parts, dim=0) if compressed_pos_parts else layer_cached_positions[:0]
+            )
+            new_cached_block_ranges_per_layer.append(new_layer_block_ranges)
+
+        past_key_values.key_cache = new_key_cache
+        past_key_values.value_cache = new_value_cache
+
+        query_len = len(query_block_tokens)
+        if query_len > 0:
+            query_tensor = torch.tensor([query_block_tokens], device=self.device, dtype=torch.long)
+            reused_window_size = max(1, int(self.parallelcomp_chunk_size))
+            query_block_ids_tensor = torch.full((query_len,), query_block_id, device=self.device, dtype=torch.long)
+            query_prompt_window_mask = torch.zeros((query_len,), device=self.device, dtype=torch.bool)
+            per_layer_attention_mask = []
+            per_layer_position_ids = []
+            per_layer_cache_position = []
+            appended_cached_positions_per_layer = []
+
+            for layer_cached_positions in new_cached_positions_per_layer:
+                layer_cache_len = layer_cached_positions.shape[0]
+                per_layer_attention_mask.append(
+                    build_sparse_block_attention_mask(
+                        query_block_ids=query_block_ids_tensor,
+                        cached_length=layer_cache_len,
+                        query_prompt_window_mask=query_prompt_window_mask,
+                        update_kvcache=query_len,
+                        device=self.device,
+                        dtype=self.target_dtype if self.target_dtype not in (None, "auto") else torch.bfloat16,
+                    )
+                )
+                logical_query_positions = torch.arange(
+                    reused_window_size,
+                    reused_window_size + query_len,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                physical_query_positions = torch.arange(
+                    layer_cache_len,
+                    layer_cache_len + query_len,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                per_layer_position_ids.append(logical_query_positions.unsqueeze(0))
+                per_layer_cache_position.append(physical_query_positions)
+                appended_cached_positions_per_layer.append(
+                    torch.cat([layer_cached_positions, physical_query_positions], dim=0)
+                )
+
+            replay_outputs = self.model(
+                query_tensor,
+                attention_mask=per_layer_attention_mask,
+                past_key_values=past_key_values,
+                position_ids=per_layer_position_ids,
+                cache_position=per_layer_cache_position,
+                use_cache=True,
+                update_kvcache=query_len,
+            )
+            past_key_values = replay_outputs.past_key_values
+            new_cached_positions_per_layer = appended_cached_positions_per_layer
+            for layer_idx, layer_block_ranges in enumerate(new_cached_block_ranges_per_layer):
+                layer_context_len = new_cached_positions_per_layer[layer_idx].shape[0] - query_len
+                layer_block_ranges[query_block_id] = (layer_context_len, layer_context_len + query_len)
+            block_states[query_block_id]["rope_span"] = reused_window_size + query_len
+
+        old_stable_prefix_len = stable_prefix_len
+        new_stable_prefix_len = stable_prefix_len
+
+        layer_selection_divergence = 0
+        if compressed_block_meta:
+            for _, _, _, per_layer_kept_indices in compressed_block_meta:
+                reference_set = None
+                for kept_indices in per_layer_kept_indices:
+                    if isinstance(kept_indices, torch.Tensor):
+                        for head_indices in kept_indices.tolist():
+                            head_set = set(head_indices)
+                            if reference_set is None:
+                                reference_set = head_set
+                            else:
+                                layer_selection_divergence += len(reference_set.symmetric_difference(head_set))
+                    elif reference_set is not None:
+                        layer_selection_divergence += len(reference_set.symmetric_difference(set(kept_indices)))
+
+        eval_logger.info(
+            "ParallelComp-style per-layer prompt cache compression: logical_prefix_tokens=%d, context_blocks=%d, kept_context_blocks=%d, query_block=%d, removed_tokens=%d, high_score_evicted=%d, layer_selection_divergence=%d, layer_cache_lengths=%s",
+            old_stable_prefix_len,
+            len(context_prompt_block_ids),
+            len(kept_block_ids),
+            query_block_id,
+            total_removed,
+            total_evicted_high,
+            layer_selection_divergence,
+            [layer_positions.shape[0] for layer_positions in new_cached_positions_per_layer],
+        )
+        return x_t, past_key_values, new_cached_positions_per_layer, new_cached_block_ranges_per_layer, new_stable_prefix_len, True
     
     @classmethod
     def create_from_arg_string(
@@ -570,32 +1748,20 @@ class DreamLoRA(LM):
         skip_threshold = self.skip_threshold
         decoded_token_threshold = self.decoded_token_threshold
         
-        # Pre-generate full attention mask, using model's data type
-        prompt_length = prompt.shape[1]
-        full_attention_mask = create_full_block_attention_mask(
-            prompt_length=prompt_length,
-            max_length=self.max_length,
-            block_size=block_size,
-            device=self.device,
-            dtype=self.target_dtype if self.target_dtype is not None and self.target_dtype != "auto" else torch.bfloat16
-        )
+        attn_dtype = self.target_dtype if self.target_dtype is not None and self.target_dtype != "auto" else torch.bfloat16
         
         with torch.inference_mode():
             # Initialization
             x_t = prompt.to(self.device)
+            self._parallelcomp_prompt_cache_compression_done = False
+            cached_positions_per_layer = []
+            cached_block_ranges_per_layer = []
+            shared_cached_length = 0
             
             # Track block states - state can be: 'active', 'to_cache', 'in_cache'
             # Added 'is_complete' field to indicate whether it's a complete state (True) or incomplete (False)
-            block_states = {
-                0: {
-                    'start_pos': 0,
-                    'end_pos': prompt.shape[1],
-                    'mask_count': 0,
-                    'total_masks': prompt.shape[1],
-                    'state': 'to_cache',  # prompt ready for caching immediately
-                    'is_complete': True,  # prompt is always in a complete state
-                },
-            }
+            block_states = self._init_prompt_block_states(prompt.shape[1])
+            canonical_block_tokens = self._init_canonical_block_tokens(x_t, block_states)
             
             # Initialize cache
             past_key_values = None
@@ -609,13 +1775,14 @@ class DreamLoRA(LM):
                 step += 1
                 
                 # Check if a new block needs to be added
-                if len(block_states)-1 < (self.max_new_tokens // block_size) and not eos_detected:
-                    last_block_id = len(block_states) - 1
+                generated_block_count = self._count_generated_blocks(block_states)
+                if generated_block_count < (self.max_new_tokens // block_size) and not eos_detected:
+                    last_block_id = max(block_states.keys())
                     current_progress = (block_states[last_block_id]['total_masks'] - 
                                       block_states[last_block_id]['mask_count']) / block_states[last_block_id]['total_masks']
                     if current_progress >= block_add_threshold:
                         # Add new block - defaults to incomplete state
-                        new_block_id = len(block_states)
+                        new_block_id = max(block_states.keys()) + 1
                         new_start_pos = x_t.shape[1]
                         x_t = torch.cat([x_t, torch.tensor([[mask_id] * block_size]).to(self.device)], dim=1)
                         
@@ -624,24 +1791,25 @@ class DreamLoRA(LM):
                             'end_pos': new_start_pos + block_size,
                             'mask_count': block_size,
                             'total_masks': block_size,
+                            'rope_span': block_size,
                             'state': 'active',
                             'is_complete': False,  # New block defaults to incomplete state
+                            'is_prompt_window': False,
                         }
                         current_blocks += 1
                 
                 # At the beginning of each loop, update block completion states
                 self._update_block_completion_states(block_states, decoded_token_threshold)
-                # Check if there are still mask tokens
-                mask_index = (x_t == mask_id)
-                if mask_index.sum() == 0 and current_blocks == 0:
-                    break
-                
                 # Determine which blocks need to be added to cache
                 blocks_to_cache = [bid for bid, state in block_states.items() 
                                 if state['state'] == 'to_cache']
+                # Check if there are still mask tokens
+                mask_index = (x_t == mask_id)
+                if mask_index.sum() == 0 and current_blocks == 0 and not blocks_to_cache:
+                    break
                     
                 # Determine the part to process
-                cache_length = 0 if past_key_values is None else past_key_values.get_seq_length()
+                cache_length = shared_cached_length if past_key_values is not None else 0
                 
                 # Determine content to add to cache
                 update_kvcache = 0
@@ -694,20 +1862,39 @@ class DreamLoRA(LM):
                     print(f"Warning: input_seq is empty at step {step}. Breaking generation loop.")
                     raise Exception("input_seq is empty")
                 
-                # Extract attention mask for current input from the pre-generated full mask
                 input_length = input_seq.shape[1]
-                attention_mask = extract_attention_mask(
-                    full_mask=full_attention_mask,
-                    start_pos=process_start_pos,
+                input_block_ids, input_prompt_window_mask, input_rope_positions = self._build_input_position_ids(
+                    block_states=block_states,
+                    process_start_pos=process_start_pos,
                     input_length=input_length,
-                    cache_length=cache_length
+                    update_kvcache=update_kvcache,
                 )
+                if cached_positions_per_layer:
+                    attention_mask = build_per_layer_sparse_block_attention_mask(
+                        query_block_ids=input_block_ids,
+                        cached_positions_per_layer=cached_positions_per_layer,
+                        query_prompt_window_mask=input_prompt_window_mask,
+                        update_kvcache=update_kvcache,
+                        device=self.device,
+                        dtype=attn_dtype,
+                    )
+                else:
+                    attention_mask = build_sparse_block_attention_mask(
+                        query_block_ids=input_block_ids,
+                        cached_length=0,
+                        query_prompt_window_mask=input_prompt_window_mask,
+                        update_kvcache=update_kvcache,
+                        device=self.device,
+                        dtype=attn_dtype,
+                    )
                 
                 # Forward pass
                 outputs = self.model(
                     input_seq,
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
+                    position_ids=input_rope_positions.unsqueeze(0),
+                    cache_position=input_rope_positions,
                     use_cache=True,
                     update_kvcache=update_kvcache,
                 )
@@ -720,10 +1907,57 @@ class DreamLoRA(LM):
                     
                     # Update cache
                     past_key_values = outputs.past_key_values
+                    if not cached_positions_per_layer:
+                        num_layers = len(past_key_values.key_cache)
+                        cached_positions_per_layer = [
+                            torch.empty(0, device=self.device, dtype=torch.long) for _ in range(num_layers)
+                        ]
+                        cached_block_ranges_per_layer = [{} for _ in range(num_layers)]
+                    old_layer_lengths = [
+                        layer_cached_positions.shape[0] for layer_cached_positions in cached_positions_per_layer
+                    ]
+                    new_cached_slice = self._build_cache_write_positions(
+                        block_states=block_states,
+                        update_kvcache=update_kvcache,
+                    )
+                    cached_positions_per_layer = [
+                        torch.cat([layer_cached_positions, new_cached_slice], dim=0)
+                        for layer_cached_positions in cached_positions_per_layer
+                    ]
+                    sorted_blocks_to_cache = sorted(blocks_to_cache)
+                    self._snapshot_canonical_block_tokens(
+                        x_t=x_t,
+                        block_states=block_states,
+                        block_ids=sorted_blocks_to_cache,
+                        canonical_block_tokens=canonical_block_tokens,
+                    )
+                    block_cursor = 0
+                    for layer_idx, layer_block_ranges in enumerate(cached_block_ranges_per_layer):
+                        layer_cursor = old_layer_lengths[layer_idx]
+                        for block_id in sorted_blocks_to_cache:
+                            block_len = block_states[block_id]['end_pos'] - block_states[block_id]['start_pos']
+                            layer_block_ranges[block_id] = (layer_cursor + block_cursor, layer_cursor + block_cursor + block_len)
+                            block_cursor += block_len
+                        block_cursor = 0
                     
                     # Mark blocks as cached
                     for block_id in blocks_to_cache:
                         block_states[block_id]['state'] = 'in_cache'
+
+                    shared_cached_length += update_kvcache
+
+                    x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, cache_compressed = self._compress_cached_prefix_blocks(
+                        x_t=x_t,
+                        past_key_values=past_key_values,
+                        block_states=block_states,
+                        mask_id=mask_id,
+                        cached_positions_per_layer=cached_positions_per_layer,
+                        cached_block_ranges_per_layer=cached_block_ranges_per_layer,
+                        shared_cached_length=shared_cached_length,
+                        canonical_block_tokens=canonical_block_tokens,
+                    )
+                    if cache_compressed:
+                        mask_index = (x_t == mask_id)
                 
                 # Get correctly shifted logits for prediction
                 logits = self._shift_logits(outputs.logits, last_logit=last_logits)

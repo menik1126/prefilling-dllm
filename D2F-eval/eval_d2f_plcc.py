@@ -15,6 +15,21 @@ Usage:
     --pretrained GSAI-ML/LLaDA-8B-Instruct \
     --top_percent 30 \
     --output_dir ./results_nolora
+
+  python eval_d2f_plcc.py \
+    --model_type dream \
+    --pretrained /path/to/Dream-v0-Base-7B \
+    --configs medium_context \
+    --top_percent 30 \
+    --max_length 2048 \
+    --rope_scale_factor 1.0 \
+    --local_input_data_template /path/to/artifacts/python/qwen2.5-coder-1.5b/{config}/in/model_inputs_composer_path_distance.json \
+    --parallelcomp_cache_compress_mode \
+    --parallelcomp_chunk_size 512 \
+    --parallelcomp_query_tokens 128 \
+    --parallelcomp_topk_chunks 6 \
+    --parallelcomp_token_capacity 256 \
+    --output_dir ./results_parallelcomp_plcc
 """
 import argparse
 import json
@@ -96,6 +111,17 @@ def total_context_chars(item):
     return ctx_len + len(file_content)
 
 
+def total_prepared_chars(item):
+    """
+    Approximate total chars for locally preprocessed model_inputs JSON.
+
+    These files are derived from the HF dataset after composer preprocessing, so
+    the original repo_snapshot split is no longer available. We therefore use the
+    composed context string plus completion file content as the local ranking key.
+    """
+    return len(item.get('context', '')) + len(item.get('completion', ''))
+
+
 def filter_top_percent(items, top_percent, key_fn):
     indexed = sorted(enumerate(items), key=lambda x: key_fn(x[1]), reverse=True)
     top_n = max(1, int(len(indexed) * top_percent / 100))
@@ -104,6 +130,21 @@ def filter_top_percent(items, top_percent, key_fn):
     print(f"  Total: {len(items)}, top {top_percent}% = {len(subset)} items")
     print(f"  Context length threshold: >= {threshold:,} chars")
     return subset
+
+
+def load_items_for_config(cfg, local_input_data_template=None):
+    if local_input_data_template:
+        local_path = local_input_data_template.format(config=cfg)
+        with open(local_path, 'r') as f:
+            items = json.load(f)
+        return items, 'local', local_path
+
+    from datasets import load_dataset
+    ds = load_dataset(
+        'JetBrains-Research/lca-project-level-code-completion',
+        cfg, split='test'
+    )
+    return list(ds), 'hf', None
 
 
 def edit_similarity(pred, gt):
@@ -121,6 +162,8 @@ def main():
     parser.add_argument('--pretrained', required=True)
     parser.add_argument('--lora_path', default=None)
     parser.add_argument('--top_percent', type=float, default=30)
+    parser.add_argument('--max_examples', type=int, default=None,
+                        help='Optional cap on the number of examples after top-percent filtering.')
     parser.add_argument('--configs', nargs='+', default=CONFIGS)
     parser.add_argument('--max_new_tokens', type=int, default=128)
     parser.add_argument('--max_length', type=int, default=None,
@@ -131,10 +174,32 @@ def main():
                         help='NTK-by-parts RoPE scale factor (1.0=off, 2.0=2x context, 4.0=4x context).')
     parser.add_argument('--temperature', type=float, default=0.2)
     parser.add_argument('--output_dir', default='./results_nolora')
+    parser.add_argument(
+        '--local_input_data_template',
+        default=None,
+        help='Optional path template for locally preprocessed model_inputs JSON. '
+             'Use {config} as a placeholder, e.g. '
+             '/path/to/artifacts/python/qwen2.5-coder-1.5b/{config}/in/model_inputs_composer_path_distance.json',
+    )
     parser.add_argument('--apply_chat_template', action='store_true',
                         help='Wrap prompt in chat template (for Instruct models).')
     parser.add_argument('--model_tag', default=None,
                         help='Tag for output filenames (default: model_type).')
+    parser.add_argument('--parallelcomp_mode', action='store_true')
+    parser.add_argument('--parallelcomp_cache_compress_mode', action='store_true')
+    parser.add_argument('--parallelcomp_chunk_size', type=int, default=256)
+    parser.add_argument('--parallelcomp_query_tokens', type=int, default=128)
+    parser.add_argument('--parallelcomp_topk_chunks', type=int, default=4)
+    parser.add_argument('--parallelcomp_min_prompt_tokens', type=int, default=1024)
+    parser.add_argument('--parallelcomp_keep_first_chunk', action='store_true')
+    parser.add_argument('--parallelcomp_hidden_topk', type=int, default=32)
+    parser.add_argument('--parallelcomp_token_capacity', type=int, default=128)
+    parser.add_argument('--parallelcomp_token_keep_min', type=int, default=32)
+    parser.add_argument('--parallelcomp_high_score_threshold', type=float, default=None)
+    parser.add_argument('--parallelcomp_structural_bias', dest='parallelcomp_structural_bias', action='store_true')
+    parser.add_argument('--no_parallelcomp_structural_bias', dest='parallelcomp_structural_bias', action='store_false')
+    parser.set_defaults(parallelcomp_structural_bias=True)
+    parser.add_argument('--parallelcomp_structural_bias_strength', type=float, default=0.2)
     args = parser.parse_args()
 
     # Determine token budget for the prompt
@@ -158,6 +223,19 @@ def main():
         temperature=args.temperature,
         add_bos_token=True,
         rope_scale_factor=args.rope_scale_factor,
+        parallelcomp_mode=args.parallelcomp_mode,
+        parallelcomp_cache_compress_mode=args.parallelcomp_cache_compress_mode,
+        parallelcomp_chunk_size=args.parallelcomp_chunk_size,
+        parallelcomp_query_tokens=args.parallelcomp_query_tokens,
+        parallelcomp_topk_chunks=args.parallelcomp_topk_chunks,
+        parallelcomp_min_prompt_tokens=args.parallelcomp_min_prompt_tokens,
+        parallelcomp_keep_first_chunk=args.parallelcomp_keep_first_chunk,
+        parallelcomp_hidden_topk=args.parallelcomp_hidden_topk,
+        parallelcomp_token_capacity=args.parallelcomp_token_capacity,
+        parallelcomp_token_keep_min=args.parallelcomp_token_keep_min,
+        parallelcomp_high_score_threshold=args.parallelcomp_high_score_threshold,
+        parallelcomp_structural_bias=args.parallelcomp_structural_bias,
+        parallelcomp_structural_bias_strength=args.parallelcomp_structural_bias_strength,
     )
 
     tokenizer = model.tokenizer
@@ -184,31 +262,42 @@ def main():
                 all_results[cfg] = json.load(f)
             continue
 
-        ds = load_dataset(
-            'JetBrains-Research/lca-project-level-code-completion',
-            cfg, split='test'
+        items, data_source, local_path = load_items_for_config(
+            cfg, local_input_data_template=args.local_input_data_template
         )
-        items = list(ds)
-        subset = filter_top_percent(items, args.top_percent, total_context_chars)
+        if data_source == 'local':
+            print(f"  Loaded local preprocessed inputs from: {local_path}")
+            subset = filter_top_percent(items, args.top_percent, total_prepared_chars)
+        else:
+            subset = filter_top_percent(items, args.top_percent, total_context_chars)
+        if args.max_examples is not None:
+            subset = subset[:args.max_examples]
+            print(f"  Capped to first {len(subset)} examples after filtering")
 
         em_by_cat = {}
         es_by_cat = {}
         predictions_all = []
 
         for ex_idx, item in enumerate(subset):
-            snap             = item.get('repo_snapshot', {})
-            cf               = item.get('completion_file', {})
             completion_lines = item.get('completion_lines', {})
+            if data_source == 'local':
+                cf_filename = item.get('completion_file')
+                cf_content = item.get('completion', '')
+                cf_line_list = cf_content.split('\n')
+                repo_name = item.get('repo_name', item.get('repo', ''))
+                repo_ctx = item.get('context', '')
+            else:
+                snap = item.get('repo_snapshot', {})
+                cf = item.get('completion_file', {})
+                cf_filename = cf.get('filename', 'unknown.py') if isinstance(cf, dict) else 'unknown.py'
+                cf_content = cf.get('content', '') if isinstance(cf, dict) else ''
+                cf_line_list = cf_content.split('\n')
+                repo_name = item.get('repo', '')
 
-            cf_filename  = cf.get('filename', 'unknown.py') if isinstance(cf, dict) else 'unknown.py'
-            cf_content   = cf.get('content', '')            if isinstance(cf, dict) else ''
-            cf_line_list = cf_content.split('\n')
-            repo_name    = item.get('repo', '')
-
-            # Build repo context once per item:
-            # - completion file excluded (only its path marker appended at end)
-            # - farthest files first so closest survive left-truncation
-            repo_ctx = build_repo_context(snap, completion_filepath=cf_filename, repo_name=repo_name)
+                # Build repo context once per item:
+                # - completion file excluded (only its path marker appended at end)
+                # - farthest files first so closest survive left-truncation
+                repo_ctx = build_repo_context(snap, completion_filepath=cf_filename, repo_name=repo_name)
 
             example_rec = {
                 'repo':            item.get('repo', ''),
