@@ -265,7 +265,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Dream
 class DreamMLP(nn.Module):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -803,7 +803,7 @@ class DreamBaseModel(DreamPreTrainedModel):
         config: DreamConfig
     """
 
-    def __init__(self, config: DreamConfig, **kwargs):
+    def __init__(self, config: DreamConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -878,40 +878,54 @@ class DreamBaseModel(DreamPreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers:
+        per_layer_attention_mask = isinstance(attention_mask, (list, tuple))
+        per_layer_position_ids = isinstance(position_ids, (list, tuple))
+        per_layer_cache_position = isinstance(cache_position, (list, tuple))
+
+        shared_position_embeddings = None
+        if not per_layer_position_ids:
+            shared_position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            layer_attention_mask = attention_mask[layer_idx] if per_layer_attention_mask else attention_mask
+            layer_position_ids = position_ids[layer_idx] if per_layer_position_ids else position_ids
+            layer_cache_position = cache_position[layer_idx] if per_layer_cache_position else cache_position
+            layer_position_embeddings = (
+                self.rotary_emb(hidden_states, layer_position_ids)
+                if per_layer_position_ids
+                else shared_position_embeddings
+            )
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
-                    attention_mask,
-                    position_ids,
+                    layer_attention_mask,
+                    layer_position_ids,
                     past_key_values,
                     output_attentions,
                     use_cache,
-                    cache_position,
-                    position_embeddings,
+                    layer_cache_position,
+                    layer_position_embeddings,
                 )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    attention_mask=attention_mask,
+                    attention_mask=layer_attention_mask,
                     update_kvcache=update_kvcache,
-                    position_ids=position_ids,
+                    position_ids=layer_position_ids,
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
+                    cache_position=layer_cache_position,
+                    position_embeddings=layer_position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]
@@ -938,7 +952,7 @@ class DreamBaseModel(DreamPreTrainedModel):
 class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, **kwargs):
+    def __init__(self, config):
         super().__init__(config)
         self.model = DreamBaseModel(config)
         self.vocab_size = config.vocab_size
