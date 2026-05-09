@@ -279,6 +279,9 @@ cd Discrete-Diffusion-Forcing
 
 #### Environment Configuration
 
+The mllm experiments use a conda environment installed from `requirements.txt`.
+`pyproject.toml` mirrors the same dependency set for `uv` users.
+
 ##### UV (Recommended)
 
 ```shell
@@ -289,12 +292,16 @@ uv sync
 
 ```shell
 # Create and activate a conda environment
-conda create -n d2f python=3.10
-conda activate d2f
+conda create -n d2f_eval_parallelcomp python=3.10
+conda activate d2f_eval_parallelcomp
 
 # Install dependencies
+pip install -U pip
 pip install -r requirements.txt
 ```
+
+If your machine needs a specific CUDA-enabled PyTorch wheel, install the matching
+PyTorch build first, then run `pip install -r requirements.txt`.
 
 #### vLLM Installation
 

@@ -33,7 +33,19 @@ bash run_infinitebench_parallelcomp.sh passkey 128 5
 
 ## mllm Environment
 
-The paths below match the current mllm setup. Adjust them if you run elsewhere.
+The current mllm setup uses the root `requirements.txt` inside a conda
+environment. From a fresh checkout:
+
+```shell
+cd /home/ma-user/work/Discrete-Diffusion-Forcing
+conda create -n d2f_eval_parallelcomp python=3.10
+conda activate d2f_eval_parallelcomp
+pip install -U pip
+pip install -r requirements.txt
+```
+
+The paths below match the current mllm runtime. Adjust them if you run
+elsewhere.
 
 ```shell
 export REPO=/home/ma-user/work/Discrete-Diffusion-Forcing
