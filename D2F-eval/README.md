@@ -9,6 +9,12 @@ cd D2F-eval
 python eval_infinitebench.py ...
 ```
 
+There is also a current shell wrapper:
+
+```shell
+bash run_infinitebench_parallelcomp.sh passkey 128 5
+```
+
 ## Main Files
 
 - `eval_infinitebench.py`: main entry for InfiniteBench. This is the current
@@ -45,6 +51,14 @@ Run `passkey` first. This verifies that pre-runtime chunk selection,
 query-conditioned cache rebuild, token eviction, and query replay are all wired
 together.
 
+Short form:
+
+```shell
+CUDA_VISIBLE_DEVICES=0 bash run_infinitebench_parallelcomp.sh passkey 128 5
+```
+
+The equivalent explicit command is:
+
 ```shell
 CUDA_VISIBLE_DEVICES=0 $PYTHON eval_infinitebench.py \
   --model_type dream \
@@ -73,6 +87,14 @@ CUDA_VISIBLE_DEVICES=0 $PYTHON eval_infinitebench.py \
 
 Then run `number_string`. It is more sensitive to exact copying, so use it as a
 second smoke rather than the first pipeline check.
+
+Short form:
+
+```shell
+CUDA_VISIBLE_DEVICES=0 bash run_infinitebench_parallelcomp.sh number_string 512 5
+```
+
+The equivalent explicit command is:
 
 ```shell
 CUDA_VISIBLE_DEVICES=0 $PYTHON eval_infinitebench.py \
