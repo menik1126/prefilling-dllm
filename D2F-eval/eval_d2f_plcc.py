@@ -1,0 +1,442 @@
+"""
+Evaluate LLaDA/DREAM on LCA Project-level Code Completion (top-N% longest context).
+Metrics: Exact Match (EM) and Edit Similarity (ES) per line category.
+
+Default behavior follows the validated h20 legacy wrapper:
+  1. Files are sorted by path distance from the completion file (closest last),
+     so the most relevant files survive the context window truncation.
+  2. For BM25 retrieval, we still use a character-budget heuristic
+     (prompt_token_limit * 6) only to decide how many repo files to pack.
+     The final assembled prompt is no longer sliced again at the character level.
+
+Usage:
+  python eval_d2f_plcc.py \
+    --model_type llada \
+    --pretrained GSAI-ML/LLaDA-8B-Instruct \
+    --top_percent 30 \
+    --output_dir ./results_nolora
+"""
+import argparse
+import json
+import os
+import sys
+from json import JSONDecodeError
+
+os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+sys.path.insert(0, os.path.dirname(__file__))
+
+from plcc_file_retrieval import (
+    build_repo_context_bm25,
+    build_repo_file_segments,
+    build_repo_context_path_distance,
+)
+
+CONFIGS = ['small_context', 'medium_context', 'large_context', 'huge_context']
+
+
+def build_repo_context(snap, completion_filepath=None):
+    repo_ctx, _ = build_repo_context_path_distance(
+        snap, completion_filepath=completion_filepath
+    )
+    return repo_ctx
+
+
+def total_context_chars(item):
+    """Total chars across repo_snapshot + completion_file (used for top-% filtering)."""
+    snap = item.get('repo_snapshot', {})
+    contents = snap.get('content', []) if isinstance(snap, dict) else []
+    ctx_len = sum(len(c) for c in contents if isinstance(c, str))
+    cf = item.get('completion_file', {})
+    file_content = cf.get('content', '') if isinstance(cf, dict) else ''
+    return ctx_len + len(file_content)
+
+
+def filter_top_percent(items, top_percent, key_fn):
+    indexed = sorted(enumerate(items), key=lambda x: key_fn(x[1]), reverse=True)
+    top_n = max(1, int(len(indexed) * top_percent / 100))
+    subset = [item for _, item in indexed[:top_n]]
+    threshold = key_fn(indexed[top_n - 1][1])
+    print(f"  Total: {len(items)}, top {top_percent}% = {len(subset)} items")
+    print(f"  Context length threshold: >= {threshold:,} chars")
+    return subset
+
+
+def edit_similarity(pred, gt):
+    try:
+        from thefuzz import fuzz
+        return fuzz.ratio(pred.strip(), gt.strip()) / 100.0
+    except Exception:
+        return 1.0 if pred.strip() == gt.strip() else 0.0
+
+
+def make_example_key(repo, completion_file):
+    return f"{repo}::{completion_file}"
+
+
+def update_metric_buffers_from_record(record, em_by_cat, es_by_cat):
+    for cat, entries in record.get('predictions', {}).items():
+        for entry in entries:
+            em_by_cat.setdefault(cat, []).append(entry['em'])
+            es_by_cat.setdefault(cat, []).append(entry['es'])
+
+
+def load_existing_predictions(out_file):
+    predictions = []
+    completed_keys = set()
+    last_good_pos = 0
+    saw_decode_error = False
+
+    if not os.path.exists(out_file):
+        return predictions, completed_keys
+
+    with open(out_file, 'r', encoding='utf-8') as f:
+        while True:
+            pos = f.tell()
+            line = f.readline()
+            if not line:
+                last_good_pos = pos
+                break
+            if not line.strip():
+                last_good_pos = f.tell()
+                continue
+            try:
+                rec = json.loads(line)
+            except JSONDecodeError:
+                saw_decode_error = True
+                last_good_pos = pos
+                break
+
+            predictions.append(rec)
+            completed_keys.add(
+                make_example_key(
+                    rec.get('repo', ''),
+                    rec.get('completion_file', ''),
+                )
+            )
+            last_good_pos = f.tell()
+
+    if saw_decode_error:
+        with open(out_file, 'rb+') as f:
+            f.truncate(last_good_pos)
+        print(f"  Trimmed a partial JSONL tail while resuming: {out_file}")
+
+    return predictions, completed_keys
+
+
+def append_prediction_record(out_file, record):
+    with open(out_file, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Eval LLaDA/DREAM on LCA PLCC')
+    parser.add_argument('--model_type', choices=['llada', 'dream'], required=True)
+    parser.add_argument('--pretrained', required=True)
+    parser.add_argument('--lora_path', default=None)
+    parser.add_argument('--top_percent', type=float, default=30)
+    parser.add_argument('--configs', nargs='+', default=CONFIGS)
+    parser.add_argument('--max_new_tokens', type=int, default=128)
+    parser.add_argument('--max_length', type=int, default=None,
+                        help='Model total context window (tokens). '
+                             'Default: 2048 for dream, 4096 for llada.')
+    parser.add_argument('--rope_scale_factor', type=float, default=1.0)
+    parser.add_argument('--block_size', type=int, default=16)
+    parser.add_argument('--temperature', type=float, default=0.2)
+    parser.add_argument('--parallelcomp_mode', action='store_true')
+    parser.add_argument('--parallelcomp_pre_runtime_mode', action='store_true')
+    parser.add_argument('--parallelcomp_cache_compress_mode', action='store_true')
+    parser.add_argument('--parallelcomp_chunk_size', type=int, default=256)
+    parser.add_argument(
+        '--parallelcomp_query_tokens',
+        type=int,
+        default=0,
+        help='Compatibility flag only. Prompt-tail query blocks are disabled in the fixed-NL ParallelComp path.'
+    )
+    parser.add_argument('--parallelcomp_topk_chunks', type=int, default=4)
+    parser.add_argument('--parallelcomp_min_prompt_tokens', type=int, default=1024)
+    parser.add_argument('--parallelcomp_keep_first_chunk', action='store_true')
+    parser.add_argument('--parallelcomp_split_from_tail', action='store_true')
+    parser.add_argument('--parallelcomp_hidden_topk', type=int, default=32)
+    parser.add_argument('--parallelcomp_token_capacity', type=int, default=128)
+    parser.add_argument('--parallelcomp_token_keep_min', type=int, default=32)
+    parser.add_argument('--parallelcomp_high_score_threshold', type=float, default=None)
+    parser.add_argument('--parallelcomp_select_low_score_chunks', action='store_true')
+    parser.add_argument('--parallelcomp_fixed_query_text',
+                        default='Please complete the preceding code.')
+    parser.add_argument('--parallelcomp_tail_replay_full_mask', action='store_true')
+    parser.add_argument(
+        '--repo_file_selection',
+        choices=['path_distance', 'bm25'],
+        default='path_distance',
+        help='How to choose repo files before prompt assembly.'
+    )
+    parser.add_argument(
+        '--bm25_topk_files',
+        type=int,
+        default=0,
+        help='If > 0, hard cap BM25 retrieval to the top-k files.'
+    )
+    parser.add_argument(
+        '--bm25_fill_window',
+        action='store_true',
+        help='Keep appending BM25-ranked files until the target prompt budget is reached.'
+    )
+    parser.add_argument(
+        '--bm25_target_prompt_chars',
+        type=int,
+        default=0,
+        help='Target char budget for BM25 file packing. Defaults to prompt char budget.'
+    )
+    parser.add_argument(
+        '--bm25_query_max_lines',
+        type=int,
+        default=128,
+        help='Max completion-file prefix lines used to build the BM25 query.'
+    )
+    parser.add_argument(
+        '--bm25_query_max_chars',
+        type=int,
+        default=4000,
+        help='Max BM25 query chars.'
+    )
+    parser.add_argument('--output_dir', default='./results_nolora')
+    args = parser.parse_args()
+
+    # Determine token budget for the prompt
+    if args.max_length is None:
+        args.max_length = 4096 if args.model_type == 'llada' else 2048
+    prompt_token_limit = args.max_length - args.max_new_tokens   # e.g. 1920 or 3968
+    # Keep a char-budget heuristic only for BM25 file packing. We no longer
+    # slice the fully assembled prompt at the character level before tokenization.
+    max_prompt_chars = prompt_token_limit * 6
+    print(f"Prompt token limit : {prompt_token_limit}")
+    print(f"BM25 char budget hint: {max_prompt_chars:,}  (={prompt_token_limit}×6)")
+    print("Dataset source      : official HF test split")
+    print(f"Repo file selection : {args.repo_file_selection}")
+
+    from datasets import load_dataset
+    from d2f_model import load_model, generate
+
+    print(f"Loading {args.model_type} model from {args.pretrained}...")
+    model = load_model(
+        args.model_type, args.pretrained, args.lora_path,
+        rope_scale_factor=args.rope_scale_factor,
+        max_new_tokens=args.max_new_tokens,
+        max_length=args.max_length,
+        block_size=args.block_size,
+        temperature=args.temperature,
+        add_bos_token=True,
+        parallelcomp_mode=args.parallelcomp_mode,
+        parallelcomp_pre_runtime_mode=args.parallelcomp_pre_runtime_mode,
+        parallelcomp_cache_compress_mode=args.parallelcomp_cache_compress_mode,
+        parallelcomp_chunk_size=args.parallelcomp_chunk_size,
+        parallelcomp_query_tokens=args.parallelcomp_query_tokens,
+        parallelcomp_topk_chunks=args.parallelcomp_topk_chunks,
+        parallelcomp_min_prompt_tokens=args.parallelcomp_min_prompt_tokens,
+        parallelcomp_keep_first_chunk=args.parallelcomp_keep_first_chunk,
+        parallelcomp_split_from_tail=args.parallelcomp_split_from_tail,
+        parallelcomp_hidden_topk=args.parallelcomp_hidden_topk,
+        parallelcomp_token_capacity=args.parallelcomp_token_capacity,
+        parallelcomp_token_keep_min=args.parallelcomp_token_keep_min,
+        parallelcomp_high_score_threshold=args.parallelcomp_high_score_threshold,
+        parallelcomp_select_low_score_chunks=args.parallelcomp_select_low_score_chunks,
+        parallelcomp_fixed_query_text=args.parallelcomp_fixed_query_text,
+        parallelcomp_tail_replay_full_mask=args.parallelcomp_tail_replay_full_mask,
+    )
+
+    all_results = {}
+
+    for cfg in args.configs:
+        print(f"\n{'='*60}")
+        print(f"Config: {cfg}")
+        print('='*60)
+
+        # Skip if already completed
+        os.makedirs(args.output_dir, exist_ok=True)
+        out_file = os.path.join(
+            args.output_dir,
+            f"{args.model_type}_plcc_{cfg}_top{int(args.top_percent)}pct_predictions.jsonl"
+        )
+        metrics_file = out_file.replace('_predictions.jsonl', '_metrics.json')
+        if os.path.exists(metrics_file):
+            print(f"  Already done, skipping. ({metrics_file})")
+            with open(metrics_file) as f:
+                all_results[cfg] = json.load(f)
+            continue
+
+        ds = load_dataset(
+            'JetBrains-Research/lca-project-level-code-completion',
+            cfg, split='test'
+        )
+        items = list(ds)
+        subset = filter_top_percent(items, args.top_percent, total_context_chars)
+
+        em_by_cat = {}
+        es_by_cat = {}
+        predictions_all, completed_keys = load_existing_predictions(out_file)
+        if predictions_all:
+            print(f"  Resuming from {len(predictions_all)} completed examples in {out_file}")
+            for rec in predictions_all:
+                update_metric_buffers_from_record(rec, em_by_cat, es_by_cat)
+
+        for ex_idx, item in enumerate(subset):
+            snap             = item.get('repo_snapshot', {})
+            cf               = item.get('completion_file', {})
+            completion_lines = item.get('completion_lines', {})
+
+            cf_filename  = cf.get('filename', 'unknown.py') if isinstance(cf, dict) else 'unknown.py'
+            cf_content   = cf.get('content', '')            if isinstance(cf, dict) else ''
+            cf_line_list = cf_content.split('\n')
+            example_key = make_example_key(item.get('repo', ''), cf_filename)
+            if example_key in completed_keys:
+                continue
+
+            target_line_nums = [
+                int(ln)
+                for line_nums in completion_lines.values()
+                if line_nums
+                for ln in line_nums
+                if isinstance(ln, int)
+            ]
+            max_prefix_chars = 0
+            if target_line_nums:
+                max_prefix_chars = max(
+                    len('\n'.join(cf_line_list[:ln]))
+                    for ln in target_line_nums
+                )
+            completion_path_prefix = f"\n\n# path: {cf_filename}\n"
+            bm25_repo_char_budget = max(
+                0,
+                (args.bm25_target_prompt_chars or max_prompt_chars)
+                - len(completion_path_prefix)
+                - max_prefix_chars,
+            )
+
+            if args.repo_file_selection == 'bm25':
+                repo_ctx, retrieval_meta = build_repo_context_bm25(
+                    snap,
+                    completion_filepath=cf_filename,
+                    completion_content=cf_content,
+                    completion_lines=completion_lines,
+                    topk_files=args.bm25_topk_files,
+                    fill_window=args.bm25_fill_window,
+                    target_prompt_chars=bm25_repo_char_budget,
+                    query_max_lines=args.bm25_query_max_lines,
+                    query_max_chars=args.bm25_query_max_chars,
+                )
+                retrieval_meta['target_repo_context_chars'] = bm25_repo_char_budget
+                retrieval_meta['reserved_completion_prefix_chars'] = max_prefix_chars
+            else:
+                repo_ctx, retrieval_meta = build_repo_context_path_distance(
+                    snap, completion_filepath=cf_filename
+                )
+
+            repo_segments = None
+            if args.parallelcomp_pre_runtime_mode and args.model_type == 'dream':
+                repo_segments = build_repo_file_segments(
+                    snap,
+                    ordered_filenames=retrieval_meta.get('selected_files'),
+                    completion_filepath=cf_filename,
+                )
+
+            example_rec = {
+                'repo':            item.get('repo', ''),
+                'config':          cfg,
+                'completion_file': cf_filename,
+                'predictions':     {},
+                'retrieval':       retrieval_meta,
+            }
+
+            # Build per-line prompts
+            line_prompts = []
+            for cat, line_nums in completion_lines.items():
+                if not line_nums:
+                    continue
+                for ln in line_nums:
+                    prefix = '\n'.join(cf_line_list[:ln])
+                    if repo_segments is not None:
+                        prompt = {
+                            'context_segments': repo_segments,
+                            'query': f"\n\n# path: {cf_filename}\n{prefix}",
+                            'scoring_query': f"{cf_filename}\n{prefix}",
+                            'metadata_label': f"{item.get('repo', '')}:{cf_filename}:{ln}",
+                        }
+                    else:
+                        prompt = repo_ctx + f"\n\n# path: {cf_filename}\n{prefix}"
+                    gt = cf_line_list[ln] if ln < len(cf_line_list) else ''
+                    line_prompts.append((cat, ln, prompt, gt))
+
+            if not line_prompts:
+                predictions_all.append(example_rec)
+                append_prediction_record(out_file, example_rec)
+                completed_keys.add(example_key)
+                continue
+
+            prompts = [lp[2] for lp in line_prompts]
+            outputs = generate(model, prompts, stop_tokens=['\n'])
+
+            # Evaluate
+            for (cat, ln, _, gt), out in zip(line_prompts, outputs):
+                pred_line = out.split('\n')[0]
+
+                em_score = int(pred_line.strip() == gt.strip())
+                es_score = edit_similarity(pred_line, gt)
+
+                em_by_cat.setdefault(cat, []).append(em_score)
+                es_by_cat.setdefault(cat, []).append(es_score)
+
+                example_rec['predictions'].setdefault(cat, []).append({
+                    'line_num': ln,
+                    'gt':       gt,
+                    'pred':     pred_line,
+                    'em':       em_score,
+                    'es':       es_score,
+                })
+
+            predictions_all.append(example_rec)
+            append_prediction_record(out_file, example_rec)
+            completed_keys.add(example_key)
+
+            if (ex_idx + 1) % 5 == 0:
+                print(f"  [{ex_idx+1}/{len(subset)}] done")
+        print(f"\nPredictions saved to: {out_file}")
+
+        # Compute and save metrics
+        metrics = {}
+        print(f"\n=== PLCC {cfg} Metrics ===")
+        all_em, all_es = [], []
+        for cat in sorted(em_by_cat.keys()):
+            em_list = em_by_cat[cat]
+            es_list = es_by_cat[cat]
+            em_score = sum(em_list) / len(em_list) if em_list else 0.0
+            es_score = sum(es_list) / len(es_list) if es_list else 0.0
+            metrics[cat] = {'em': em_score, 'es': es_score, 'n': len(em_list)}
+            print(f"  {cat:20s}: EM={em_score:.4f}, ES={es_score:.4f}  (n={len(em_list)})")
+            all_em.extend(em_list)
+            all_es.extend(es_list)
+
+        overall_em = sum(all_em) / len(all_em) if all_em else 0.0
+        overall_es = sum(all_es) / len(all_es) if all_es else 0.0
+        metrics['overall'] = {'em': overall_em, 'es': overall_es, 'n': len(all_em)}
+        print(f"  {'overall':20s}: EM={overall_em:.4f}, ES={overall_es:.4f}  (n={len(all_em)})")
+
+        with open(metrics_file, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Metrics saved to: {metrics_file}")
+
+        all_results[cfg] = metrics
+
+    # Save combined metrics
+    combined_file = os.path.join(
+        args.output_dir,
+        f"{args.model_type}_plcc_all_top{int(args.top_percent)}pct_metrics.json"
+    )
+    with open(combined_file, 'w') as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\nAll configs combined metrics: {combined_file}")
+
+
+if __name__ == '__main__':
+    main()

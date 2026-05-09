@@ -1,2 +1,15 @@
 evals_*
 *.pyc
+
+# Python / OS artifacts
+__pycache__/
+*.py[cod]
+.DS_Store
+._*
+D2F-eval/._*
+
+# Local model/data artifacts
+D2F-eval/model_weights/
+D2F-eval/logs/
+D2F-eval/results*/
+D2F-eval/evals_*/
