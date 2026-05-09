@@ -303,6 +303,13 @@ vLLM is comming soon, right now we only implemented the basic functions of vLLM.
 ### 2. Evaluation
 All evaluation scripts are located in the `D2F-eval` directory.
 
+For the ParallelComp / Dream long-context branch, start with
+[`D2F-eval/README.md`](D2F-eval/README.md). The main InfiniteBench entry is
+`D2F-eval/eval_infinitebench.py`; `D2F-eval/eval_dream.py` contains the Dream
+runtime and ParallelComp-style cache compression implementation. Files named
+`debug_*`, `analyze_*`, `queue_*`, or `*.bak_*` are experiment/debug helpers
+rather than default entry points.
+
 ```shell
 cd D2F-eval
 ```
