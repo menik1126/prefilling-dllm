@@ -370,7 +370,7 @@ class DreamLoRA(LM):
         parallelcomp_fixed_query_text: Optional[str] = "Please complete the preceding code.",
         parallelcomp_pooling: Optional[str] = "maxpool",
         parallelcomp_pooling_kernel_size: Optional[int] = 7,
-        parallelcomp_tail_replay_full_mask: Optional[bool] = False,
+        parallelcomp_tail_replay_full_mask: Optional[bool] = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1354,6 +1354,112 @@ class DreamLoRA(LM):
             last_logits,
         )
 
+    def _rebuild_parallelcomp_context_cache_with_query(
+        self,
+        x_t: torch.Tensor,
+        past_key_values,
+        block_states,
+        stable_prompt_block_ids: List[int],
+        cached_positions_per_layer: List[torch.Tensor],
+        cached_block_ranges_per_layer: List[dict],
+    ) -> Tuple[object, List[torch.Tensor], List[dict]]:
+        if past_key_values is None or len(stable_prompt_block_ids) <= 1:
+            return past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer
+
+        tail_prompt_block_id = stable_prompt_block_ids[-1]
+        context_prompt_block_ids = stable_prompt_block_ids[:-1]
+        if not context_prompt_block_ids:
+            return past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer
+
+        tail_state = block_states[tail_prompt_block_id]
+        tail_input_ids = x_t[:, tail_state["start_pos"]:tail_state["end_pos"]]
+        tail_len = int(tail_input_ids.shape[1])
+        if tail_len <= 0:
+            return past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer
+
+        reused_window_size = max(1, self._get_reused_window_size(block_states))
+        rebuilt_key_parts = None
+        rebuilt_value_parts = None
+        rebuilt_cache = None
+        rebuilt_ranges = {}
+        cursor = 0
+
+        for block_id in context_prompt_block_ids:
+            state = block_states[block_id]
+            block_input_ids = x_t[:, state["start_pos"]:state["end_pos"]]
+            block_len = int(block_input_ids.shape[1])
+            if block_len <= 0:
+                continue
+
+            joint_input_ids = torch.cat([block_input_ids, tail_input_ids], dim=1)
+            joint_len = int(joint_input_ids.shape[1])
+            block_positions = torch.arange(block_len, device=self.device, dtype=torch.long)
+            tail_positions = torch.arange(
+                reused_window_size,
+                reused_window_size + tail_len,
+                device=self.device,
+                dtype=torch.long,
+            )
+            position_ids = torch.cat([block_positions, tail_positions], dim=0).unsqueeze(0)
+            cache_position = torch.arange(joint_len, device=self.device, dtype=torch.long)
+
+            outputs = self.model(
+                joint_input_ids,
+                attention_mask=self._build_full_visible_attention_mask(joint_len),
+                position_ids=position_ids,
+                cache_position=cache_position,
+                use_cache=True,
+                update_kvcache=joint_len,
+            )
+            block_cache = outputs.past_key_values
+            if rebuilt_cache is None:
+                rebuilt_cache = block_cache
+                rebuilt_key_parts = [[] for _ in block_cache.key_cache]
+                rebuilt_value_parts = [[] for _ in block_cache.value_cache]
+
+            for layer_idx, (layer_k, layer_v) in enumerate(
+                zip(block_cache.key_cache, block_cache.value_cache)
+            ):
+                rebuilt_key_parts[layer_idx].append(layer_k[:, :, :block_len, :])
+                rebuilt_value_parts[layer_idx].append(layer_v[:, :, :block_len, :])
+
+            rebuilt_ranges[block_id] = (cursor, cursor + block_len)
+            cursor += block_len
+
+        if rebuilt_cache is None:
+            return past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer
+
+        rebuilt_cache.key_cache = [
+            torch.cat(parts, dim=2) if parts else layer_k[:, :, :0, :]
+            for parts, layer_k in zip(rebuilt_key_parts, rebuilt_cache.key_cache)
+        ]
+        rebuilt_cache.value_cache = [
+            torch.cat(parts, dim=2) if parts else layer_v[:, :, :0, :]
+            for parts, layer_v in zip(rebuilt_value_parts, rebuilt_cache.value_cache)
+        ]
+
+        rebuilt_cached_positions_per_layer = [
+            torch.arange(cursor, device=self.device, dtype=torch.long)
+            for _ in rebuilt_cache.key_cache
+        ]
+        rebuilt_cached_block_ranges_per_layer = [
+            dict(rebuilt_ranges) for _ in rebuilt_cache.key_cache
+        ]
+
+        self._emit_parallelcomp_runtime_summary(
+            "[ParallelComp] query_conditioned_context_rebuild "
+            f"context_blocks={len(context_prompt_block_ids)} "
+            f"tail_prompt_block={tail_prompt_block_id} "
+            f"tail_prompt_len={tail_len} "
+            f"rebuilt_context_tokens={cursor} "
+            f"reused_window_size={reused_window_size}"
+        )
+        return (
+            rebuilt_cache,
+            rebuilt_cached_positions_per_layer,
+            rebuilt_cached_block_ranges_per_layer,
+        )
+
     def _resolve_prompt_scoring_query(
         self,
         prompt: Optional[Dict[str, Any]],
@@ -1825,6 +1931,18 @@ class DreamLoRA(LM):
             return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False, None
 
         tail_prompt_state = block_states[tail_prompt_block_id]
+        (
+            past_key_values,
+            cached_positions_per_layer,
+            cached_block_ranges_per_layer,
+        ) = self._rebuild_parallelcomp_context_cache_with_query(
+            x_t=x_t,
+            past_key_values=past_key_values,
+            block_states=block_states,
+            stable_prompt_block_ids=stable_prompt_block_ids,
+            cached_positions_per_layer=cached_positions_per_layer,
+            cached_block_ranges_per_layer=cached_block_ranges_per_layer,
+        )
         scoring_query_ids = self._build_parallelcomp_scoring_query_ids()
         if not scoring_query_ids:
             return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False, None

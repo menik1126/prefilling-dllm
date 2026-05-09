@@ -138,7 +138,11 @@ def build_arg_parser():
         "--parallelcomp_fixed_query_text",
         default="Please answer the question using the long context above.",
     )
-    parser.add_argument("--parallelcomp_tail_replay_full_mask", action="store_true")
+    parser.add_argument(
+        "--parallelcomp_tail_replay_full_mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     return parser
 
 
