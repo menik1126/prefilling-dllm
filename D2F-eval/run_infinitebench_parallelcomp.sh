@@ -18,6 +18,9 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
 BLOCK_SIZE="${BLOCK_SIZE:-32}"
 CHUNK_SIZE="${PARALLELCOMP_CHUNK_SIZE:-1024}"
 TOPK_CHUNKS="${PARALLELCOMP_TOPK_CHUNKS:-3}"
+CHUNK_SCORE_QUERY_WINDOW="${PARALLELCOMP_CHUNK_SCORE_QUERY_WINDOW:-${PARALLELCOMP_QUERY_WINDOW:-0}}"
+RECENT_TOKEN_WINDOW="${PARALLELCOMP_RECENT_TOKEN_WINDOW:-${PARALLELCOMP_QUERY_WINDOW:-0}}"
+CHUNK_SCORE_ATTENTION_MASK="${PARALLELCOMP_LOCAL_ATTENTION_MASK:-${PARALLELCOMP_CHUNK_SCORE_ATTENTION_MASK:-query_to_chunk}}"
 TOKEN_KEEP_MIN="${PARALLELCOMP_TOKEN_KEEP_MIN:-32}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/results_infinitebench_${TASK}_n${MAX_EXAMPLES}_cap${TOKEN_CAPACITY}_${RUN_TAG}}"
@@ -31,6 +34,8 @@ cd "$SCRIPT_DIR"
 echo "Task                : ${TASK}"
 echo "Token capacity      : ${TOKEN_CAPACITY}"
 echo "Max examples        : ${MAX_EXAMPLES}"
+echo "Local attention mask: ${CHUNK_SCORE_ATTENTION_MASK}"
+echo "Query windows       : score=${CHUNK_SCORE_QUERY_WINDOW}, token=${RECENT_TOKEN_WINDOW}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "Output dir          : ${OUTPUT_DIR}"
 
@@ -51,8 +56,10 @@ echo "Output dir          : ${OUTPUT_DIR}"
   --parallelcomp_cache_compress_mode \
   --parallelcomp_chunk_size "$CHUNK_SIZE" \
   --parallelcomp_topk_chunks "$TOPK_CHUNKS" \
+  --parallelcomp_chunk_score_query_window "$CHUNK_SCORE_QUERY_WINDOW" \
+  --parallelcomp_chunk_score_attention_mask "$CHUNK_SCORE_ATTENTION_MASK" \
+  --parallelcomp_recent_token_window "$RECENT_TOKEN_WINDOW" \
   --parallelcomp_min_prompt_tokens 1 \
-  --parallelcomp_keep_first_chunk \
   --parallelcomp_token_capacity "$TOKEN_CAPACITY" \
   --parallelcomp_token_keep_min "$TOKEN_KEEP_MIN" \
   --parallelcomp_tail_replay_full_mask \

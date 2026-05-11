@@ -358,7 +358,9 @@ class DreamLoRA(LM):
         parallelcomp_min_prompt_tokens: Optional[int] = 1024,
         parallelcomp_keep_first_chunk: Optional[bool] = False,
         parallelcomp_split_from_tail: Optional[bool] = False,
-        parallelcomp_recent_token_window: Optional[int] = 8,
+        parallelcomp_recent_token_window: Optional[int] = 0,
+        parallelcomp_chunk_score_query_window: Optional[int] = 0,
+        parallelcomp_chunk_score_attention_mask: Optional[str] = "query_to_chunk",
         parallelcomp_hidden_topk: Optional[int] = 32,
         parallelcomp_token_capacity: Optional[int] = 128,
         parallelcomp_token_keep_min: Optional[int] = 32,
@@ -371,6 +373,7 @@ class DreamLoRA(LM):
         parallelcomp_pooling: Optional[str] = "maxpool",
         parallelcomp_pooling_kernel_size: Optional[int] = 7,
         parallelcomp_tail_replay_full_mask: Optional[bool] = True,
+        parallelcomp_query_free_cache_rebuild: Optional[bool] = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -448,6 +451,12 @@ class DreamLoRA(LM):
         self.parallelcomp_keep_first_chunk = parallelcomp_keep_first_chunk
         self.parallelcomp_split_from_tail = parallelcomp_split_from_tail
         self.parallelcomp_recent_token_window = parallelcomp_recent_token_window
+        self.parallelcomp_chunk_score_query_window = parallelcomp_chunk_score_query_window
+        self.parallelcomp_chunk_score_attention_mask = str(parallelcomp_chunk_score_attention_mask or "query_to_chunk").lower()
+        if self.parallelcomp_chunk_score_attention_mask not in {"causal", "full", "full_visible", "query_to_chunk", "prefix_full"}:
+            raise ValueError(
+                f"Unsupported parallelcomp_chunk_score_attention_mask: {parallelcomp_chunk_score_attention_mask}"
+            )
         self.parallelcomp_hidden_topk = parallelcomp_hidden_topk
         self.parallelcomp_token_capacity = parallelcomp_token_capacity
         self.parallelcomp_token_keep_min = parallelcomp_token_keep_min
@@ -460,9 +469,12 @@ class DreamLoRA(LM):
         self.parallelcomp_pooling = parallelcomp_pooling
         self.parallelcomp_pooling_kernel_size = parallelcomp_pooling_kernel_size
         self.parallelcomp_tail_replay_full_mask = parallelcomp_tail_replay_full_mask
+        self.parallelcomp_query_free_cache_rebuild = bool(parallelcomp_query_free_cache_rebuild)
         self._parallelcomp_post_compression_position_offset = None
         self._parallelcomp_active_scoring_query_ids = None
         self._parallelcomp_active_scoring_query_source = None
+        self._parallelcomp_active_query_start = None
+        self._parallelcomp_active_query_end = None
         
         # Add metric tracking
         self.total_forward_passes = 0
@@ -652,10 +664,30 @@ class DreamLoRA(LM):
             dtype=dtype,
         )
 
+    def _build_parallelcomp_chunk_query_attention_mask(
+        self,
+        chunk_len: int,
+        query_len: int,
+    ) -> torch.Tensor:
+        seq_len = chunk_len + query_len
+        dtype = self.target_dtype if self.target_dtype is not None and self.target_dtype != "auto" else torch.bfloat16
+        mask = torch.zeros((1, 1, seq_len, seq_len), device=self.device, dtype=dtype)
+        if chunk_len > 0 and query_len > 0:
+            mask[:, :, :chunk_len, chunk_len:] = -torch.inf
+        return mask
+
     def _build_parallelcomp_scoring_attention_mask(
         self,
         seq_len: int,
+        chunk_len: Optional[int] = None,
+        query_len: Optional[int] = None,
     ) -> torch.Tensor:
+        if self.parallelcomp_chunk_score_attention_mask in {"full", "full_visible"}:
+            return self._build_full_visible_attention_mask(seq_len)
+        if self.parallelcomp_chunk_score_attention_mask in {"query_to_chunk", "prefix_full"}:
+            if chunk_len is None or query_len is None:
+                raise ValueError("query_to_chunk scoring mask requires chunk_len and query_len")
+            return self._build_parallelcomp_chunk_query_attention_mask(chunk_len, query_len)
         return self._build_causal_attention_mask(seq_len)
 
     def _pool_parallelcomp_token_scores(
@@ -712,11 +744,26 @@ class DreamLoRA(LM):
             return query_len
         return min(query_len, recent_window)
 
+    def _get_parallelcomp_chunk_score_query_window_size(
+        self,
+        query_len: int,
+    ) -> int:
+        if query_len <= 0:
+            return 0
+        score_window = int(self.parallelcomp_chunk_score_query_window or 0)
+        if score_window <= 0:
+            return query_len
+        return min(query_len, score_window)
+
     def _analyze_chunk_with_attentions(
         self, chunk_ids: List[int], query_ids: List[int]
     ) -> Tuple[float, torch.Tensor]:
         joint_ids = torch.tensor([chunk_ids + query_ids], device=self.device, dtype=torch.long)
-        attention_mask = self._build_parallelcomp_scoring_attention_mask(joint_ids.shape[1])
+        attention_mask = self._build_parallelcomp_scoring_attention_mask(
+            joint_ids.shape[1],
+            chunk_len=len(chunk_ids),
+            query_len=len(query_ids),
+        )
 
         with torch.inference_mode():
             outputs = self.model(
@@ -760,7 +807,11 @@ class DreamLoRA(LM):
             return float("inf")
 
         joint_ids = torch.tensor([chunk_ids + query_ids], device=self.device, dtype=torch.long)
-        attention_mask = self._build_causal_attention_mask(joint_ids.shape[1])
+        attention_mask = self._build_parallelcomp_scoring_attention_mask(
+            joint_ids.shape[1],
+            chunk_len=len(chunk_ids),
+            query_len=len(query_ids),
+        )
 
         with torch.inference_mode():
             outputs = self.model(
@@ -773,7 +824,7 @@ class DreamLoRA(LM):
         logits = outputs.logits
         chunk_len = len(chunk_ids)
         query_len = len(query_ids)
-        query_window = self._get_parallelcomp_query_window_size(query_len)
+        query_window = self._get_parallelcomp_chunk_score_query_window_size(query_len)
         if query_window <= 0:
             return float("inf")
         if logits.shape[1] < chunk_len + query_len - 1:
@@ -906,7 +957,11 @@ class DreamLoRA(LM):
         self, chunk_ids: List[int], query_ids: List[int]
     ) -> List[torch.Tensor]:
         joint_ids = torch.tensor([chunk_ids + query_ids], device=self.device, dtype=torch.long)
-        attention_mask = self._build_parallelcomp_scoring_attention_mask(joint_ids.shape[1])
+        attention_mask = self._build_parallelcomp_scoring_attention_mask(
+            joint_ids.shape[1],
+            chunk_len=len(chunk_ids),
+            query_len=len(query_ids),
+        )
 
         with torch.inference_mode():
             outputs = self.model(
@@ -949,7 +1004,11 @@ class DreamLoRA(LM):
         num_cache_heads_per_layer: List[int],
     ) -> List[torch.Tensor]:
         joint_ids = torch.tensor([chunk_ids + query_ids], device=self.device, dtype=torch.long)
-        attention_mask = self._build_parallelcomp_scoring_attention_mask(joint_ids.shape[1])
+        attention_mask = self._build_parallelcomp_scoring_attention_mask(
+            joint_ids.shape[1],
+            chunk_len=len(chunk_ids),
+            query_len=len(query_ids),
+        )
 
         with torch.inference_mode():
             outputs = self.model(
@@ -995,6 +1054,216 @@ class DreamLoRA(LM):
                     grouped_scores.append(head_group.mean(dim=0))
             token_scores_per_layer_per_head.append(torch.stack(grouped_scores, dim=0))
         return token_scores_per_layer_per_head
+
+    def _score_parallelcomp_query_from_logits(
+        self,
+        logits: torch.Tensor,
+        joint_ids: torch.Tensor,
+        chunk_len: int,
+        query_len: int,
+    ) -> float:
+        query_window = self._get_parallelcomp_chunk_score_query_window_size(query_len)
+        if query_window <= 0 or logits.shape[1] < chunk_len + query_len - 1:
+            return float("-inf")
+        query_logits = logits[:, chunk_len + query_len - query_window - 1:chunk_len + query_len - 1, :]
+        query_labels = joint_ids[:, chunk_len + query_len - query_window:chunk_len + query_len]
+        if query_logits.shape[1] != query_labels.shape[1]:
+            return float("-inf")
+        log_probs = F.log_softmax(query_logits, dim=-1)
+        token_nll = -log_probs.gather(dim=-1, index=query_labels.unsqueeze(-1)).squeeze(-1)
+        return float(-token_nll.mean().item())
+
+    def _token_scores_from_parallelcomp_attentions(
+        self,
+        attn_layers,
+        chunk_len: int,
+        query_len: int,
+        num_cache_heads_per_layer: List[int],
+    ) -> List[torch.Tensor]:
+        if attn_layers is None or len(attn_layers) == 0 or chunk_len <= 0 or query_len <= 0:
+            return []
+        query_window = self._get_parallelcomp_query_window_size(query_len)
+        if query_window <= 0:
+            return []
+
+        query_start = chunk_len + query_len - query_window
+        query_end = chunk_len + query_len
+        token_scores_per_layer_per_head = []
+        for layer_idx, layer_attn in enumerate(attn_layers):
+            layer_attn = layer_attn[0]
+            cross_attn = layer_attn[:, query_start:query_end, :chunk_len]
+            num_cache_heads = (
+                num_cache_heads_per_layer[layer_idx]
+                if layer_idx < len(num_cache_heads_per_layer)
+                else layer_attn.shape[0]
+            )
+            if cross_attn.numel() == 0:
+                token_scores_per_layer_per_head.append(
+                    torch.empty((num_cache_heads, 0), device=self.device)
+                )
+                continue
+
+            query_head_scores = cross_attn.sum(dim=1)
+            query_head_scores = self._pool_parallelcomp_token_scores(query_head_scores)
+            grouped_scores = []
+            for head_group in torch.tensor_split(query_head_scores, num_cache_heads, dim=0):
+                if head_group.shape[0] == 0:
+                    grouped_scores.append(torch.zeros(chunk_len, device=self.device, dtype=query_head_scores.dtype))
+                else:
+                    grouped_scores.append(head_group.mean(dim=0))
+            token_scores_per_layer_per_head.append(torch.stack(grouped_scores, dim=0))
+        return token_scores_per_layer_per_head
+
+    def _select_cache_block_token_indices_from_scores_per_layer_per_head(
+        self,
+        token_scores_per_layer_per_head: List[torch.Tensor],
+        block_len: int,
+        num_cache_heads_per_layer: List[int],
+    ) -> Tuple[List[torch.Tensor], List[int]]:
+        if block_len <= 0:
+            return [], []
+        if not token_scores_per_layer_per_head:
+            default_indices = []
+            for num_heads in num_cache_heads_per_layer:
+                base = torch.arange(block_len, device=self.device, dtype=torch.long)
+                default_indices.append(base.unsqueeze(0).expand(num_heads, -1).clone())
+            return default_indices, [0 for _ in num_cache_heads_per_layer]
+
+        keep_indices_per_layer_per_head = []
+        evicted_high_per_layer = []
+        total_layers = max(1, len(token_scores_per_layer_per_head))
+        for layer_idx, head_scores in enumerate(token_scores_per_layer_per_head):
+            num_heads = (
+                num_cache_heads_per_layer[layer_idx]
+                if layer_idx < len(num_cache_heads_per_layer)
+                else head_scores.shape[0]
+            )
+            if head_scores.numel() == 0:
+                base = torch.arange(block_len, device=self.device, dtype=torch.long)
+                keep_indices_per_layer_per_head.append(base.unsqueeze(0).expand(num_heads, -1).clone())
+                evicted_high_per_layer.append(0)
+                continue
+
+            keep_min = min(block_len, max(1, int(self.parallelcomp_token_keep_min)))
+            token_capacity = max(1, int(self.parallelcomp_token_capacity))
+            keep_count = min(block_len, max(keep_min, token_capacity))
+
+            head_keep_indices = []
+            biased_head_scores = []
+            evicted_high = 0
+            for head_idx in range(head_scores.shape[0]):
+                biased_scores = self._apply_layer_structural_bias(
+                    token_scores=head_scores[head_idx],
+                    layer_idx=layer_idx,
+                    num_layers=total_layers,
+                )
+                biased_head_scores.append(biased_scores)
+                selected_indices, head_evicted_high = self._select_token_indices_from_scores(
+                    token_scores=biased_scores,
+                    keep_count=keep_count,
+                    keep_min=keep_min,
+                )
+                head_keep_indices.append(torch.tensor(selected_indices, device=self.device, dtype=torch.long))
+                evicted_high += head_evicted_high
+
+            padded_head_indices = []
+            for head_idx, index_tensor in enumerate(head_keep_indices):
+                if index_tensor.shape[0] < keep_count:
+                    token_scores = biased_head_scores[head_idx]
+                    remaining_mask = torch.ones(token_scores.shape[0], dtype=torch.bool, device=token_scores.device)
+                    remaining_mask[index_tensor] = False
+                    remaining_indices = torch.arange(token_scores.shape[0], device=token_scores.device)[remaining_mask]
+                    if remaining_indices.numel() > 0:
+                        supplement_scores = token_scores[remaining_indices]
+                        supplement_local = supplement_scores.topk(
+                            min(keep_count - index_tensor.shape[0], remaining_indices.shape[0]),
+                            largest=False,
+                        ).indices
+                        supplement_indices = remaining_indices[supplement_local]
+                        index_tensor = torch.cat([index_tensor, supplement_indices], dim=0)
+                if index_tensor.shape[0] < keep_count:
+                    raise RuntimeError(
+                        "Failed to build a fixed-width per-head selection set for ParallelComp token eviction"
+                    )
+                padded_head_indices.append(torch.sort(index_tensor[:keep_count]).values)
+
+            keep_indices_per_layer_per_head.append(torch.stack(padded_head_indices, dim=0))
+            evicted_high_per_layer.append(evicted_high)
+
+        return keep_indices_per_layer_per_head, evicted_high_per_layer
+
+    def _run_parallelcomp_local_block_forward(
+        self,
+        block_input_ids: torch.Tensor,
+        query_ids: List[int],
+        reused_window_size: int,
+    ) -> Optional[Dict[str, Any]]:
+        block_len = int(block_input_ids.shape[1])
+        query_len = len(query_ids)
+        if block_len <= 0 or query_len <= 0:
+            return None
+
+        # One local ParallelComp pass: score the chunk from query NLL, score
+        # tokens from query->chunk attention, and keep the chunk KV slice.
+        query_input_ids = torch.tensor([query_ids], device=self.device, dtype=torch.long)
+        joint_ids = torch.cat([block_input_ids, query_input_ids], dim=1)
+        joint_len = block_len + query_len
+        block_positions = torch.arange(block_len, device=self.device, dtype=torch.long)
+        query_positions = torch.arange(
+            reused_window_size,
+            reused_window_size + query_len,
+            device=self.device,
+            dtype=torch.long,
+        )
+        position_ids = torch.cat([block_positions, query_positions], dim=0).unsqueeze(0)
+        cache_position = torch.arange(joint_len, device=self.device, dtype=torch.long)
+        attention_mask = self._build_parallelcomp_scoring_attention_mask(
+            joint_len,
+            chunk_len=block_len,
+            query_len=query_len,
+        )
+
+        with torch.inference_mode():
+            outputs = self.model(
+                joint_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                output_attentions=True,
+                return_dict=True,
+                use_cache=True,
+                update_kvcache=joint_len,
+            )
+
+        block_cache = outputs.past_key_values
+        num_cache_heads_per_layer = [layer_k.shape[1] for layer_k in block_cache.key_cache]
+        token_scores_per_layer_per_head = self._token_scores_from_parallelcomp_attentions(
+            outputs.attentions,
+            chunk_len=block_len,
+            query_len=query_len,
+            num_cache_heads_per_layer=num_cache_heads_per_layer,
+        )
+        per_layer_kept_indices, evicted_high_layers = self._select_cache_block_token_indices_from_scores_per_layer_per_head(
+            token_scores_per_layer_per_head=token_scores_per_layer_per_head,
+            block_len=block_len,
+            num_cache_heads_per_layer=num_cache_heads_per_layer,
+        )
+        score = self._score_parallelcomp_query_from_logits(
+            logits=outputs.logits,
+            joint_ids=joint_ids,
+            chunk_len=block_len,
+            query_len=query_len,
+        )
+
+        return {
+            "score": score,
+            "key_cache": [layer_k[:, :, :block_len, :] for layer_k in block_cache.key_cache],
+            "value_cache": [layer_v[:, :, :block_len, :] for layer_v in block_cache.value_cache],
+            "kept_indices": per_layer_kept_indices,
+            "evicted_high_layers": evicted_high_layers,
+            "num_cache_heads_per_layer": num_cache_heads_per_layer,
+            "block_len": block_len,
+        }
 
     def _build_layer_structural_prior(
         self,
@@ -1272,56 +1541,56 @@ class DreamLoRA(LM):
 
         return keep_indices_per_layer_per_head, evicted_high_per_layer
 
-    def _replay_parallelcomp_tail_prompt_block(
+    def _replay_parallelcomp_query_span(
         self,
         x_t: torch.Tensor,
-        tail_prompt_block_id: int,
-        block_states,
+        replay_start: int,
+        replay_end: int,
+        replay_range_key,
         past_key_values,
         cached_positions_per_layer: List[torch.Tensor],
         cached_block_ranges_per_layer: List[dict],
     ) -> Tuple[object, List[torch.Tensor], List[dict], int, torch.Tensor]:
-        tail_state = block_states[tail_prompt_block_id]
-        tail_input_ids = x_t[:, tail_state["start_pos"]:tail_state["end_pos"]]
-        tail_len = tail_input_ids.shape[1]
-        if tail_len <= 0:
-            raise ValueError("Tail prompt replay requested with an empty tail block")
+        replay_input_ids = x_t[:, replay_start:replay_end]
+        replay_len = replay_input_ids.shape[1]
+        if replay_len <= 0:
+            raise ValueError("ParallelComp query replay requested with an empty span")
 
         cached_length = (
             cached_positions_per_layer[0].shape[0]
             if cached_positions_per_layer
             else 0
         )
-        reused_window_size = max(1, self._get_reused_window_size(block_states))
+        reused_window_size = max(1, int(self.parallelcomp_chunk_size or 1))
         replay_positions = torch.arange(
             reused_window_size,
-            reused_window_size + tail_len,
+            reused_window_size + replay_len,
             device=self.device,
             dtype=torch.long,
         )
         replay_cache_positions = self._build_cache_slot_positions(
             cache_start=cached_length,
-            length=tail_len,
+            length=replay_len,
         )
         if self.parallelcomp_tail_replay_full_mask:
             attention_mask = self._build_cached_prefix_full_visible_attention_mask(
                 cached_length=cached_length,
-                query_length=tail_len,
+                query_length=replay_len,
             )
         else:
             attention_mask = self._build_cached_prefix_causal_attention_mask(
                 cached_length=cached_length,
-                query_length=tail_len,
+                query_length=replay_len,
             )
 
         outputs = self.model(
-            tail_input_ids,
+            replay_input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             position_ids=replay_positions.unsqueeze(0),
             cache_position=replay_cache_positions,
             use_cache=True,
-            update_kvcache=tail_len,
+            update_kvcache=replay_len,
         )
 
         past_key_values = outputs.past_key_values
@@ -1336,16 +1605,16 @@ class DreamLoRA(LM):
         new_cached_block_ranges_per_layer = []
         for layer_idx, layer_cached_positions in enumerate(cached_positions_per_layer):
             layer_start = layer_cached_positions.shape[0]
-            layer_end = layer_start + tail_len
+            layer_end = layer_start + replay_len
             new_cached_positions_per_layer.append(
                 torch.cat([layer_cached_positions, replay_cache_positions], dim=0)
             )
             layer_ranges = dict(cached_block_ranges_per_layer[layer_idx])
-            layer_ranges[tail_prompt_block_id] = (layer_start, layer_end)
+            layer_ranges[replay_range_key] = (layer_start, layer_end)
             new_cached_block_ranges_per_layer.append(layer_ranges)
 
-        last_logits = outputs.logits[:, tail_len - 1, :].unsqueeze(1)
-        total_cached_length = cached_length + tail_len
+        last_logits = outputs.logits[:, replay_len - 1, :].unsqueeze(1)
+        total_cached_length = cached_length + replay_len
         return (
             past_key_values,
             new_cached_positions_per_layer,
@@ -1391,25 +1660,32 @@ class DreamLoRA(LM):
             if block_len <= 0:
                 continue
 
-            joint_input_ids = torch.cat([block_input_ids, tail_input_ids], dim=1)
-            joint_len = int(joint_input_ids.shape[1])
             block_positions = torch.arange(block_len, device=self.device, dtype=torch.long)
-            tail_positions = torch.arange(
-                reused_window_size,
-                reused_window_size + tail_len,
-                device=self.device,
-                dtype=torch.long,
-            )
-            position_ids = torch.cat([block_positions, tail_positions], dim=0).unsqueeze(0)
-            cache_position = torch.arange(joint_len, device=self.device, dtype=torch.long)
+            if self.parallelcomp_query_free_cache_rebuild:
+                rebuild_input_ids = block_input_ids
+                rebuild_len = block_len
+                position_ids = block_positions.unsqueeze(0)
+                attention_mask = self._build_full_visible_attention_mask(rebuild_len)
+            else:
+                rebuild_input_ids = torch.cat([block_input_ids, tail_input_ids], dim=1)
+                rebuild_len = int(rebuild_input_ids.shape[1])
+                tail_positions = torch.arange(
+                    reused_window_size,
+                    reused_window_size + tail_len,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                position_ids = torch.cat([block_positions, tail_positions], dim=0).unsqueeze(0)
+                attention_mask = self._build_full_visible_attention_mask(rebuild_len)
+            cache_position = torch.arange(rebuild_len, device=self.device, dtype=torch.long)
 
             outputs = self.model(
-                joint_input_ids,
-                attention_mask=self._build_full_visible_attention_mask(joint_len),
+                rebuild_input_ids,
+                attention_mask=attention_mask,
                 position_ids=position_ids,
                 cache_position=cache_position,
                 use_cache=True,
-                update_kvcache=joint_len,
+                update_kvcache=rebuild_len,
             )
             block_cache = outputs.past_key_values
             if rebuilt_cache is None:
@@ -1452,7 +1728,8 @@ class DreamLoRA(LM):
             f"tail_prompt_block={tail_prompt_block_id} "
             f"tail_prompt_len={tail_len} "
             f"rebuilt_context_tokens={cursor} "
-            f"reused_window_size={reused_window_size}"
+            f"reused_window_size={reused_window_size} "
+            f"query_free_cache={self.parallelcomp_query_free_cache_rebuild}"
         )
         return (
             rebuilt_cache,
@@ -1925,75 +2202,118 @@ class DreamLoRA(LM):
         if stable_prefix_len <= 0:
             return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False, None
 
-        tail_prompt_block_id = stable_prompt_block_ids[-1]
-        context_prompt_block_ids = stable_prompt_block_ids[:-1]
-        if not context_prompt_block_ids:
+        query_span = self._get_active_prompt_query_span(prompt_length=x_t.shape[1])
+        if query_span is None:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False, None
+        query_start, query_end = query_span
+        if query_end > stable_prefix_len:
             return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False, None
 
-        tail_prompt_state = block_states[tail_prompt_block_id]
-        (
-            past_key_values,
-            cached_positions_per_layer,
-            cached_block_ranges_per_layer,
-        ) = self._rebuild_parallelcomp_context_cache_with_query(
-            x_t=x_t,
-            past_key_values=past_key_values,
-            block_states=block_states,
-            stable_prompt_block_ids=stable_prompt_block_ids,
-            cached_positions_per_layer=cached_positions_per_layer,
-            cached_block_ranges_per_layer=cached_block_ranges_per_layer,
-        )
+        context_prompt_units = []
+        query_prompt_block_id = None
+        for block_id in stable_prompt_block_ids:
+            state = block_states[block_id]
+            if state["start_pos"] <= query_start < state["end_pos"]:
+                query_prompt_block_id = block_id
+            context_start = state["start_pos"]
+            context_end = min(state["end_pos"], query_start)
+            if context_end <= context_start:
+                continue
+            context_prompt_units.append(
+                {
+                    "block_id": block_id,
+                    "start_pos": context_start,
+                    "end_pos": context_end,
+                    "original_start_pos": state["start_pos"],
+                    "original_end_pos": state["end_pos"],
+                    "is_partial": context_end < state["end_pos"],
+                }
+            )
+        context_prompt_block_ids = [unit["block_id"] for unit in context_prompt_units]
+        context_prompt_unit_by_id = {unit["block_id"]: unit for unit in context_prompt_units}
+        if not context_prompt_units:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False, None
+
         scoring_query_ids = self._build_parallelcomp_scoring_query_ids()
         if not scoring_query_ids:
             return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False, None
         prev_context_block_id = context_prompt_block_ids[-1] if context_prompt_block_ids else None
+        reused_window_size = max(1, self._get_reused_window_size(block_states))
 
-        kept_block_ids = self._select_global_cache_blocks(
-            block_states=block_states,
-            stable_block_ids=context_prompt_block_ids,
-            stable_prefix_len=stable_prefix_len,
-            query_ids=scoring_query_ids,
-            canonical_block_tokens=canonical_block_tokens,
-        )
+        local_block_results = {}
+        local_block_scores = {}
+        for unit in context_prompt_units:
+            block_id = unit["block_id"]
+            block_input_ids = x_t[:, unit["start_pos"]:unit["end_pos"]]
+            local_result = self._run_parallelcomp_local_block_forward(
+                block_input_ids=block_input_ids,
+                query_ids=scoring_query_ids,
+                reused_window_size=reused_window_size,
+            )
+            if local_result is None:
+                continue
+            local_block_results[block_id] = local_result
+            local_block_scores[block_id] = local_result["score"]
+
         self._parallelcomp_prompt_cache_compression_done = True
+        if not local_block_results:
+            return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False, None
+
+        keep_ids = set()
+        if self.parallelcomp_keep_first_chunk and 0 in local_block_results:
+            keep_ids.add(0)
+        candidates = [(block_id, local_block_scores.get(block_id, float("-inf"))) for block_id in context_prompt_block_ids if block_id in local_block_results and block_id not in keep_ids]
+        if self.parallelcomp_topk_chunks is None:
+            topk = len(candidates)
+        else:
+            topk = min(max(1, int(self.parallelcomp_topk_chunks)), len(candidates)) if candidates else 0
+        prefer_low_scores = bool(self.parallelcomp_select_low_score_chunks)
+        selected = sorted(candidates, key=lambda item: item[1], reverse=not prefer_low_scores)[:topk]
+        keep_ids.update(block_id for block_id, _ in selected)
+        kept_block_ids = [block_id for block_id in context_prompt_block_ids if block_id in keep_ids]
         if not kept_block_ids:
             return x_t, past_key_values, cached_positions_per_layer, cached_block_ranges_per_layer, shared_cached_length, False, None
+
+        self._emit_parallelcomp_runtime_summary(
+            "[ParallelComp] local_forward_once "
+            f"context_blocks={len(context_prompt_block_ids)} "
+            f"kept_blocks={len(kept_block_ids)} "
+            f"query_prompt_block={query_prompt_block_id} "
+            f"query_span=[{query_start},{query_end}) "
+            f"query_len={query_end - query_start} "
+            f"scoring_query_len={len(scoring_query_ids)} "
+            f"score_query_window={self._get_parallelcomp_chunk_score_query_window_size(len(scoring_query_ids))} "
+            f"token_query_window={self._get_parallelcomp_query_window_size(len(scoring_query_ids))} "
+            f"local_mask={self.parallelcomp_chunk_score_attention_mask} "
+            f"reused_window_size={reused_window_size}"
+        )
 
         compressed_block_meta = []
         block_keep_widths = {}
         total_evicted_high = 0
         total_removed = 0
         for block_id in kept_block_ids:
-            state = block_states[block_id]
-            block_ids = x_t[0, state["start_pos"]:state["end_pos"]].tolist()
-            num_cache_heads_per_layer = [layer_k.shape[1] for layer_k in past_key_values.key_cache]
-            if len(block_ids) <= self.parallelcomp_token_keep_min:
-                per_layer_kept_indices = []
-                for num_heads in num_cache_heads_per_layer:
-                    base = torch.arange(len(block_ids), device=self.device, dtype=torch.long)
-                    per_layer_kept_indices.append(base.unsqueeze(0).expand(num_heads, -1).clone())
-                evicted_high_layers = [0 for _ in range(len(past_key_values.key_cache))]
-            else:
-                per_layer_kept_indices, evicted_high_layers = self._select_cache_block_token_indices_per_layer_per_head(
-                    block_ids,
-                    scoring_query_ids,
-                    num_cache_heads_per_layer,
-                )
+            unit = context_prompt_unit_by_id[block_id]
+            local_result = local_block_results[block_id]
+            block_len = int(local_result["block_len"])
+            per_layer_kept_indices = local_result["kept_indices"]
+            evicted_high_layers = local_result["evicted_high_layers"]
             total_evicted_high += sum(evicted_high_layers)
             layer_keep_width = max(
                 (kept_indices.shape[1] if isinstance(kept_indices, torch.Tensor) else len(kept_indices))
                 for kept_indices in per_layer_kept_indices
-            ) if per_layer_kept_indices else len(block_ids)
-            total_removed += max(0, len(block_ids) - layer_keep_width)
+            ) if per_layer_kept_indices else block_len
+            total_removed += max(0, block_len - layer_keep_width)
             block_keep_widths[block_id] = layer_keep_width
             compressed_block_meta.append(
-                (block_id, state["start_pos"], state["end_pos"], per_layer_kept_indices)
+                (block_id, unit["start_pos"], unit["end_pos"], per_layer_kept_indices)
             )
 
-        dropped_block_ids = [block_id for block_id in context_prompt_block_ids if block_id not in kept_block_ids]
+        dropped_block_ids = [unit["block_id"] for unit in context_prompt_units if unit["block_id"] not in kept_block_ids]
         total_removed += sum(
-            block_states[block_id]["end_pos"] - block_states[block_id]["start_pos"]
-            for block_id in dropped_block_ids
+            unit["end_pos"] - unit["start_pos"]
+            for unit in context_prompt_units
+            if unit["block_id"] in dropped_block_ids
         )
 
         new_key_cache = []
@@ -2008,21 +2328,21 @@ class DreamLoRA(LM):
             layer_block_ranges = cached_block_ranges_per_layer[layer_idx] if layer_idx < len(cached_block_ranges_per_layer) else {}
             new_layer_block_ranges = {}
             layer_cursor = 0
-            for block_id, _, _, per_layer_kept_indices in compressed_block_meta:
-                if block_id not in layer_block_ranges:
+            for block_id, unit_start, unit_end, per_layer_kept_indices in compressed_block_meta:
+                local_result = local_block_results.get(block_id)
+                if local_result is None or layer_idx >= len(local_result["key_cache"]):
                     continue
-                layer_block_start, layer_block_end = layer_block_ranges[block_id]
                 per_head_kept_indices = per_layer_kept_indices[layer_idx] if layer_idx < len(per_layer_kept_indices) else per_layer_kept_indices[0]
                 per_head_kept_indices = per_head_kept_indices.to(device=layer_k.device, dtype=torch.long)
                 keep_count = per_head_kept_indices.shape[1]
+                block_slice_k = local_result["key_cache"][layer_idx].to(device=layer_k.device)
+                block_slice_v = local_result["value_cache"][layer_idx].to(device=layer_v.device)
                 expanded_index = per_head_kept_indices.unsqueeze(0).unsqueeze(-1).expand(
-                    layer_k.shape[0],
+                    block_slice_k.shape[0],
                     per_head_kept_indices.shape[0],
                     keep_count,
-                    layer_k.shape[-1],
+                    block_slice_k.shape[-1],
                 )
-                block_slice_k = layer_k[:, :, layer_block_start:layer_block_end, :]
-                block_slice_v = layer_v[:, :, layer_block_start:layer_block_end, :]
                 block_k = block_slice_k.gather(2, expanded_index)
                 block_v = block_slice_v.gather(2, expanded_index)
                 block_pos = torch.arange(
@@ -2057,7 +2377,7 @@ class DreamLoRA(LM):
         )
         reused_window_size = max(1, self._get_reused_window_size(block_states))
         self._parallelcomp_post_compression_position_offset = (
-            tail_prompt_state["start_pos"] - reused_window_size
+            query_start - reused_window_size
         )
 
         layer_selection_divergence = 0
@@ -2076,44 +2396,49 @@ class DreamLoRA(LM):
                         layer_selection_divergence += len(reference_set.symmetric_difference(set(kept_indices)))
 
         eval_logger.info(
-            "ParallelComp-style per-layer prompt cache compression: logical_prefix_tokens=%d, context_blocks=%d, kept_context_blocks=%d, tail_prompt_block=%d, removed_tokens=%d, high_score_evicted=%d, layer_selection_divergence=%d, layer_cache_lengths=%s",
+            "ParallelComp-style per-layer prompt cache compression: logical_prefix_tokens=%d, context_blocks=%d, kept_context_blocks=%d, query_prompt_block=%s, query_len=%d, removed_tokens=%d, high_score_evicted=%d, layer_selection_divergence=%d, layer_cache_lengths=%s",
             old_stable_prefix_len,
             len(context_prompt_block_ids),
             len(kept_block_ids),
-            tail_prompt_block_id,
+            query_prompt_block_id,
+            query_end - query_start,
             total_removed,
             total_evicted_high,
             layer_selection_divergence,
             [layer_positions.shape[0] for layer_positions in new_cached_positions_per_layer],
         )
         prev_block_summary = "prev_block=None"
-        if prev_context_block_id is not None and prev_context_block_id in block_states:
-            prev_state = block_states[prev_context_block_id]
-            prev_original_len = prev_state["end_pos"] - prev_state["start_pos"]
+        if prev_context_block_id is not None and prev_context_block_id in context_prompt_unit_by_id:
+            prev_unit = context_prompt_unit_by_id[prev_context_block_id]
+            prev_original_len = prev_unit["end_pos"] - prev_unit["start_pos"]
             prev_kept = prev_context_block_id in block_keep_widths
             prev_kept_tokens = block_keep_widths.get(prev_context_block_id, 0)
             prev_block_summary = (
                 f"prev_block={prev_context_block_id} "
-                f"span=[{prev_state['start_pos']},{prev_state['end_pos']}) "
+                f"span=[{prev_unit['start_pos']},{prev_unit['end_pos']}) "
                 f"len={prev_original_len} kept={prev_kept} kept_tokens={prev_kept_tokens}"
             )
 
-        tail_context_blocks = context_prompt_block_ids[-min(3, len(context_prompt_block_ids)):]
-        tail_kept_blocks = [block_id for block_id in tail_context_blocks if block_id in block_keep_widths]
+        recent_context_blocks = context_prompt_block_ids[-min(3, len(context_prompt_block_ids)):]
+        recent_kept_blocks = [block_id for block_id in recent_context_blocks if block_id in block_keep_widths]
         self._emit_parallelcomp_runtime_summary(
             "[ParallelComp] prompt_cache_compress "
             f"scoring_query_source={getattr(self, '_parallelcomp_active_scoring_query_source', 'fixed_fallback')} "
             f"scoring_query_len={len(scoring_query_ids)} "
             f"context_blocks={len(context_prompt_block_ids)} "
             f"kept_blocks={len(kept_block_ids)} "
-            f"tail_prompt_block={tail_prompt_block_id} "
-            f"tail_prompt_span=[{tail_prompt_state['start_pos']},{tail_prompt_state['end_pos']}) "
-            f"tail_prompt_len={tail_prompt_state['end_pos'] - tail_prompt_state['start_pos']} "
-            f"tail_context_blocks={tail_context_blocks} "
-            f"tail_kept_blocks={tail_kept_blocks} "
+            f"query_prompt_block={query_prompt_block_id} "
+            f"query_span=[{query_start},{query_end}) "
+            f"query_len={query_end - query_start} "
+            f"recent_context_blocks={recent_context_blocks} "
+            f"recent_kept_blocks={recent_kept_blocks} "
             f"{prev_block_summary} "
             f"removed_tokens={total_removed} "
-            f"high_score_evicted={total_evicted_high}"
+            f"high_score_evicted={total_evicted_high} "
+            f"local_forward_once=True "
+            f"score_query_window={self._get_parallelcomp_chunk_score_query_window_size(len(scoring_query_ids))} "
+            f"token_query_window={self._get_parallelcomp_query_window_size(len(scoring_query_ids))} "
+            f"local_mask={self.parallelcomp_chunk_score_attention_mask}"
         )
         (
             replayed_past_key_values,
@@ -2121,18 +2446,20 @@ class DreamLoRA(LM):
             replayed_cached_block_ranges_per_layer,
             replayed_cached_length,
             replay_last_logits,
-        ) = self._replay_parallelcomp_tail_prompt_block(
+        ) = self._replay_parallelcomp_query_span(
             x_t=x_t,
-            tail_prompt_block_id=tail_prompt_block_id,
-            block_states=block_states,
+            replay_start=query_start,
+            replay_end=query_end,
+            replay_range_key=f"query:{query_start}:{query_end}",
             past_key_values=past_key_values,
             cached_positions_per_layer=new_cached_positions_per_layer,
             cached_block_ranges_per_layer=new_cached_block_ranges_per_layer,
         )
         self._emit_parallelcomp_runtime_summary(
-            "[ParallelComp] tail_prompt_replay "
-            f"tail_prompt_block={tail_prompt_block_id} "
-            f"tail_prompt_len={tail_prompt_state['end_pos'] - tail_prompt_state['start_pos']} "
+            "[ParallelComp] query_replay "
+            f"query_prompt_block={query_prompt_block_id} "
+            f"query_span=[{query_start},{query_end}) "
+            f"query_len={query_end - query_start} "
             f"stitched_context_tokens={new_stable_prefix_len} "
             f"reused_window_size={reused_window_size} "
             f"position_offset={self._parallelcomp_post_compression_position_offset} "
@@ -2223,6 +2550,15 @@ class DreamLoRA(LM):
         if not text:
             return []
         return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _get_active_prompt_query_span(self, prompt_length: int) -> Optional[Tuple[int, int]]:
+        if self._parallelcomp_active_query_start is None or self._parallelcomp_active_query_end is None:
+            return None
+        query_start = max(0, int(self._parallelcomp_active_query_start))
+        query_end = min(prompt_length, int(self._parallelcomp_active_query_end))
+        if query_end <= query_start:
+            return None
+        return query_start, query_end
 
     def _split_parallelcomp_token_chunks(self, token_ids: List[int]) -> List[List[int]]:
         if not token_ids:
@@ -2415,12 +2751,16 @@ class DreamLoRA(LM):
 
         if not candidate_chunks:
             prompt_ids = prefix_ids + query_ids
+            query_start = len(prefix_ids)
+            query_end = query_start + len(query_ids)
             return prompt_ids, {
                 "mode": "structured_no_context",
                 "raw_prompt_tokens": len(prompt_ids),
                 "label": prompt.get("metadata_label"),
                 "scoring_query_source": scoring_query_source,
                 "scoring_query_ids": scoring_query_ids,
+                "query_start": query_start,
+                "query_end": query_end,
             }
 
         should_compress = bool(self.parallelcomp_pre_runtime_mode)
@@ -2435,6 +2775,8 @@ class DreamLoRA(LM):
                 separator_ids=separator_ids,
                 query_ids=query_ids,
             )
+            query_start = len(prompt_ids) - len(query_ids)
+            query_end = len(prompt_ids)
             return prompt_ids, {
                 "mode": "structured_passthrough",
                 "raw_prompt_tokens": raw_prompt_tokens,
@@ -2442,6 +2784,8 @@ class DreamLoRA(LM):
                 "label": prompt.get("metadata_label"),
                 "scoring_query_source": scoring_query_source,
                 "scoring_query_ids": scoring_query_ids,
+                "query_start": query_start,
+                "query_end": query_end,
             }
 
         selected_indices, scores = self._select_pre_runtime_chunk_indices(
@@ -2462,6 +2806,8 @@ class DreamLoRA(LM):
             separator_ids=separator_ids,
             query_ids=query_ids,
         )
+        query_start = len(prompt_ids) - len(query_ids)
+        query_end = len(prompt_ids)
 
         selected_scores = {
             idx: scores[idx]
@@ -2481,6 +2827,8 @@ class DreamLoRA(LM):
             "selected_chunk_indices": packed_indices,
             "selected_chunk_scores": selected_scores,
             "context_tokens_after_pack": packed_context_tokens,
+            "query_start": query_start,
+            "query_end": query_end,
         }
 
     def _generate_batch(self, prompts: List[Union[str, Dict[str, Any]]]) -> List[str]:
@@ -2516,10 +2864,26 @@ class DreamLoRA(LM):
                 )
 
             prompt_tensor = torch.tensor([prompt_ids], device=self.device, dtype=torch.long)
+            prompt_offset = 0
 
             if len(prompt_ids) > self.max_length - self.max_new_tokens:
                 eval_logger.warning(f"Prompt length {len(prompt_ids)} is larger than {self.max_length-self.max_new_tokens}, cutoff on the left side")
+                prompt_offset = len(prompt_ids) - (self.max_length - self.max_new_tokens)
                 prompt_tensor = prompt_tensor[:, -(self.max_length-self.max_new_tokens):]
+            query_start = prompt_meta.get("query_start")
+            query_end = prompt_meta.get("query_end")
+            if query_start is not None and query_end is not None:
+                adjusted_query_start = max(0, int(query_start) - prompt_offset)
+                adjusted_query_end = min(prompt_tensor.shape[1], int(query_end) - prompt_offset)
+                if adjusted_query_end > adjusted_query_start:
+                    self._parallelcomp_active_query_start = adjusted_query_start
+                    self._parallelcomp_active_query_end = adjusted_query_end
+                else:
+                    self._parallelcomp_active_query_start = None
+                    self._parallelcomp_active_query_end = None
+            else:
+                self._parallelcomp_active_query_start = None
+                self._parallelcomp_active_query_end = None
 
             # Use generate_block_single method to generate, returns EOS-truncated response text
             try:
@@ -2528,6 +2892,8 @@ class DreamLoRA(LM):
             finally:
                 self._parallelcomp_active_scoring_query_ids = None
                 self._parallelcomp_active_scoring_query_source = None
+                self._parallelcomp_active_query_start = None
+                self._parallelcomp_active_query_end = None
 
         return responses
     

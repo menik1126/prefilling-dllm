@@ -129,6 +129,24 @@ def build_arg_parser():
     parser.add_argument("--parallelcomp_min_prompt_tokens", type=int, default=1024)
     parser.add_argument("--parallelcomp_keep_first_chunk", action="store_true")
     parser.add_argument("--parallelcomp_split_from_tail", action="store_true")
+    parser.add_argument(
+        "--parallelcomp_chunk_score_query_window",
+        type=int,
+        default=0,
+        help="Query-token window for chunk self-information scoring. 0 means full query.",
+    )
+    parser.add_argument(
+        "--parallelcomp_chunk_score_attention_mask",
+        choices=["causal", "full", "full_visible", "query_to_chunk", "prefix_full"],
+        default="query_to_chunk",
+        help="Local [chunk, query] attention mask used for one-forward chunk scoring and token eviction.",
+    )
+    parser.add_argument(
+        "--parallelcomp_recent_token_window",
+        type=int,
+        default=0,
+        help="Query-token window used for token eviction attention scoring. 0 means full query.",
+    )
     parser.add_argument("--parallelcomp_hidden_topk", type=int, default=32)
     parser.add_argument("--parallelcomp_token_capacity", type=int, default=128)
     parser.add_argument("--parallelcomp_token_keep_min", type=int, default=32)
@@ -187,6 +205,9 @@ def main():
         parallelcomp_min_prompt_tokens=args.parallelcomp_min_prompt_tokens,
         parallelcomp_keep_first_chunk=args.parallelcomp_keep_first_chunk,
         parallelcomp_split_from_tail=args.parallelcomp_split_from_tail,
+        parallelcomp_chunk_score_query_window=args.parallelcomp_chunk_score_query_window,
+        parallelcomp_chunk_score_attention_mask=args.parallelcomp_chunk_score_attention_mask,
+        parallelcomp_recent_token_window=args.parallelcomp_recent_token_window,
         parallelcomp_hidden_topk=args.parallelcomp_hidden_topk,
         parallelcomp_token_capacity=args.parallelcomp_token_capacity,
         parallelcomp_token_keep_min=args.parallelcomp_token_keep_min,
