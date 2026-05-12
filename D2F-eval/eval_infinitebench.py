@@ -161,6 +161,7 @@ def build_arg_parser():
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument("--parallelcomp_score_mode", type=str, default="self_information")
     return parser
 
 
@@ -215,6 +216,7 @@ def main():
         parallelcomp_select_low_score_chunks=args.parallelcomp_select_low_score_chunks,
         parallelcomp_fixed_query_text=args.parallelcomp_fixed_query_text,
         parallelcomp_tail_replay_full_mask=args.parallelcomp_tail_replay_full_mask,
+        parallelcomp_score_mode=args.parallelcomp_score_mode,
     )
 
     all_results = {}

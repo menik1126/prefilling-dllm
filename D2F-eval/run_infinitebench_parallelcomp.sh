@@ -22,6 +22,7 @@ CHUNK_SCORE_QUERY_WINDOW="${PARALLELCOMP_CHUNK_SCORE_QUERY_WINDOW:-${PARALLELCOM
 RECENT_TOKEN_WINDOW="${PARALLELCOMP_RECENT_TOKEN_WINDOW:-${PARALLELCOMP_QUERY_WINDOW:-0}}"
 CHUNK_SCORE_ATTENTION_MASK="${PARALLELCOMP_LOCAL_ATTENTION_MASK:-${PARALLELCOMP_CHUNK_SCORE_ATTENTION_MASK:-query_to_chunk}}"
 TOKEN_KEEP_MIN="${PARALLELCOMP_TOKEN_KEEP_MIN:-32}"
+SCORE_MODE="${PARALLELCOMP_SCORE_MODE:-self_information}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/results_infinitebench_${TASK}_n${MAX_EXAMPLES}_cap${TOKEN_CAPACITY}_${RUN_TAG}}"
 
@@ -64,4 +65,5 @@ echo "Output dir          : ${OUTPUT_DIR}"
   --parallelcomp_token_keep_min "$TOKEN_KEEP_MIN" \
   --parallelcomp_tail_replay_full_mask \
   --parallelcomp_fixed_query_text "Please answer the question using the long context above." \
+  --parallelcomp_score_mode "$SCORE_MODE" \
   --output_dir "$OUTPUT_DIR"

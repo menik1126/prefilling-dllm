@@ -374,6 +374,7 @@ class DreamLoRA(LM):
         parallelcomp_pooling_kernel_size: Optional[int] = 7,
         parallelcomp_tail_replay_full_mask: Optional[bool] = True,
         parallelcomp_query_free_cache_rebuild: Optional[bool] = False,
+        parallelcomp_score_mode: Optional[str] = "self_information",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -470,6 +471,7 @@ class DreamLoRA(LM):
         self.parallelcomp_pooling_kernel_size = parallelcomp_pooling_kernel_size
         self.parallelcomp_tail_replay_full_mask = parallelcomp_tail_replay_full_mask
         self.parallelcomp_query_free_cache_rebuild = bool(parallelcomp_query_free_cache_rebuild)
+        self.parallelcomp_score_mode = str(parallelcomp_score_mode or "self_information").lower()
         self._parallelcomp_post_compression_position_offset = None
         self._parallelcomp_active_scoring_query_ids = None
         self._parallelcomp_active_scoring_query_source = None
@@ -835,6 +837,61 @@ class DreamLoRA(LM):
         log_probs = F.log_softmax(query_logits, dim=-1)
         token_nll = -log_probs.gather(dim=-1, index=query_labels.unsqueeze(-1)).squeeze(-1)
         return float(token_nll.mean().item())
+
+    def _score_chunk_with_next_block_logits(
+        self, chunk_ids: List[int], query_ids: List[int], next_block_size: Optional[int] = None
+    ) -> Tuple[float, torch.Tensor, torch.Tensor]:
+        """Score chunk by predicting next block content from query tail logits.
+
+        Forward pass on [chunk + query], then use the last `next_block_size`
+        positions of query logits to predict pseudo next-block tokens. The score
+        is the negative NLL of those argmax pseudo-labels, so higher is better.
+
+        Returns:
+            (score, predicted_tokens, predicted_confidences)
+            - score: negative mean NLL of predicted next-block tokens
+            - predicted_tokens: [next_block_size] tensor of argmax token ids
+            - predicted_confidences: [next_block_size] tensor of top-1 probabilities
+        """
+        if next_block_size is None:
+            next_block_size = self.block_size
+        if len(chunk_ids) == 0 or len(query_ids) == 0:
+            return float("-inf"), torch.tensor([], device=self.device), torch.tensor([], device=self.device)
+
+        chunk_len = len(chunk_ids)
+        query_len = len(query_ids)
+
+        joint_ids = torch.tensor([chunk_ids + query_ids], device=self.device, dtype=torch.long)
+        attention_mask = self._build_parallelcomp_scoring_attention_mask(
+            joint_ids.shape[1],
+            chunk_len=chunk_len,
+            query_len=query_len,
+        )
+
+        with torch.inference_mode():
+            outputs = self.model(
+                joint_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        logits = outputs.logits
+        total_len = chunk_len + query_len
+
+        # Take logits from the last next_block_size positions of the sequence.
+        # logits[:, t, :] predicts token at position t+1.
+        # So logits[:, -next_block_size:, :] predicts the next block's tokens.
+        predict_len = min(next_block_size, total_len)
+        next_block_logits = logits[:, total_len - predict_len:total_len, :]
+
+        log_probs = F.log_softmax(next_block_logits.squeeze(0), dim=-1)
+        predicted_tokens = log_probs.argmax(dim=-1)
+        token_nll = -log_probs.gather(dim=-1, index=predicted_tokens.unsqueeze(-1)).squeeze(-1)
+        predicted_confidences = log_probs.max(dim=-1).values.exp()
+
+        score = -float(token_nll.mean().item())
+        return score, predicted_tokens, predicted_confidences
 
     def _score_prompt_blocks_with_hidden_resonance(
         self,
@@ -2105,9 +2162,14 @@ class DreamLoRA(LM):
             block_ids = canonical_block_tokens.get(block_id)
             if block_ids is None:
                 block_ids = []
-            score = self._score_chunk_with_self_information(block_ids, query_ids)
+            if self.parallelcomp_score_mode == "next_block_logits":
+                score, _, _ = self._score_chunk_with_next_block_logits(block_ids, query_ids)
+            else:
+                score = self._score_chunk_with_self_information(block_ids, query_ids)
+                if math.isfinite(score):
+                    score = -score
             if math.isfinite(score):
-                self_information_scores[block_id] = -score
+                self_information_scores[block_id] = score
 
         if len(self_information_scores) != len(stable_block_ids) and x_t is not None and query_block_id is not None:
             attention_scores = self._score_prompt_blocks_with_attention_resonance(
@@ -2620,7 +2682,10 @@ class DreamLoRA(LM):
         scores = {}
         for idx, chunk in enumerate(candidate_chunks):
             chunk_ids = chunk["token_ids"]
-            score = -self._score_chunk_with_self_information(chunk_ids, scoring_query_ids)
+            if self.parallelcomp_score_mode == "next_block_logits":
+                score, _, _ = self._score_chunk_with_next_block_logits(chunk_ids, scoring_query_ids)
+            else:
+                score = -self._score_chunk_with_self_information(chunk_ids, scoring_query_ids)
             if not math.isfinite(score):
                 score, _ = self._analyze_chunk_with_attentions(chunk_ids, scoring_query_ids)
             scores[idx] = float(score) if math.isfinite(score) else float("-inf")
