@@ -23,8 +23,18 @@ RECENT_TOKEN_WINDOW="${PARALLELCOMP_RECENT_TOKEN_WINDOW:-${PARALLELCOMP_QUERY_WI
 CHUNK_SCORE_ATTENTION_MASK="${PARALLELCOMP_LOCAL_ATTENTION_MASK:-${PARALLELCOMP_CHUNK_SCORE_ATTENTION_MASK:-query_to_chunk}}"
 TOKEN_KEEP_MIN="${PARALLELCOMP_TOKEN_KEEP_MIN:-32}"
 SCORE_MODE="${PARALLELCOMP_SCORE_MODE:-self_information}"
+FIRST_LAYER_CACHE_ONLY="${PARALLELCOMP_FIRST_LAYER_CACHE_ONLY:-0}"
+STORE_LAYER0_HIDDEN="${PARALLELCOMP_STORE_LAYER0_HIDDEN:-1}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/results_infinitebench_${TASK}_n${MAX_EXAMPLES}_cap${TOKEN_CAPACITY}_${RUN_TAG}}"
+
+EXTRA_ARGS=()
+if [[ "${FIRST_LAYER_CACHE_ONLY}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
+  EXTRA_ARGS+=(--parallelcomp_first_layer_cache_only)
+fi
+if [[ "${STORE_LAYER0_HIDDEN}" =~ ^(0|false|FALSE|no|NO)$ ]]; then
+  EXTRA_ARGS+=(--no-parallelcomp_store_layer0_hidden)
+fi
 
 export HF_HOME="${HF_HOME:-/home/ma-user/work/hf-cache}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -39,6 +49,9 @@ echo "Local attention mask: ${CHUNK_SCORE_ATTENTION_MASK}"
 echo "Query windows       : score=${CHUNK_SCORE_QUERY_WINDOW}, token=${RECENT_TOKEN_WINDOW}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "Output dir          : ${OUTPUT_DIR}"
+echo "Score mode          : ${SCORE_MODE}"
+echo "First-layer cache   : ${FIRST_LAYER_CACHE_ONLY}"
+echo "Store layer0 hidden : ${STORE_LAYER0_HIDDEN}"
 
 "$PYTHON_BIN" eval_infinitebench.py \
   --model_type dream \
@@ -66,4 +79,5 @@ echo "Output dir          : ${OUTPUT_DIR}"
   --parallelcomp_tail_replay_full_mask \
   --parallelcomp_fixed_query_text "Please answer the question using the long context above." \
   --parallelcomp_score_mode "$SCORE_MODE" \
+  "${EXTRA_ARGS[@]}" \
   --output_dir "$OUTPUT_DIR"

@@ -5,6 +5,7 @@ import json
 import math
 import importlib
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 import torch
 import torch.nn.functional as F
@@ -375,6 +376,8 @@ class DreamLoRA(LM):
         parallelcomp_tail_replay_full_mask: Optional[bool] = True,
         parallelcomp_query_free_cache_rebuild: Optional[bool] = False,
         parallelcomp_score_mode: Optional[str] = "self_information",
+        parallelcomp_first_layer_cache_only: Optional[bool] = False,
+        parallelcomp_store_layer0_hidden: Optional[bool] = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -472,6 +475,14 @@ class DreamLoRA(LM):
         self.parallelcomp_tail_replay_full_mask = parallelcomp_tail_replay_full_mask
         self.parallelcomp_query_free_cache_rebuild = bool(parallelcomp_query_free_cache_rebuild)
         self.parallelcomp_score_mode = str(parallelcomp_score_mode or "self_information").lower()
+        self.parallelcomp_first_layer_cache_only = bool(parallelcomp_first_layer_cache_only)
+        self.parallelcomp_store_layer0_hidden = bool(parallelcomp_store_layer0_hidden)
+        self._parallelcomp_first_layer_prefix_input_ids = None
+        self._parallelcomp_first_layer_prefix_positions = None
+        self._parallelcomp_first_layer_prefix_hidden = None
+        self._parallelcomp_first_layer_prefix_blocks = None
+        self._parallelcomp_first_layer_prefix_tail_hidden = None
+        self._parallelcomp_first_layer_prefix_tail_positions = None
         self._parallelcomp_post_compression_position_offset = None
         self._parallelcomp_active_scoring_query_ids = None
         self._parallelcomp_active_scoring_query_source = None
@@ -1287,6 +1298,10 @@ class DreamLoRA(LM):
                 position_ids=position_ids,
                 cache_position=cache_position,
                 output_attentions=True,
+                output_hidden_states=(
+                    self.parallelcomp_first_layer_cache_only
+                    and self.parallelcomp_store_layer0_hidden
+                ),
                 return_dict=True,
                 use_cache=True,
                 update_kvcache=joint_len,
@@ -1312,7 +1327,7 @@ class DreamLoRA(LM):
             query_len=query_len,
         )
 
-        return {
+        result = {
             "score": score,
             "key_cache": [layer_k[:, :, :block_len, :] for layer_k in block_cache.key_cache],
             "value_cache": [layer_v[:, :, :block_len, :] for layer_v in block_cache.value_cache],
@@ -1321,6 +1336,9 @@ class DreamLoRA(LM):
             "num_cache_heads_per_layer": num_cache_heads_per_layer,
             "block_len": block_len,
         }
+        if outputs.hidden_states is not None:
+            result["layer0_hidden"] = outputs.hidden_states[1][:, :block_len, :]
+        return result
 
     def _build_layer_structural_prior(
         self,
@@ -1640,15 +1658,26 @@ class DreamLoRA(LM):
                 query_length=replay_len,
             )
 
-        outputs = self.model(
-            replay_input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=replay_positions.unsqueeze(0),
-            cache_position=replay_cache_positions,
-            use_cache=True,
-            update_kvcache=replay_len,
-        )
+        if self.parallelcomp_first_layer_cache_only:
+            outputs = self._forward_with_first_layer_cache_only(
+                input_ids=replay_input_ids,
+                layer0_attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=replay_positions,
+                cache_position=replay_cache_positions,
+                update_kvcache=replay_len,
+                append_input_to_upper_prefix=True,
+            )
+        else:
+            outputs = self.model(
+                replay_input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=replay_positions.unsqueeze(0),
+                cache_position=replay_cache_positions,
+                use_cache=True,
+                update_kvcache=replay_len,
+            )
 
         past_key_values = outputs.past_key_values
         if not cached_positions_per_layer:
@@ -2077,6 +2106,182 @@ class DreamLoRA(LM):
             return torch.empty(0, device=self.device, dtype=torch.long)
         return self._build_cache_slot_positions(cache_start=cache_start, length=update_kvcache)
 
+    def _get_causal_model_for_manual_forward(self):
+        model = self.model
+        if hasattr(model, "get_base_model"):
+            model = model.get_base_model()
+        return model
+
+    def _forward_with_first_layer_cache_only(
+        self,
+        input_ids: torch.Tensor,
+        layer0_attention_mask: torch.Tensor,
+        past_key_values,
+        position_ids: torch.Tensor,
+        cache_position: torch.Tensor,
+        update_kvcache: int,
+        append_input_to_upper_prefix: bool = False,
+    ):
+        prefix_hidden = self._parallelcomp_first_layer_prefix_hidden
+        prefix_positions = self._parallelcomp_first_layer_prefix_positions
+        prefix_blocks = self._parallelcomp_first_layer_prefix_blocks
+        if prefix_hidden is None and not prefix_blocks:
+            return self.model(
+                input_ids,
+                attention_mask=layer0_attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids.unsqueeze(0),
+                cache_position=cache_position,
+                use_cache=True,
+                update_kvcache=update_kvcache,
+            )
+
+        causal_model = self._get_causal_model_for_manual_forward()
+        decoder = causal_model.model
+        prefix_hidden_parts = []
+        prefix_position_parts = []
+        if prefix_hidden is not None and prefix_positions is not None:
+            prefix_hidden_parts.append(prefix_hidden.to(device=input_ids.device))
+            prefix_position_parts.append(prefix_positions.to(device=position_ids.device, dtype=position_ids.dtype))
+        elif prefix_blocks:
+            for block in prefix_blocks:
+                block_input_ids = block["input_ids"].to(device=input_ids.device, dtype=input_ids.dtype)
+                kept_indices = block["kept_indices"].to(device=input_ids.device, dtype=torch.long)
+                block_positions = block["positions"].to(device=position_ids.device, dtype=position_ids.dtype)
+                block_embeds = decoder.embed_tokens(block_input_ids)
+                block_position_ids = block_positions.unsqueeze(0)
+                block_position_embeddings = decoder.rotary_emb(block_embeds, block_position_ids)
+                block_attention_mask = self._build_full_visible_attention_mask(block_input_ids.shape[1]).to(
+                    device=block_embeds.device,
+                    dtype=layer0_attention_mask.dtype if layer0_attention_mask is not None else block_embeds.dtype,
+                )
+                block_layer0_outputs = decoder.layers[0](
+                    block_embeds,
+                    attention_mask=block_attention_mask,
+                    update_kvcache=0,
+                    position_ids=block_position_ids,
+                    past_key_value=None,
+                    output_attentions=False,
+                    use_cache=False,
+                    cache_position=block_positions,
+                    position_embeddings=block_position_embeddings,
+                )
+                prefix_hidden_parts.append(block_layer0_outputs[0].index_select(1, kept_indices))
+                prefix_position_parts.append(block_positions.index_select(0, kept_indices))
+
+        tail_hidden = self._parallelcomp_first_layer_prefix_tail_hidden
+        tail_positions = self._parallelcomp_first_layer_prefix_tail_positions
+        if tail_hidden is not None and tail_positions is not None:
+            prefix_hidden_parts.append(tail_hidden.to(device=input_ids.device))
+            prefix_position_parts.append(tail_positions.to(device=position_ids.device, dtype=position_ids.dtype))
+
+        prefix_layer0_hidden = torch.cat(prefix_hidden_parts, dim=1)
+        prefix_positions = torch.cat(prefix_position_parts, dim=0)
+
+        input_embeds = decoder.embed_tokens(input_ids)
+        layer0_position_ids = position_ids.unsqueeze(0)
+        layer0_position_embeddings = decoder.rotary_emb(input_embeds, layer0_position_ids)
+
+        layer0_outputs = decoder.layers[0](
+            input_embeds,
+            attention_mask=layer0_attention_mask,
+            update_kvcache=update_kvcache,
+            position_ids=layer0_position_ids,
+            past_key_value=past_key_values,
+            output_attentions=False,
+            use_cache=True,
+            cache_position=cache_position,
+            position_embeddings=layer0_position_embeddings,
+        )
+        input_layer0_hidden = layer0_outputs[0]
+
+        upper_hidden = torch.cat(
+            [prefix_layer0_hidden.to(device=input_layer0_hidden.device, dtype=input_layer0_hidden.dtype), input_layer0_hidden],
+            dim=1,
+        )
+        upper_positions = torch.cat(
+            [prefix_positions, position_ids],
+            dim=0,
+        ).unsqueeze(0)
+        upper_position_embeddings = decoder.rotary_emb(upper_hidden, upper_positions)
+        upper_attention_mask = self._build_parallelcomp_chunk_query_attention_mask(
+            prefix_layer0_hidden.shape[1],
+            input_layer0_hidden.shape[1],
+        ).to(
+            device=upper_hidden.device,
+            dtype=layer0_attention_mask.dtype if layer0_attention_mask is not None else upper_hidden.dtype,
+        )
+
+        hidden_states = upper_hidden
+        for decoder_layer in decoder.layers[1:]:
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=upper_attention_mask,
+                update_kvcache=0,
+                position_ids=upper_positions,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False,
+                cache_position=upper_positions.squeeze(0),
+                position_embeddings=upper_position_embeddings,
+            )
+            hidden_states = layer_outputs[0]
+
+        hidden_states = decoder.norm(hidden_states)
+        input_hidden_states = hidden_states[:, -input_ids.shape[1]:, :]
+        logits = causal_model.lm_head(input_hidden_states)
+
+        if append_input_to_upper_prefix:
+            if self._parallelcomp_first_layer_prefix_input_ids is not None:
+                self._parallelcomp_first_layer_prefix_input_ids = torch.cat(
+                    [
+                        self._parallelcomp_first_layer_prefix_input_ids,
+                        input_ids.detach().to(device=self._parallelcomp_first_layer_prefix_input_ids.device),
+                    ],
+                    dim=1,
+                )
+            self._parallelcomp_first_layer_prefix_positions = torch.cat(
+                [
+                    self._parallelcomp_first_layer_prefix_positions,
+                    position_ids.detach().to(device=self._parallelcomp_first_layer_prefix_positions.device),
+                ],
+                dim=0,
+            )
+            detached_input_hidden = input_layer0_hidden.detach()
+            if self._parallelcomp_first_layer_prefix_hidden is not None:
+                self._parallelcomp_first_layer_prefix_hidden = torch.cat(
+                    [
+                        self._parallelcomp_first_layer_prefix_hidden,
+                        detached_input_hidden.to(device=self._parallelcomp_first_layer_prefix_hidden.device),
+                    ],
+                    dim=1,
+                )
+            elif self._parallelcomp_first_layer_prefix_tail_hidden is None:
+                self._parallelcomp_first_layer_prefix_tail_hidden = detached_input_hidden
+                self._parallelcomp_first_layer_prefix_tail_positions = position_ids.detach()
+            else:
+                self._parallelcomp_first_layer_prefix_tail_hidden = torch.cat(
+                    [
+                        self._parallelcomp_first_layer_prefix_tail_hidden,
+                        detached_input_hidden.to(device=self._parallelcomp_first_layer_prefix_tail_hidden.device),
+                    ],
+                    dim=1,
+                )
+                self._parallelcomp_first_layer_prefix_tail_positions = torch.cat(
+                    [
+                        self._parallelcomp_first_layer_prefix_tail_positions,
+                        position_ids.detach().to(device=self._parallelcomp_first_layer_prefix_tail_positions.device),
+                    ],
+                    dim=0,
+                )
+
+        return SimpleNamespace(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=None,
+            attentions=None,
+        )
+
     def _rerun_active_blocks_after_cache_compression(
         self,
         x_t: torch.Tensor,
@@ -2122,19 +2327,30 @@ class DreamLoRA(LM):
                 dtype=attn_dtype,
             )
 
-        outputs = self.model(
-            active_input_seq,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=input_rope_positions.unsqueeze(0),
-            cache_position=self._build_forward_cache_positions(
-                position_ids=input_rope_positions,
-                cached_length=cached_positions_per_layer[0].shape[0] if cached_positions_per_layer else 0,
-                update_kvcache=0,
-            ),
-            use_cache=True,
+        cache_positions = self._build_forward_cache_positions(
+            position_ids=input_rope_positions,
+            cached_length=cached_positions_per_layer[0].shape[0] if cached_positions_per_layer else 0,
             update_kvcache=0,
         )
+        if self.parallelcomp_first_layer_cache_only:
+            outputs = self._forward_with_first_layer_cache_only(
+                input_ids=active_input_seq,
+                layer0_attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=input_rope_positions,
+                cache_position=cache_positions,
+                update_kvcache=0,
+            )
+        else:
+            outputs = self.model(
+                active_input_seq,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=input_rope_positions.unsqueeze(0),
+                cache_position=cache_positions,
+                use_cache=True,
+                update_kvcache=0,
+            )
         return outputs, process_start_pos
 
     def _count_generated_blocks(self, block_states) -> int:
@@ -2382,6 +2598,10 @@ class DreamLoRA(LM):
         new_value_cache = []
         new_cached_positions_per_layer = []
         new_cached_block_ranges_per_layer = []
+        first_layer_prefix_input_parts = []
+        first_layer_prefix_position_parts = []
+        first_layer_prefix_hidden_parts = []
+        first_layer_prefix_blocks = []
         for layer_idx, (layer_k, layer_v) in enumerate(zip(past_key_values.key_cache, past_key_values.value_cache)):
             compressed_k_parts = []
             compressed_v_parts = []
@@ -2390,12 +2610,24 @@ class DreamLoRA(LM):
             layer_block_ranges = cached_block_ranges_per_layer[layer_idx] if layer_idx < len(cached_block_ranges_per_layer) else {}
             new_layer_block_ranges = {}
             layer_cursor = 0
+            if self.parallelcomp_first_layer_cache_only and layer_idx > 0:
+                new_key_cache.append(layer_k[:, :, :0, :].contiguous())
+                new_value_cache.append(layer_v[:, :, :0, :].contiguous())
+                new_cached_positions_per_layer.append(layer_cached_positions[:0])
+                new_cached_block_ranges_per_layer.append(new_layer_block_ranges)
+                continue
+
             for block_id, unit_start, unit_end, per_layer_kept_indices in compressed_block_meta:
                 local_result = local_block_results.get(block_id)
                 if local_result is None or layer_idx >= len(local_result["key_cache"]):
                     continue
                 per_head_kept_indices = per_layer_kept_indices[layer_idx] if layer_idx < len(per_layer_kept_indices) else per_layer_kept_indices[0]
                 per_head_kept_indices = per_head_kept_indices.to(device=layer_k.device, dtype=torch.long)
+                if self.parallelcomp_first_layer_cache_only and layer_idx == 0:
+                    token_kept_indices = per_head_kept_indices[0].to(device=layer_k.device, dtype=torch.long)
+                    per_head_kept_indices = token_kept_indices.unsqueeze(0).expand(per_head_kept_indices.shape[0], -1).contiguous()
+                else:
+                    token_kept_indices = None
                 keep_count = per_head_kept_indices.shape[1]
                 block_slice_k = local_result["key_cache"][layer_idx].to(device=layer_k.device)
                 block_slice_v = local_result["value_cache"][layer_idx].to(device=layer_v.device)
@@ -2413,6 +2645,32 @@ class DreamLoRA(LM):
                     device=layer_cached_positions.device,
                     dtype=torch.long,
                 )
+                if self.parallelcomp_first_layer_cache_only and layer_idx == 0 and token_kept_indices is not None:
+                    full_block_token_ids = x_t[:, unit_start:unit_end].detach().clone().to(device=layer_k.device)
+                    block_local_positions = torch.arange(
+                        unit_end - unit_start,
+                        device=layer_k.device,
+                        dtype=torch.long,
+                    )
+                    first_layer_prefix_input_parts.append(
+                        full_block_token_ids.index_select(1, token_kept_indices.to(device=layer_k.device))
+                    )
+                    first_layer_prefix_position_parts.append(
+                        block_local_positions.index_select(0, token_kept_indices.to(device=layer_k.device))
+                    )
+                    if self.parallelcomp_store_layer0_hidden:
+                        block_layer0_hidden = local_result["layer0_hidden"].to(device=layer_k.device)
+                        first_layer_prefix_hidden_parts.append(
+                            block_layer0_hidden.index_select(1, token_kept_indices.to(device=block_layer0_hidden.device)).detach().clone()
+                        )
+                    else:
+                        first_layer_prefix_blocks.append(
+                            {
+                                "input_ids": full_block_token_ids,
+                                "kept_indices": token_kept_indices.detach().clone().to(device=layer_k.device),
+                                "positions": block_local_positions,
+                            }
+                        )
                 compressed_k_parts.append(block_k)
                 compressed_v_parts.append(block_v)
                 compressed_pos_parts.append(block_pos)
@@ -2427,6 +2685,37 @@ class DreamLoRA(LM):
                 torch.cat(compressed_pos_parts, dim=0) if compressed_pos_parts else layer_cached_positions[:0]
             )
             new_cached_block_ranges_per_layer.append(new_layer_block_ranges)
+
+        if self.parallelcomp_first_layer_cache_only and new_key_cache:
+            self._parallelcomp_first_layer_prefix_input_ids = (
+                torch.cat(first_layer_prefix_input_parts, dim=1)
+                if first_layer_prefix_input_parts
+                else None
+            )
+            self._parallelcomp_first_layer_prefix_positions = (
+                torch.cat(first_layer_prefix_position_parts, dim=0)
+                if first_layer_prefix_position_parts
+                else None
+            )
+            self._parallelcomp_first_layer_prefix_hidden = (
+                torch.cat(first_layer_prefix_hidden_parts, dim=1)
+                if first_layer_prefix_hidden_parts
+                else None
+            )
+            self._parallelcomp_first_layer_prefix_blocks = first_layer_prefix_blocks or None
+            self._parallelcomp_first_layer_prefix_tail_hidden = None
+            self._parallelcomp_first_layer_prefix_tail_positions = None
+            self._emit_parallelcomp_runtime_summary(
+                "[ParallelComp] first_layer_cache_only "
+                f"context_blocks={len(context_prompt_block_ids)} "
+                f"kept_context_blocks={len(kept_block_ids)} "
+                f"layer0_context_tokens={new_cached_positions_per_layer[0].shape[0]} "
+                f"upper_recompute_prefix_tokens={0 if self._parallelcomp_first_layer_prefix_positions is None else self._parallelcomp_first_layer_prefix_positions.shape[0]} "
+                f"stored_layer0_hidden_tokens={0 if self._parallelcomp_first_layer_prefix_hidden is None else self._parallelcomp_first_layer_prefix_hidden.shape[1]} "
+                f"stored_layer0_hidden={self._parallelcomp_first_layer_prefix_hidden is not None} "
+                f"recompute_layer0_blocks={0 if self._parallelcomp_first_layer_prefix_blocks is None else len(self._parallelcomp_first_layer_prefix_blocks)} "
+                f"dropped_upper_layer_cache={max(0, len(new_key_cache) - 1)}"
+            )
 
         past_key_values.key_cache = new_key_cache
         past_key_values.value_cache = new_value_cache
@@ -2500,6 +2789,7 @@ class DreamLoRA(LM):
             f"local_forward_once=True "
             f"score_query_window={self._get_parallelcomp_chunk_score_query_window_size(len(scoring_query_ids))} "
             f"token_query_window={self._get_parallelcomp_query_window_size(len(scoring_query_ids))} "
+            f"first_layer_cache_only={self.parallelcomp_first_layer_cache_only} "
             f"local_mask={self.parallelcomp_chunk_score_attention_mask}"
         )
         (
@@ -2982,6 +3272,12 @@ class DreamLoRA(LM):
             # Initialization
             x_t = prompt.to(self.device)
             self._parallelcomp_prompt_cache_compression_done = False
+            self._parallelcomp_first_layer_prefix_input_ids = None
+            self._parallelcomp_first_layer_prefix_positions = None
+            self._parallelcomp_first_layer_prefix_hidden = None
+            self._parallelcomp_first_layer_prefix_blocks = None
+            self._parallelcomp_first_layer_prefix_tail_hidden = None
+            self._parallelcomp_first_layer_prefix_tail_positions = None
             self._parallelcomp_post_compression_position_offset = None
             cached_positions_per_layer = []
             cached_block_ranges_per_layer = []
@@ -3128,15 +3424,30 @@ class DreamLoRA(LM):
                     )
                 
                 # Forward pass
-                outputs = self.model(
-                    input_seq,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    position_ids=input_rope_positions.unsqueeze(0),
-                    cache_position=input_cache_positions,
-                    use_cache=True,
-                    update_kvcache=update_kvcache,
-                )
+                if (
+                    self.parallelcomp_first_layer_cache_only
+                    and self._parallelcomp_first_layer_prefix_input_ids is not None
+                    and past_key_values is not None
+                ):
+                    outputs = self._forward_with_first_layer_cache_only(
+                        input_ids=input_seq,
+                        layer0_attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        position_ids=input_rope_positions,
+                        cache_position=input_cache_positions,
+                        update_kvcache=update_kvcache,
+                        append_input_to_upper_prefix=update_kvcache > 0,
+                    )
+                else:
+                    outputs = self.model(
+                        input_seq,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        position_ids=input_rope_positions.unsqueeze(0),
+                        cache_position=input_cache_positions,
+                        use_cache=True,
+                        update_kvcache=update_kvcache,
+                    )
                 
                 # If needed, update cache
                 if update_kvcache > 0:

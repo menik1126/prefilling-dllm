@@ -162,6 +162,8 @@ def build_arg_parser():
         default=True,
     )
     parser.add_argument("--parallelcomp_score_mode", type=str, default="self_information")
+    parser.add_argument("--parallelcomp_first_layer_cache_only", action="store_true")
+    parser.add_argument("--parallelcomp_store_layer0_hidden", action=argparse.BooleanOptionalAction, default=True)
     return parser
 
 
@@ -217,6 +219,8 @@ def main():
         parallelcomp_fixed_query_text=args.parallelcomp_fixed_query_text,
         parallelcomp_tail_replay_full_mask=args.parallelcomp_tail_replay_full_mask,
         parallelcomp_score_mode=args.parallelcomp_score_mode,
+        parallelcomp_first_layer_cache_only=args.parallelcomp_first_layer_cache_only,
+        parallelcomp_store_layer0_hidden=args.parallelcomp_store_layer0_hidden,
     )
 
     all_results = {}
