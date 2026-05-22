@@ -212,7 +212,7 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
         global_ctxlen = tl.load(ctxlens_ptr + off_ctxlen)
         cur_window_sz = (local_blk_idx + 1) * PAGE_SIZE
         prev_window_sz = local_blk_idx * PAGE_SIZE
-        local_ctxlen = tl.where(global_ctxlen > cur_window_sz, PAGE_SIZE, global_ctxlen % PAGE_SIZE)
+        local_ctxlen = tl.minimum(tl.maximum(global_ctxlen - prev_window_sz, 0), PAGE_SIZE)
         if global_ctxlen > prev_window_sz:
             # Load KV cache
             offs_kv_cache_seq = tl.arange(0, PAGE_SIZE)

@@ -48,17 +48,11 @@ class Attention(nn.Module):
                     return_lse=False, training=False), dynamic=True)
         self._block_mask_cache = {}
 
-    @lru_cache(maxsize=32)
     def dllm_block_mask(self, block_mask: torch.Tensor, 
                         B: int, H: int, Q_LEN: int, KV_LEN: int, device: str):
-        cache_key = (B, H, Q_LEN, KV_LEN, device)
         def _mask_mod(batch, head, token_q, token_kv):
             return block_mask[token_q, token_kv]
-        if cache_key not in self._block_mask_cache:
-            self._block_mask_cache[cache_key] = create_block_mask(
-                _mask_mod, B, H, Q_LEN, KV_LEN, device=device
-            )
-        return self._block_mask_cache[cache_key]
+        return create_block_mask(_mask_mod, B, H, Q_LEN, KV_LEN, device=device)
     
     @lru_cache(maxsize=32)
     def causal_lm_block_mask(self, cum_seq_lens: torch.Tensor, B: int, H: int, Q_LEN: int, KV_LEN: int, device: str):
@@ -100,7 +94,7 @@ class Attention(nn.Module):
                 # CHECK_STORING(k_cache, v_cache, k, v, context)
 
         transpose_fn = lambda x: rearrange(x, 's h d -> 1 h s d').contiguous()
-        # Prefill / Decode logic TODO: Replace the Flex Attention Prefilling
+        # Prefill / Decode logic
         if context.is_prefill:
             # Block PK
             if context.block_tables is not None and self.model_type == 'causal_lm':
@@ -109,14 +103,28 @@ class Attention(nn.Module):
                 # TODO: Implement Prefix Caching
                 pass
 
-            # Attention computation
-            q_t, k_t, v_t = [transpose_fn(t) for t in (q, k, v)]
+            if not is_unified_layout and self.model_type == 'diffusion_lm' and k_cache.numel() > 0:
+                config = context.seqs[0].config
+                diffusion_block_size = config.diffusion_block_size
+                o = torch.empty_like(q)
+                diffusion_lm_parallel_flash_decoding(
+                    q, k, v, o, str(k_cache.dtype), k_cache, v_cache,
+                    context.block_tables if context.block_tables is not None else torch.zeros((1, 1), dtype=torch.int32, device=q.device),
+                    context.cu_seqlens_q,
+                    torch.tensor([q.shape[0]], dtype=torch.int32, device=q.device),
+                    0, q.shape[0], 1.0, 1.0,
+                    diffusion_block_size, None, None, self.scale, context.block_mask,
+                    bidirectional=True,
+                )
+            else:
+                # Attention computation
+                q_t, k_t, v_t = [transpose_fn(t) for t in (q, k, v)]
 
-            B, H, S, _ = q_t.shape
-            block_mask_fn = self.causal_lm_block_mask if self.model_type == 'causal_lm' else self.dllm_block_mask
-            input_obj = context.cu_seqlens_q if self.model_type == 'causal_lm' else context.block_mask
-            block_mask = block_mask_fn(input_obj, B, H, S, S, str(q.device))
-            o = self.attention(q_t, k_t, v_t, block_mask=block_mask)
+                B, H, S, _ = q_t.shape
+                block_mask_fn = self.causal_lm_block_mask if self.model_type == 'causal_lm' else self.dllm_block_mask
+                input_obj = context.cu_seqlens_q if self.model_type == 'causal_lm' else context.block_mask
+                block_mask = block_mask_fn(input_obj, B, H, S, S, str(q.device))
+                o = self.attention(q_t, k_t, v_t, block_mask=block_mask)
         else:
             if self.model_type == 'causal_lm':
                 o = causal_lm_flash_decoding(
@@ -139,20 +147,19 @@ class Attention(nn.Module):
 
                     o = self.attention(q_t, k_t, v_t, block_mask=block_mask)
                 else:
-                    # FIXME: Kernel not ok...
-                    o = torch.empty_like(q).to(q.device).to(q.dtype)
-                    q, k, o, k_cache, v_cache = map(lambda x: x.to(torch.float32), (q, k, o, k_cache, v_cache))
+                    o = torch.empty_like(q)
                     diffusion_lm_parallel_flash_decoding(
-                        q, k, v, o, str(k_cache.dtype), k_cache, v_cache, 
+                        q, k, v, o, str(k_cache.dtype), k_cache, v_cache,
                         context.block_tables, context.cu_seqlens_q, context.total_lens,
                         max(context.total_lens), max(context.seq_lens), 1.0, 1.0,
-                        diffusion_block_size, context.block_mask
+                        diffusion_block_size, None, None, self.scale, context.block_mask
                     )
-                    CHECK_ATTENTION(o, q, k, v, k_cache, v_cache, context)
             
         # Final reshape
         if context.kv_cache_layout == "unified" and self.model_type == 'diffusion_lm':
             o = rearrange(o, '1 h s d -> s (h d)').contiguous()
+        elif not is_unified_layout and self.model_type == 'diffusion_lm':
+            o = o.view(-1, self.num_heads * self.head_dim).contiguous()
         else:
             if not context.is_prefill:
                 o = o.view(-1, self.num_heads * self.head_dim).contiguous()

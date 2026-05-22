@@ -531,6 +531,11 @@ class ModelRunnerForDiffusionLM(ModelRunnerBase):
         print(f"Allocated {config.num_kvcache_blocks} blocks of size {self.block_size} for kv cache on rank {self.rank}.")
 
         if config.kv_cache_layout == "distinct":
+            max_needed = (config.max_model_len + self.block_size - 1) // self.block_size
+            max_blocks_cap = max(max_needed * config.max_num_seqs * 8, 240)
+            if config.num_kvcache_blocks > max_blocks_cap:
+                config.num_kvcache_blocks = max_blocks_cap
+                print(f"  Capped to {max_blocks_cap} blocks for distinct layout (max_needed_per_seq={max_needed}).")
             # k_cache: [layer_id, block_id, head, head_dim // x, block_size(segmented seq_len), x]
             # v_cache: [layer_id, block_id, head, head_dim, block_size(segmented seq_len)]
             x = config.k_cache_hdim_split_factor_x
@@ -582,7 +587,14 @@ class ModelRunnerForDiffusionLM(ModelRunnerBase):
             total_seqlen = len(seq)
             # tokens and positions to run in this prefill step
             input_ids.extend(seq[seq.cached_num_tokens:])
-            positions.extend(list(range(seq.cached_num_tokens, total_seqlen)))
+            if seq.prompt_positions is not None:
+                custom_pos = list(seq.prompt_positions[seq.cached_num_tokens:])
+                gen_start = max(seq.prompt_positions) + 1
+                gen_count = total_seqlen - len(seq.prompt_positions)
+                custom_pos.extend(list(range(gen_start, gen_start + gen_count)))
+                positions.extend(custom_pos)
+            else:
+                positions.extend(list(range(seq.cached_num_tokens, total_seqlen)))
             seq_lens.append(total_seqlen)
             context_lens.append(0)
             assert len(input_ids) == len(positions), (

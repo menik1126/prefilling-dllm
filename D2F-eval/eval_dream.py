@@ -4,6 +4,7 @@ import time
 import json
 import math
 import importlib
+import os
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 import torch
@@ -164,11 +165,17 @@ def build_sparse_block_attention_mask(
     query_block_ids = query_block_ids.to(device=device, dtype=torch.long)
 
     q_len = query_block_ids.shape[0]
+    if q_len == 0:
+        return torch.empty((1, 1, 0, cached_length), device=device, dtype=dtype)
+
+    # Raw NTK/full-context baseline prefill is a single full-visible prompt block.
+    # Passing no mask lets SDPA use its efficient full-attention path instead of
+    # materializing an all-zero q_len x q_len mask.
+    if cached_length == 0 and torch.all(query_block_ids == query_block_ids[0]):
+        return None
+
     k_len = cached_length + q_len
     attention_mask = torch.full((1, 1, q_len, k_len), -torch.inf, device=device, dtype=dtype)
-
-    if q_len == 0:
-        return attention_mask
 
     if cached_length > 0:
         attention_mask[:, :, :, :cached_length] = 0
@@ -472,6 +479,15 @@ class DreamLoRA(LM):
         self.parallelcomp_tail_replay_full_mask = parallelcomp_tail_replay_full_mask
         self.parallelcomp_query_free_cache_rebuild = bool(parallelcomp_query_free_cache_rebuild)
         self.parallelcomp_score_mode = str(parallelcomp_score_mode or "self_information").lower()
+        chunk_bos_env = os.environ.get("PARALLELCOMP_CHUNK_BOS_ABLATION")
+        self.parallelcomp_chunk_bos_ablation = (
+            True
+            if chunk_bos_env is None or chunk_bos_env == ""
+            else str(chunk_bos_env).lower() not in {"0", "false", "no", "off"}
+        )
+        self.parallelcomp_generation_block_bos_ablation = str(
+            os.environ.get("PARALLELCOMP_GENERATION_BLOCK_BOS_ABLATION", "")
+        ).lower() in {"1", "true", "yes", "on"}
         self._parallelcomp_post_compression_position_offset = None
         self._parallelcomp_active_scoring_query_ids = None
         self._parallelcomp_active_scoring_query_source = None
@@ -2642,6 +2658,20 @@ class DreamLoRA(LM):
             cursor += chunk_size
         return chunks
 
+    def _maybe_prepend_bos_to_parallelcomp_chunk(self, chunk_ids: List[int]) -> List[int]:
+        if not self.parallelcomp_chunk_bos_ablation:
+            return chunk_ids
+        bos_ids = self._get_bos_token_ids()
+        if not bos_ids:
+            return chunk_ids
+        if chunk_ids[:len(bos_ids)] == bos_ids:
+            return chunk_ids
+        chunk_size = int(self.parallelcomp_chunk_size or 0)
+        with_bos = list(bos_ids) + list(chunk_ids)
+        if chunk_size > 0 and len(with_bos) > chunk_size:
+            with_bos = with_bos[:chunk_size]
+        return with_bos
+
     def _build_pre_runtime_candidate_chunks(
         self,
         prompt_spec: Dict[str, Any],
@@ -2654,6 +2684,7 @@ class DreamLoRA(LM):
             for segment_idx, segment_text in enumerate(context_segments):
                 segment_ids = self._encode_text_fragment(segment_text)
                 for chunk_idx, chunk_ids in enumerate(self._split_parallelcomp_token_chunks(segment_ids)):
+                    chunk_ids = self._maybe_prepend_bos_to_parallelcomp_chunk(chunk_ids)
                     candidates.append(
                         {
                             "token_ids": chunk_ids,
@@ -2664,6 +2695,7 @@ class DreamLoRA(LM):
         elif context_text:
             context_ids = self._encode_text_fragment(context_text)
             for chunk_idx, chunk_ids in enumerate(self._split_parallelcomp_token_chunks(context_ids)):
+                chunk_ids = self._maybe_prepend_bos_to_parallelcomp_chunk(chunk_ids)
                 candidates.append(
                     {
                         "token_ids": chunk_ids,
@@ -2807,6 +2839,7 @@ class DreamLoRA(LM):
         separator_ids = self._encode_text_fragment(prompt.get("segment_separator", "\n\n"))
         candidate_chunks = self._build_pre_runtime_candidate_chunks(prompt)
         scoring_query_ids, scoring_query_source = self._resolve_prompt_scoring_query(prompt)
+        ntk_truncation_strategy = prompt.get("ntk_truncation_strategy")
 
         raw_context_tokens = 0
         if candidate_chunks:
@@ -2824,6 +2857,7 @@ class DreamLoRA(LM):
                 "label": prompt.get("metadata_label"),
                 "scoring_query_source": scoring_query_source,
                 "scoring_query_ids": scoring_query_ids,
+                "ntk_truncation_strategy": ntk_truncation_strategy,
                 "query_start": query_start,
                 "query_end": query_end,
             }
@@ -2849,6 +2883,7 @@ class DreamLoRA(LM):
                 "label": prompt.get("metadata_label"),
                 "scoring_query_source": scoring_query_source,
                 "scoring_query_ids": scoring_query_ids,
+                "ntk_truncation_strategy": ntk_truncation_strategy,
                 "query_start": query_start,
                 "query_end": query_end,
             }
@@ -2888,6 +2923,7 @@ class DreamLoRA(LM):
             "scoring_query_tokens": len(scoring_query_ids),
             "scoring_query_source": scoring_query_source,
             "scoring_query_ids": scoring_query_ids,
+            "ntk_truncation_strategy": ntk_truncation_strategy,
             "selected_chunks": len(packed_indices),
             "selected_chunk_indices": packed_indices,
             "selected_chunk_scores": selected_scores,
@@ -2928,15 +2964,74 @@ class DreamLoRA(LM):
                     f"{score_summary}"
                 )
 
-            prompt_tensor = torch.tensor([prompt_ids], device=self.device, dtype=torch.long)
-            prompt_offset = 0
-
-            if len(prompt_ids) > self.max_length - self.max_new_tokens:
-                eval_logger.warning(f"Prompt length {len(prompt_ids)} is larger than {self.max_length-self.max_new_tokens}, cutoff on the left side")
-                prompt_offset = len(prompt_ids) - (self.max_length - self.max_new_tokens)
-                prompt_tensor = prompt_tensor[:, -(self.max_length-self.max_new_tokens):]
             query_start = prompt_meta.get("query_start")
             query_end = prompt_meta.get("query_end")
+            ntk_truncation_strategy = prompt_meta.get("ntk_truncation_strategy")
+            prompt_offset = 0
+            prompt_budget = self.max_length - self.max_new_tokens
+
+            if len(prompt_ids) > prompt_budget:
+                can_preserve_query = (
+                    query_start is not None
+                    and query_end is not None
+                    and 0 <= int(query_start) < int(query_end) <= len(prompt_ids)
+                )
+                if can_preserve_query:
+                    original_prompt_len = len(prompt_ids)
+                    query_start_int = int(query_start)
+                    query_end_int = int(query_end)
+                    query_ids = prompt_ids[query_start_int:query_end_int]
+                    if ntk_truncation_strategy == "head_tail":
+                        tail_keep = max(len(query_ids), prompt_budget // 2)
+                        tail_keep = min(tail_keep, prompt_budget)
+                        head_keep = prompt_budget - tail_keep
+                        tail_start = original_prompt_len - tail_keep
+                        if tail_start > query_start_int:
+                            tail_keep = original_prompt_len - query_start_int
+                            tail_keep = min(tail_keep, prompt_budget)
+                            head_keep = prompt_budget - tail_keep
+                            tail_start = original_prompt_len - tail_keep
+                        eval_logger.warning(
+                            f"Prompt length {original_prompt_len} is larger than {prompt_budget}, "
+                            f"cutoff prompt middle; "
+                            f"kept_head_tokens={head_keep}, "
+                            f"kept_tail_tokens={tail_keep}, "
+                            f"query_tokens={len(query_ids)}, "
+                            f"dropped_middle_tokens={tail_start - head_keep}"
+                        )
+                        prompt_ids = prompt_ids[:head_keep] + prompt_ids[tail_start:]
+                        query_start = head_keep + max(0, query_start_int - tail_start)
+                        query_end = head_keep + max(0, query_end_int - tail_start)
+                    else:
+                        prefix_context_budget = prompt_budget - len(query_ids)
+                        if prefix_context_budget > 0:
+                            kept_prefix_context_len = min(query_start_int, prefix_context_budget)
+                            dropped_context_tail = query_start_int - kept_prefix_context_len
+                            eval_logger.warning(
+                                f"Prompt length {original_prompt_len} is larger than {prompt_budget}, "
+                                f"cutoff context tail before query; "
+                                f"kept_prefix_context_tokens={kept_prefix_context_len}, "
+                                f"query_tokens={len(query_ids)}, "
+                                f"dropped_context_tail_tokens={dropped_context_tail}"
+                            )
+                            prompt_ids = prompt_ids[:kept_prefix_context_len] + query_ids
+                            query_start = kept_prefix_context_len
+                            query_end = len(prompt_ids)
+                        else:
+                            eval_logger.warning(
+                                f"Prompt length {original_prompt_len} is larger than {prompt_budget}, "
+                                f"query length {len(query_ids)} exceeds the prompt budget; cutoff on the left side"
+                            )
+                            prompt_offset = original_prompt_len - prompt_budget
+                            prompt_ids = prompt_ids[-prompt_budget:]
+                else:
+                    eval_logger.warning(
+                        f"Prompt length {len(prompt_ids)} is larger than {prompt_budget}, cutoff on the left side"
+                    )
+                    prompt_offset = len(prompt_ids) - prompt_budget
+                    prompt_ids = prompt_ids[-prompt_budget:]
+
+            prompt_tensor = torch.tensor([prompt_ids], device=self.device, dtype=torch.long)
             if query_start is not None and query_end is not None:
                 adjusted_query_start = max(0, int(query_start) - prompt_offset)
                 adjusted_query_end = min(prompt_tensor.shape[1], int(query_end) - prompt_offset)
@@ -3010,7 +3105,17 @@ class DreamLoRA(LM):
                     max_generation_blocks = max(
                         1, (self.max_new_tokens + block_size - 1) // block_size
                     )
-                if generated_block_count < max_generation_blocks and not eos_detected:
+                pending_cache_blocks = any(
+                    state["state"] == "to_cache" for state in block_states.values()
+                )
+                defer_generation_for_raw_prefill = (
+                    pending_cache_blocks and not self.parallelcomp_cache_compress_mode
+                )
+                if (
+                    generated_block_count < max_generation_blocks
+                    and not eos_detected
+                    and not defer_generation_for_raw_prefill
+                ):
                     last_block_id = max(block_states.keys())
                     current_progress = (block_states[last_block_id]['total_masks'] - 
                                       block_states[last_block_id]['mask_count']) / block_states[last_block_id]['total_masks']
@@ -3018,13 +3123,20 @@ class DreamLoRA(LM):
                         # Add new block - defaults to incomplete state
                         new_block_id = max(block_states.keys()) + 1
                         new_start_pos = x_t.shape[1]
-                        x_t = torch.cat([x_t, torch.tensor([[mask_id] * block_size]).to(self.device)], dim=1)
+                        new_block_tokens = [mask_id] * block_size
+                        if self.parallelcomp_generation_block_bos_ablation:
+                            bos_ids = self._get_bos_token_ids()
+                            if bos_ids:
+                                bos_prefix = bos_ids[:block_size]
+                                new_block_tokens[:len(bos_prefix)] = bos_prefix
+                        new_mask_count = sum(1 for token_id in new_block_tokens if token_id == mask_id)
+                        x_t = torch.cat([x_t, torch.tensor([new_block_tokens]).to(self.device)], dim=1)
                         
                         block_states[new_block_id] = {
                             'start_pos': new_start_pos,
                             'end_pos': new_start_pos + block_size,
-                            'mask_count': block_size,
-                            'total_masks': block_size,
+                            'mask_count': new_mask_count,
+                            'total_masks': max(1, new_mask_count),
                             'rope_span': block_size,
                             'state': 'active',
                             'is_complete': False,  # New block defaults to incomplete state
@@ -3128,6 +3240,11 @@ class DreamLoRA(LM):
                     )
                 
                 # Forward pass
+                has_active_blocks_in_forward = any(
+                    state["state"] == "active" and state["end_pos"] > process_start_pos
+                    for state in block_states.values()
+                )
+                logits_to_keep = 1 if update_kvcache > 0 and not has_active_blocks_in_forward else 0
                 outputs = self.model(
                     input_seq,
                     attention_mask=attention_mask,
@@ -3136,12 +3253,13 @@ class DreamLoRA(LM):
                     cache_position=input_cache_positions,
                     use_cache=True,
                     update_kvcache=update_kvcache,
+                    num_logits_to_keep=logits_to_keep,
                 )
                 
                 # If needed, update cache
                 if update_kvcache > 0:
-                    # Store logits of the last position for next token prediction
-                    cache_end_idx = update_kvcache - 1
+                    # Store logits of the last cached position for next token prediction.
+                    cache_end_idx = outputs.logits.shape[1] - 1 if logits_to_keep == 1 else update_kvcache - 1
                     last_logits = outputs.logits[:, cache_end_idx, :].unsqueeze(1)
                     
                     # Update cache
@@ -3208,6 +3326,9 @@ class DreamLoRA(LM):
                         if rerun_outputs is not None:
                             outputs = rerun_outputs
                             process_start_pos = rerun_process_start_pos
+
+                if not any(state["state"] == "active" for state in block_states.values()):
+                    continue
                 
                 # Get correctly shifted logits for prediction
                 logits = self._shift_logits(outputs.logits, last_logit=last_logits)

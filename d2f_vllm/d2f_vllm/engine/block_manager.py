@@ -93,6 +93,7 @@ class BlockManagerBase(ABC):
             if block.ref_count == 0:
                 self._free_block(block_id)
         seq.num_cached_tokens = 0
+        seq.block_cache_missed.clear()
         seq.block_table.clear()
 
     @abstractmethod
@@ -127,6 +128,18 @@ class BlockManagerForCausalLM(BlockManagerBase):
             assert last_block.hash == -1
 
 class BlockManagerForDiffusionLM(BlockManagerBase):
+    def allocate(self, seq: SequenceForDiffusionLM):
+        # The prompt is a single bidirectional diffusion block, so prefix KV
+        # depends on the whole prompt and cannot be shared across requests.
+        assert not seq.block_table
+        seq.num_cached_tokens = 0
+        seq.block_cache_missed.clear()
+        for _ in range(seq.num_blocks):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            seq.block_cache_missed.append(True)
+            seq.block_table.append(block_id)
+
     def can_append(self, seq: SequenceForDiffusionLM) -> bool:
         return len(self.free_block_ids) >= (seq.cached_or_caching_num_tokens % self.block_size == 1)
     

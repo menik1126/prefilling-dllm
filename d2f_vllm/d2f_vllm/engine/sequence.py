@@ -32,6 +32,7 @@ class SequenceBase:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.stop_token_ids = sampling_params.stop_token_ids or []
 
     def __len__(self) -> int:
         return self.num_tokens
@@ -63,6 +64,19 @@ class SequenceBase:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    def has_stop(self) -> bool:
+        if not self.stop_token_ids:
+            return False
+        token_ids = list(self.completion_token_ids)
+        for stop_ids in self.stop_token_ids:
+            n = len(stop_ids)
+            if n == 0 or n > len(token_ids):
+                continue
+            for i in range(len(token_ids) - n + 1):
+                if token_ids[i:i + n] == stop_ids:
+                    return True
+        return False
 
 
 class SequenceForCausalLM(SequenceBase):
@@ -210,9 +224,10 @@ class DiffusionBlock:
 class SequenceForDiffusionLM(SequenceBase):
     """Sequence implementation for Diffusion Language Models."""
 
-    def __init__(self, token_ids: List[int], 
+    def __init__(self, token_ids: List[int],
                  sampling_params = SamplingParams(),
-                 config: Config = None):
+                 config: Config = None,
+                 prompt_positions: List[int] = None):
         super().__init__(token_ids, sampling_params)
         self.config = config
         self.kv_cache_layout = config.kv_cache_layout
@@ -220,6 +235,7 @@ class SequenceForDiffusionLM(SequenceBase):
         self.max_model_len = config.max_model_len
         self.mask_token_id = config.mask_token_id
         self.diffusion_block_size = config.diffusion_block_size
+        self.prompt_positions = prompt_positions
         self.block_mask = None
         self.meet_eos = False
         self.diffusion_blocks: List[DiffusionBlock] = []
@@ -262,6 +278,7 @@ class SequenceForDiffusionLM(SequenceBase):
             "mask_token_id": self.mask_token_id,
             "diffusion_block_size": self.diffusion_block_size,
             "diffusion_blocks_state": diffusion_blocks_state,
+            "prompt_positions": self.prompt_positions,
             "input_token_ids": getattr(self, "input_token_ids", []),
             "input_num_tokens": getattr(self, "input_num_tokens", 0),
             "input_num_prompt_tokens": getattr(self, "input_num_prompt_tokens", 0),
@@ -293,6 +310,7 @@ class SequenceForDiffusionLM(SequenceBase):
         self.max_model_len = state["max_model_len"]
         self.mask_token_id = state["mask_token_id"]
         self.diffusion_block_size = state["diffusion_block_size"]
+        self.prompt_positions = state.get("prompt_positions", None)
 
         self.input_token_ids = state.get("input_token_ids", [])
         self.input_num_tokens = state.get("input_num_tokens", 0)
@@ -431,16 +449,20 @@ class SequenceForDiffusionLM(SequenceBase):
     def diffusion_decoding_inputs(self) -> Tuple[List[int], List[int], int]:
         to_cache_and_active_blocks = self.diffusion_blocks[self.cached_block_ids[-1] + 1:]
         assert len(to_cache_and_active_blocks) == sum(self.active_blocks) + sum(self.to_cache_blocks)
-        
+
         input_tokens = []
         positions = []
         context_len = sum(self.diffusion_blocks[block_id].size for block_id in self.cached_block_ids)
-        temp_context_len = context_len
+        if self.prompt_positions is not None:
+            pos_start = max(self.prompt_positions) + 1
+        else:
+            pos_start = context_len
+        temp_pos = pos_start
         for block in to_cache_and_active_blocks:
             input_tokens.extend(block.token_ids)
-            positions.extend([token_id + temp_context_len for token_id in range(block.size)])
-            temp_context_len += block.size
-            
+            positions.extend(list(range(temp_pos, temp_pos + block.size)))
+            temp_pos += block.size
+
         return input_tokens, positions, context_len
 
     def reset_new_tokens(self) -> None:

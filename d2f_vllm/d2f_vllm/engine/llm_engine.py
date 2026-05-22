@@ -2,7 +2,7 @@ import atexit
 
 import torch.multiprocessing as mp
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -75,17 +75,35 @@ class LLMEngine:
             except Exception:
                 pass
 
-    def add_request(self, prompt: str | List[int], sampling_params: SamplingParams):
+    def _prepare_sampling_params(self, sampling_params: SamplingParams) -> SamplingParams:
+        stops = sampling_params.stop
+        if stops is None:
+            return sampling_params
+        if isinstance(stops, str):
+            stops = [stops]
+        return replace(sampling_params, stop=list(stops), stop_token_ids=None)
+
+    @staticmethod
+    def _truncate_stop_text(text: str, stops: str | List[str] | None) -> str:
+        if stops is None:
+            return text
+        if isinstance(stops, str):
+            stops = [stops]
+        cut_positions = [text.find(stop) for stop in stops if stop and text.find(stop) >= 0]
+        return text[:min(cut_positions)] if cut_positions else text
+
+    def add_request(self, prompt: str | List[int], sampling_params: SamplingParams, prompt_positions: List[int] = None):
+        sampling_params = self._prepare_sampling_params(sampling_params)
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-            
+
         if self.engine_type == "causal_lm":
             seq = SequenceForCausalLM(prompt, sampling_params)
         elif self.engine_type == "diffusion_lm":
-            seq = SequenceForDiffusionLM(prompt, sampling_params, config=self.config)
+            seq = SequenceForDiffusionLM(prompt, sampling_params, config=self.config, prompt_positions=prompt_positions)
         else:
             raise ValueError(f"Unsupported engine type: {self.engine_type}")
-        
+
         self.scheduler.add(seq)
         # Return seq_id so caller can build a stable mapping
         return seq.seq_id
@@ -109,15 +127,18 @@ class LLMEngine:
         prompts: List[str] | List[List[int]],
         sampling_params: SamplingParams | List[SamplingParams],
         use_tqdm: bool = True,
+        prompt_positions: List[List[int]] = None,
     ) -> List[str]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        sampling_params = [self._prepare_sampling_params(sp) for sp in sampling_params]
         # Map internal seq_id -> input index to keep output order stable
         seqid_to_idx = {}
         for idx, (prompt, sp) in enumerate(zip(prompts, sampling_params)):
-            sid = self.add_request(prompt, sp)
+            pos = prompt_positions[idx] if prompt_positions is not None else None
+            sid = self.add_request(prompt, sp, prompt_positions=pos)
             seqid_to_idx[sid] = idx
         outputs = [None] * len(prompts)
         prefill_throughput = decode_throughput = 0.
@@ -148,11 +169,18 @@ class LLMEngine:
         print(f"Finished in {n_steps} steps, prefill throughput: {prefill_throughput:.2f} tok/s, decode throughput: {decode_throughput:.2f} tok/s")
         # Ensure all outputs are present
         assert all(toks is not None for toks in outputs), "Some sequences did not produce outputs"
-        outputs = [{
-            "text": self.tokenizer.decode(token_ids).split(self.tokenizer.eos_token)[0],
-            "token_ids": token_ids[:token_ids.index(self.config.eos)] if self.config.eos in token_ids else token_ids,
-            "n_diff_steps": n_diff_step,
-        } for token_ids, n_diff_step in zip(outputs, n_diff_steps)]
+        formatted_outputs = []
+        for token_ids, n_diff_step, sp in zip(outputs, n_diff_steps, sampling_params):
+            if self.config.eos in token_ids:
+                token_ids = token_ids[:token_ids.index(self.config.eos)]
+            text = self.tokenizer.decode(token_ids)
+            text = self._truncate_stop_text(text, sp.stop)
+            formatted_outputs.append({
+                "text": text,
+                "token_ids": token_ids,
+                "n_diff_steps": n_diff_step,
+            })
+        outputs = formatted_outputs
         if use_tqdm:
             pbar.close()
         return outputs

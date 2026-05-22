@@ -13,3 +13,4 @@ D2F-eval/model_weights/
 D2F-eval/logs/
 D2F-eval/results*/
 D2F-eval/evals_*/
+nano-vllm

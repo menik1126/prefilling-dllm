@@ -138,8 +138,10 @@ class SamplerForDream(SamplerForDiffusionLM):
                         margin_confidence=(margin_confidence == "margin_confidence")
                     )
                     
-                if block.pre_block_complete:
-                    high_conf_indices = torch.where(initial_confidence > block.accept_threshold)[0]        
+                if context.is_prefill:
+                    accepted_ids = torch.tensor([0], device=sampled_tokens.device, dtype=torch.long)
+                elif block.pre_block_complete:
+                    high_conf_indices = torch.where(initial_confidence >= block.accept_threshold)[0]
                     if len(high_conf_indices) == 0:
                         number_transfer_tokens = 1
                         _, transfer_index = torch.topk(confidence, number_transfer_tokens)
@@ -147,7 +149,7 @@ class SamplerForDream(SamplerForDiffusionLM):
                         transfer_index = torch.tensor([], device=sampled_tokens.device, dtype=torch.long)
                     accepted_ids = torch.unique(torch.cat([transfer_index, high_conf_indices]))
                 else:
-                    high_conf_indices = torch.where(initial_confidence > block.accept_threshold)[0]
+                    high_conf_indices = torch.where(initial_confidence >= block.accept_threshold)[0]
                     accepted_ids = high_conf_indices
 
                 true_local_ids_sub_map[str(block_id)] = [block.local_mask_token_ids[accepted_id] for accepted_id in accepted_ids.tolist()]

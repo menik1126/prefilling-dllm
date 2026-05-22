@@ -6,3 +6,5 @@ class SamplingParams:
     temperature: float = 1.0
     max_tokens: int = 64
     ignore_eos: bool = False
+    stop: str | list[str] | None = None
+    stop_token_ids: list[list[int]] | None = None

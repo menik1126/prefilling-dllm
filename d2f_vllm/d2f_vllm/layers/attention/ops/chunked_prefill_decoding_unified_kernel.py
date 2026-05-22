@@ -229,6 +229,7 @@ def chunked_prefill_paged_decode(
     sliding_window=None,
     sm_scale=None,
     mask=None,
+    bidirectional=False,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[1]**0.5)
@@ -259,7 +260,8 @@ def chunked_prefill_paged_decode(
             sliding_window=sliding_window,
             sm_scale=sm_scale,
             skip_decode=True,
-            mask=mask
+            mask=mask,
+            bidirectional=bidirectional,
         )
         return
 
