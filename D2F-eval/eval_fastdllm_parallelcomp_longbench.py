@@ -23,6 +23,7 @@ from eval_longbench_dream import (
 from fastdllm_parallelcomp import (
     dataclass_to_jsonable,
     default_fastdllm_dream_dir,
+    default_fastdllm_llada_dir,
     load_fastdllm_parallelcomp,
 )
 
@@ -46,17 +47,44 @@ def trim_stop_tokens(text, stop_tokens):
     return text if cut is None else text[:cut]
 
 
-def build_token_parts(model, parts, add_bos_token):
-    prefix_ids = (model.bos_ids() if add_bos_token else []) + encode_fragment(
-        model.tokenizer,
-        parts.get("prefix", ""),
+def apply_chat_template_to_parts(tokenizer, parts):
+    sentinel = "__PARALLELCOMP_CONTEXT_SENTINEL__"
+    prefix = parts.get("prefix", "")
+    query = parts.get("query", "")
+    if sentinel in prefix or sentinel in query or sentinel in parts.get("context", ""):
+        raise ValueError("Chat template sentinel unexpectedly appears in prompt text")
+    user_content = f"{prefix}{sentinel}{query}"
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise ValueError("Tokenizer does not support apply_chat_template")
+    chat_text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": user_content}],
+        tokenize=False,
+        add_generation_prompt=True,
     )
-    context_ids = encode_fragment(model.tokenizer, parts.get("context", ""))
-    query_ids = encode_fragment(model.tokenizer, parts.get("query", ""))
-    scoring_query_ids = encode_fragment(model.tokenizer, parts.get("scoring_query", ""))
+    if sentinel not in chat_text:
+        raise ValueError("Chat template removed the context sentinel")
+    chat_prefix, chat_query = chat_text.split(sentinel, 1)
+    templated = dict(parts)
+    templated["prefix"] = chat_prefix
+    templated["query"] = chat_query
+    templated["scoring_query"] = chat_query
+    return templated
+
+
+def build_token_parts(model, parts, add_bos_token, use_chat_template=False):
+    effective_parts = apply_chat_template_to_parts(model.tokenizer, parts) if use_chat_template else parts
+    # Chat templates already include their own BOS / role-control tokens.
+    external_bos_ids = [] if use_chat_template else (model.bos_ids() if add_bos_token else [])
+    prefix_ids = external_bos_ids + encode_fragment(
+        model.tokenizer,
+        effective_parts.get("prefix", ""),
+    )
+    context_ids = encode_fragment(model.tokenizer, effective_parts.get("context", ""))
+    query_ids = encode_fragment(model.tokenizer, effective_parts.get("query", ""))
+    scoring_query_ids = encode_fragment(model.tokenizer, effective_parts.get("scoring_query", ""))
     if not scoring_query_ids:
         scoring_query_ids = list(query_ids)
-    return prefix_ids, context_ids, query_ids, scoring_query_ids
+    return prefix_ids, context_ids, query_ids, scoring_query_ids, effective_parts
 
 
 def add_parallelcomp_args(parser):
@@ -90,6 +118,7 @@ def add_parallelcomp_args(parser):
     parser.add_argument("--score_draft_partial_steps", type=int, default=None)
     parser.add_argument("--score_draft_partial_rounds", type=int, default=None)
     parser.add_argument("--score_draft_score_all_slots", action="store_true")
+    parser.add_argument("--score_llada_shift_logits", action="store_true")
     parser.add_argument(
         "--score_attention_mask",
         choices=["causal", "full", "query_to_chunk"],
@@ -103,15 +132,32 @@ def add_parallelcomp_args(parser):
     parser.add_argument("--attention_score_layers", type=int, default=4)
     parser.add_argument("--attention_query_window", type=int, default=0)
     parser.add_argument("--token_capacity", type=int, default=0)
-    parser.add_argument("--token_score_query_window", type=int, default=0)
-    parser.add_argument("--token_score_layers", type=int, default=1)
-    parser.add_argument("--token_score_layer_mode", choices=["first", "last", "all"], default="first")
+    parser.add_argument("--token_score_query_window", type=int, default=8)
+    parser.add_argument("--token_score_layers", type=int, default=0)
+    parser.add_argument("--token_score_layer_mode", choices=["first", "last", "all"], default="all")
     parser.add_argument("--token_score_reduce", choices=["sum", "mean"], default="sum")
+    parser.add_argument("--token_score_pooling", choices=["none", "avgpool", "maxpool"], default="maxpool")
+    parser.add_argument("--token_score_pool_kernel", type=int, default=7)
+    parser.add_argument("--token_score_head_reduce", choices=["sum", "mean", "max"], default="sum")
+    parser.add_argument("--token_score_layer_reduce", choices=["sum", "mean", "max"], default="mean")
+    parser.add_argument(
+        "--token_score_direction",
+        choices=["query_to_chunk", "chunk_to_query", "bidirectional"],
+        default="query_to_chunk",
+    )
+    parser.add_argument("--token_score_keep", choices=["high", "low"], default="high")
+    parser.add_argument("--token_score_include_prefix", dest="token_score_include_prefix", action="store_true", default=True)
+    parser.add_argument("--no-token_score_include_prefix", dest="token_score_include_prefix", action="store_false")
     parser.add_argument("--token_score_use_generated", action="store_true")
+    parser.add_argument(
+        "--token_eviction_granularity",
+        choices=["global", "per_head"],
+        default="global",
+    )
     parser.add_argument(
         "--token_attention_mask",
         choices=["full", "causal", "query_to_chunk"],
-        default="full",
+        default="causal",
     )
     parser.add_argument(
         "--chunk_position_mode",
@@ -135,7 +181,10 @@ def build_arg_parser():
         description="Evaluate Fast-dLLM v1 with full ParallelComp KV runtime on LongBench."
     )
     parser.add_argument("--pretrained", default=os.environ.get("DREAM_BASE", "Dream-org/Dream-v0-Base-7B"))
+    parser.add_argument("--model_backend", choices=["dream", "llada"], default="dream")
     parser.add_argument("--fastdllm_dream_dir", default=default_fastdllm_dream_dir())
+    parser.add_argument("--fastdllm_llada_dir", default=default_fastdllm_llada_dir())
+    parser.add_argument("--llada_score_batch_size", type=int, default=8)
     parser.add_argument("--tasks", nargs="+", default=list(SUPPORTED_TASKS))
     parser.add_argument("--data_dir", default=None)
     parser.add_argument("--config_dir", default=None)
@@ -153,9 +202,11 @@ def build_arg_parser():
     parser.add_argument("--alg_temp", type=float, default=0.0)
     parser.add_argument("--threshold", type=float, default=0.9)
     parser.add_argument("--rope_scale_factor", type=float, default=1.0)
+    parser.add_argument("--rope_scaling_type", choices=["yarn", "linear"], default="yarn")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--stop_tokens", nargs="*", default=[])
     parser.add_argument("--add_bos_token", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use_chat_template", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--longbench_e", action="store_true")
     parser.add_argument("--segment_separator", default="\n\n")
     add_parallelcomp_args(parser)
@@ -181,7 +232,9 @@ def main():
     print(f"Config dir            : {config_dir}")
     print(f"Tasks                 : {', '.join(args.tasks)}")
     print(f"Run name              : {args.run_name}")
+    print(f"Model backend         : {args.model_backend}")
     print(f"Fast-dLLM Dream dir   : {args.fastdllm_dream_dir}")
+    print(f"Fast-dLLM LLaDA dir   : {args.fastdllm_llada_dir}")
     print(f"Model max_length      : {args.max_length}")
     print(f"Generation max_new    : {args.max_new_tokens}")
     print(f"Block length          : {args.block_length}")
@@ -192,22 +245,38 @@ def main():
     print(f"Score partial steps   : {args.score_draft_partial_steps}")
     print(f"Score partial rounds  : {args.score_draft_partial_rounds}")
     print(f"Score all draft slots : {args.score_draft_score_all_slots}")
+    print(f"LLaDA shifted score   : {args.score_llada_shift_logits}")
     print(f"Score attention mask  : {args.score_attention_mask}")
     print(f"Score context mode    : {args.score_context_mode}")
     print(f"Chunk size/top-k      : {args.chunk_size}/{args.topk_chunks}")
     print(f"Token capacity        : {args.token_capacity}")
     print(f"Token score generated : {args.token_score_use_generated}")
+    print(f"Token eviction gran.  : {args.token_eviction_granularity}")
+    print(
+        "Token score config    : "
+        f"mask={args.token_attention_mask}, query_window={args.token_score_query_window}, "
+        f"layers={args.token_score_layer_mode}:{args.token_score_layers}, "
+        f"pool={args.token_score_pooling}/{args.token_score_pool_kernel}, "
+        f"head_reduce={args.token_score_head_reduce}, layer_reduce={args.token_score_layer_reduce}, "
+        f"direction={args.token_score_direction}, keep={args.token_score_keep}, "
+        f"include_prefix={args.token_score_include_prefix}"
+    )
     print(f"Chunk BOS             : {args.chunk_bos}")
     print(f"Cache build mode      : {args.cache_build_mode}")
     print(f"Chunk position mode   : {args.chunk_position_mode}")
     print(f"Query position mode   : {args.query_position_mode}")
+    print(f"Use chat template     : {args.use_chat_template}")
     print(f"RoPE scale factor     : {args.rope_scale_factor}")
+    print(f"RoPE scaling type     : {args.rope_scaling_type}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"Loading Fast-dLLM ParallelComp from {args.pretrained}...")
     model = load_fastdllm_parallelcomp(
         pretrained=args.pretrained,
         fastdllm_dream_dir=args.fastdllm_dream_dir,
+        model_backend=args.model_backend,
+        fastdllm_llada_dir=args.fastdllm_llada_dir,
+        llada_score_batch_size=args.llada_score_batch_size,
         max_new_tokens=args.max_new_tokens,
         max_length=args.max_length,
         block_length=args.block_length,
@@ -219,6 +288,7 @@ def main():
         alg_temp=args.alg_temp,
         threshold=args.threshold,
         rope_scale_factor=args.rope_scale_factor,
+        rope_scaling_type=args.rope_scaling_type,
         dtype=args.dtype,
         add_bos_token=args.add_bos_token,
         chunk_size=args.chunk_size,
@@ -236,6 +306,7 @@ def main():
         score_draft_partial_steps=args.score_draft_partial_steps,
         score_draft_partial_rounds=args.score_draft_partial_rounds,
         score_draft_score_all_slots=args.score_draft_score_all_slots,
+        score_llada_shift_logits=args.score_llada_shift_logits,
         score_attention_mask=args.score_attention_mask,
         score_context_mode=args.score_context_mode,
         attention_score_layers=args.attention_score_layers,
@@ -245,8 +316,16 @@ def main():
         token_score_layers=args.token_score_layers,
         token_score_layer_mode=args.token_score_layer_mode,
         token_score_reduce=args.token_score_reduce,
+        token_score_pooling=args.token_score_pooling,
+        token_score_pool_kernel=args.token_score_pool_kernel,
+        token_score_head_reduce=args.token_score_head_reduce,
+        token_score_layer_reduce=args.token_score_layer_reduce,
+        token_score_direction=args.token_score_direction,
+        token_score_keep=args.token_score_keep,
+        token_score_include_prefix=args.token_score_include_prefix,
         token_attention_mask=args.token_attention_mask,
         token_score_use_generated=args.token_score_use_generated,
+        token_eviction_granularity=args.token_eviction_granularity,
         chunk_position_mode=args.chunk_position_mode,
         chunk_query_position_mode=args.chunk_query_position_mode,
         query_position_mode=args.query_position_mode,
@@ -281,10 +360,11 @@ def main():
             if example_id in completed_ids:
                 continue
             parts = render_prompt_parts(template, example, args.segment_separator)
-            prefix_ids, context_ids, query_ids, scoring_query_ids = build_token_parts(
+            prefix_ids, context_ids, query_ids, scoring_query_ids, effective_parts = build_token_parts(
                 model,
                 parts,
                 args.add_bos_token,
+                args.use_chat_template,
             )
             result = model.generate(
                 prefix_ids=prefix_ids,
@@ -307,7 +387,7 @@ def main():
                 "score": score,
                 "context_chars": len(example.get("context", "")),
                 "input_chars": len(example.get("input", "")),
-                "prompt_chars": estimate_prompt_chars(parts),
+                "prompt_chars": estimate_prompt_chars(effective_parts),
                 "prompt_meta": {
                     "prefix_tokens": len(prefix_ids),
                     "context_tokens": len(context_ids),
@@ -337,6 +417,8 @@ def main():
                 "alg": args.alg,
                 "threshold": args.threshold,
                 "rope_scale_factor": args.rope_scale_factor,
+                "rope_scaling_type": args.rope_scaling_type,
+                "use_chat_template": args.use_chat_template,
                 "chunk_size": args.chunk_size,
                 "topk_chunks": args.topk_chunks,
                 "chunk_bos": args.chunk_bos,
@@ -348,13 +430,25 @@ def main():
                 "score_draft_partial_steps": args.score_draft_partial_steps,
                 "score_draft_partial_rounds": args.score_draft_partial_rounds,
                 "score_draft_score_all_slots": args.score_draft_score_all_slots,
+                "score_llada_shift_logits": args.score_llada_shift_logits,
                 "score_attention_mask": args.score_attention_mask,
                 "score_context_mode": args.score_context_mode,
                 "token_capacity": args.token_capacity,
                 "token_score_use_generated": args.token_score_use_generated,
                 "token_score_layer_mode": args.token_score_layer_mode,
                 "token_score_layers": args.token_score_layers,
+                "token_score_query_window": args.token_score_query_window,
+                "token_score_reduce": args.token_score_reduce,
+                "token_score_pooling": args.token_score_pooling,
+                "token_score_pool_kernel": args.token_score_pool_kernel,
+                "token_score_head_reduce": args.token_score_head_reduce,
+                "token_score_layer_reduce": args.token_score_layer_reduce,
+                "token_score_direction": args.token_score_direction,
+                "token_score_keep": args.token_score_keep,
+                "token_score_include_prefix": args.token_score_include_prefix,
+                "token_attention_mask": args.token_attention_mask,
                 "chunk_position_mode": args.chunk_position_mode,
+                "token_eviction_granularity": args.token_eviction_granularity,
                 "query_position_mode": args.query_position_mode,
             }
         )

@@ -9,6 +9,7 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 from fastdllm_parallelcomp import (
     dataclass_to_jsonable,
     default_fastdllm_dream_dir,
+    default_fastdllm_llada_dir,
     load_fastdllm_parallelcomp,
 )
 from infinitebench_tasks import (
@@ -132,6 +133,7 @@ def add_parallelcomp_args(parser):
     parser.add_argument("--score_draft_partial_steps", type=int, default=None)
     parser.add_argument("--score_draft_partial_rounds", type=int, default=None)
     parser.add_argument("--score_draft_score_all_slots", action="store_true")
+    parser.add_argument("--score_llada_shift_logits", action="store_true")
     parser.add_argument(
         "--score_attention_mask",
         choices=["causal", "full", "query_to_chunk"],
@@ -141,10 +143,22 @@ def add_parallelcomp_args(parser):
     parser.add_argument("--attention_query_window", type=int, default=0)
     parser.add_argument("--token_capacity", type=int, default=0)
     parser.add_argument("--token_score_query_window", type=int, default=0)
-    parser.add_argument("--token_score_layers", type=int, default=1)
-    parser.add_argument("--token_score_layer_mode", choices=["first", "last", "all"], default="first")
+    parser.add_argument("--token_score_layers", type=int, default=0)
+    parser.add_argument("--token_score_layer_mode", choices=["first", "last", "all"], default="all")
     parser.add_argument("--token_score_reduce", choices=["sum", "mean"], default="sum")
+    parser.add_argument(
+        "--token_score_direction",
+        choices=["query_to_chunk", "chunk_to_query", "bidirectional"],
+        default="query_to_chunk",
+    )
+    parser.add_argument("--token_score_include_prefix", dest="token_score_include_prefix", action="store_true", default=True)
+    parser.add_argument("--no-token_score_include_prefix", dest="token_score_include_prefix", action="store_false")
     parser.add_argument("--token_score_use_generated", action="store_true")
+    parser.add_argument(
+        "--token_eviction_granularity",
+        choices=["global", "per_head"],
+        default="global",
+    )
     parser.add_argument(
         "--token_attention_mask",
         choices=["full", "causal", "query_to_chunk"],
@@ -172,7 +186,10 @@ def build_arg_parser():
         description="Evaluate Fast-dLLM v1 with full ParallelComp KV runtime on InfiniteBench."
     )
     parser.add_argument("--pretrained", default=os.environ.get("DREAM_BASE", "Dream-org/Dream-v0-Base-7B"))
+    parser.add_argument("--model_backend", choices=["dream", "llada"], default="dream")
     parser.add_argument("--fastdllm_dream_dir", default=default_fastdllm_dream_dir())
+    parser.add_argument("--fastdllm_llada_dir", default=default_fastdllm_llada_dir())
+    parser.add_argument("--llada_score_batch_size", type=int, default=8)
     parser.add_argument("--tasks", nargs="+", default=list(SUPPORTED_TASKS))
     parser.add_argument("--data_dir", default=None)
     parser.add_argument("--max_examples", type=int, default=100)
@@ -212,7 +229,9 @@ def main():
     print(f"Data dir              : {data_dir}")
     print(f"Tasks                 : {', '.join(args.tasks)}")
     print(f"Prompt style          : {args.prompt_style}")
+    print(f"Model backend         : {args.model_backend}")
     print(f"Fast-dLLM Dream dir   : {args.fastdllm_dream_dir}")
+    print(f"Fast-dLLM LLaDA dir   : {args.fastdllm_llada_dir}")
     print(f"Model max_length      : {args.max_length}")
     print(f"Generation max_new    : {args.max_new_tokens}")
     print(f"Block length          : {args.block_length}")
@@ -222,9 +241,13 @@ def main():
     print(f"Score partial steps   : {args.score_draft_partial_steps}")
     print(f"Score partial rounds  : {args.score_draft_partial_rounds}")
     print(f"Score all draft slots : {args.score_draft_score_all_slots}")
+    print(f"LLaDA shifted score   : {args.score_llada_shift_logits}")
     print(f"Chunk size/top-k      : {args.chunk_size}/{args.topk_chunks}")
     print(f"Token capacity        : {args.token_capacity}")
     print(f"Token score generated : {args.token_score_use_generated}")
+    print(f"Token score direction : {args.token_score_direction}")
+    print(f"Token score prefix    : {args.token_score_include_prefix}")
+    print(f"Token eviction gran.  : {args.token_eviction_granularity}")
     print(f"Chunk BOS             : {args.chunk_bos}")
     print(f"Cache build mode      : {args.cache_build_mode}")
     print(f"Chunk position mode   : {args.chunk_position_mode}")
@@ -235,6 +258,9 @@ def main():
     model = load_fastdllm_parallelcomp(
         pretrained=args.pretrained,
         fastdllm_dream_dir=args.fastdllm_dream_dir,
+        model_backend=args.model_backend,
+        fastdllm_llada_dir=args.fastdllm_llada_dir,
+        llada_score_batch_size=args.llada_score_batch_size,
         max_new_tokens=args.max_new_tokens,
         max_length=args.max_length,
         block_length=args.block_length,
@@ -262,6 +288,7 @@ def main():
         score_draft_partial_steps=args.score_draft_partial_steps,
         score_draft_partial_rounds=args.score_draft_partial_rounds,
         score_draft_score_all_slots=args.score_draft_score_all_slots,
+        score_llada_shift_logits=args.score_llada_shift_logits,
         score_attention_mask=args.score_attention_mask,
         attention_score_layers=args.attention_score_layers,
         attention_query_window=args.attention_query_window,
@@ -270,8 +297,11 @@ def main():
         token_score_layers=args.token_score_layers,
         token_score_layer_mode=args.token_score_layer_mode,
         token_score_reduce=args.token_score_reduce,
+        token_score_direction=args.token_score_direction,
+        token_score_include_prefix=args.token_score_include_prefix,
         token_attention_mask=args.token_attention_mask,
         token_score_use_generated=args.token_score_use_generated,
+        token_eviction_granularity=args.token_eviction_granularity,
         chunk_position_mode=args.chunk_position_mode,
         chunk_query_position_mode=args.chunk_query_position_mode,
         query_position_mode=args.query_position_mode,
@@ -372,8 +402,12 @@ def main():
                 "score_draft_partial_steps": args.score_draft_partial_steps,
                 "score_draft_partial_rounds": args.score_draft_partial_rounds,
                 "score_draft_score_all_slots": args.score_draft_score_all_slots,
+                "score_llada_shift_logits": args.score_llada_shift_logits,
                 "token_capacity": args.token_capacity,
                 "token_score_use_generated": args.token_score_use_generated,
+                "token_score_direction": args.token_score_direction,
+                "token_score_include_prefix": args.token_score_include_prefix,
+                "token_eviction_granularity": args.token_eviction_granularity,
                 "token_score_layer_mode": args.token_score_layer_mode,
                 "token_score_layers": args.token_score_layers,
                 "chunk_position_mode": args.chunk_position_mode,

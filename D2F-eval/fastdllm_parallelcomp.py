@@ -33,6 +33,10 @@ import transformers
 from fastdllm_v1_model import _resolve_dtype, default_fastdllm_dream_dir
 
 
+def default_fastdllm_llada_dir() -> str:
+    return os.environ.get("FASTDLLM_LLADA_DIR", "/home/ma-user/work/Fast-dLLM/v1/llada")
+
+
 Cache = Optional[List[Tuple[torch.Tensor, torch.Tensor]]]
 
 
@@ -40,9 +44,12 @@ Cache = Optional[List[Tuple[torch.Tensor, torch.Tensor]]]
 class FastDLLMParallelCompConfig:
     fastdllm_dream_dir: str
     pretrained: str
+    model_backend: str = "dream"
+    fastdllm_llada_dir: Optional[str] = None
     device: str = "cuda"
     dtype: str = "auto"
     trust_remote_code: bool = True
+    llada_score_batch_size: int = 8
 
     max_new_tokens: int = 32
     max_length: int = 4096
@@ -56,6 +63,7 @@ class FastDLLMParallelCompConfig:
     threshold: float = 0.9
     add_bos_token: bool = True
     rope_scale_factor: float = 1.0
+    rope_scaling_type: str = "yarn"
 
     chunk_size: int = 1024
     topk_chunks: int = 4
@@ -73,18 +81,27 @@ class FastDLLMParallelCompConfig:
     score_draft_partial_steps: Optional[int] = None
     score_draft_partial_rounds: Optional[int] = None
     score_draft_score_all_slots: bool = False
+    score_llada_shift_logits: bool = False
     score_attention_mask: str = "causal"
     score_context_mode: str = "single_chunk"
     attention_score_layers: int = 4
     attention_query_window: int = 0
 
     token_capacity: int = 0
-    token_score_query_window: int = 0
-    token_score_layers: int = 1
-    token_score_layer_mode: str = "first"
+    token_score_query_window: int = 8
+    token_score_layers: int = 0
+    token_score_layer_mode: str = "all"
     token_score_reduce: str = "sum"
-    token_attention_mask: str = "full"
+    token_score_pooling: str = "maxpool"
+    token_score_pool_kernel: int = 7
+    token_score_head_reduce: str = "sum"
+    token_score_layer_reduce: str = "mean"
+    token_score_direction: str = "query_to_chunk"
+    token_score_keep: str = "high"
+    token_score_include_prefix: bool = True
+    token_attention_mask: str = "causal"
     token_score_use_generated: bool = False
+    token_eviction_granularity: str = "global"
 
     chunk_position_mode: str = "reuse"
     chunk_query_position_mode: str = "after_reused_window"
@@ -350,6 +367,9 @@ def _patch_fastdllm_base_model_position_ids(model) -> None:
 class FastDLLMParallelComp:
     def __init__(self, config: FastDLLMParallelCompConfig):
         self.config = config
+        self.model_backend = (config.model_backend or "dream").lower()
+        if self.model_backend not in {"dream", "llada"}:
+            raise ValueError(f"Unsupported model_backend: {config.model_backend}")
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         self.max_new_tokens = int(config.max_new_tokens)
         self.block_length = int(config.block_length)
@@ -362,36 +382,158 @@ class FastDLLMParallelComp:
             if config.diffusion_steps is not None
             else max(1, math.ceil(self.max_new_tokens / self.block_length))
         )
+        if config.token_score_direction not in {"query_to_chunk", "chunk_to_query", "bidirectional"}:
+            raise ValueError(f"Unsupported token_score_direction: {config.token_score_direction}")
+        if config.token_score_keep not in {"high", "low"}:
+            raise ValueError(f"Unsupported token_score_keep: {config.token_score_keep}")
+        if config.token_eviction_granularity not in {"global", "per_head"}:
+            raise ValueError(f"Unsupported token_eviction_granularity: {config.token_eviction_granularity}")
 
-        dream_dir = os.path.abspath(config.fastdllm_dream_dir)
-        if not os.path.isdir(dream_dir):
-            raise FileNotFoundError(f"Fast-dLLM v1 Dream dir not found: {dream_dir}")
-        if dream_dir not in sys.path:
-            sys.path.insert(0, dream_dir)
+        self._llada_attention_capture_patched = False
+        self._llada_collect_attentions = False
+        self._llada_apply_attention_bias = False
+        self._llada_capture_layer_indices: Optional[set[int]] = None
+        self._llada_captured_attentions: List[Optional[torch.Tensor]] = []
 
-        from model.configuration_dream import DreamConfig
-        from model.modeling_dream import DreamModel, DreamRotaryEmbedding
-
-        model_config = DreamConfig.from_pretrained(config.pretrained)
         target_dtype = _resolve_dtype(config.dtype)
-        self.model = DreamModel.from_pretrained(
-            config.pretrained,
-            config=model_config,
-            torch_dtype=target_dtype,
-            trust_remote_code=False,
-        ).eval()
+        self._load_backend_model(target_dtype)
         if target_dtype not in (None, "auto"):
             self.model = self.model.to(target_dtype)
         self.model = self.model.to(self.device).eval()
-        self._apply_rope_scaling(DreamRotaryEmbedding, float(config.rope_scale_factor or 1.0))
-        _patch_fastdllm_base_model_position_ids(self.model)
-
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             config.pretrained,
             trust_remote_code=config.trust_remote_code,
         )
         self.generated_token_num = 0
         self.total_generation_time = 0.0
+
+    def _prepare_fastdllm_module_path(self, source_dir: str) -> None:
+        source_dir = os.path.abspath(source_dir)
+        if not os.path.isdir(source_dir):
+            raise FileNotFoundError(f"Fast-dLLM source dir not found: {source_dir}")
+        for module_name in list(sys.modules):
+            if module_name == "model" or module_name.startswith("model."):
+                del sys.modules[module_name]
+        if source_dir in sys.path:
+            sys.path.remove(source_dir)
+        sys.path.insert(0, source_dir)
+
+    def _load_backend_model(self, target_dtype):
+        if self.model_backend == "dream":
+            self._prepare_fastdllm_module_path(self.config.fastdllm_dream_dir)
+            from model.configuration_dream import DreamConfig
+            from model.modeling_dream import DreamModel, DreamRotaryEmbedding
+
+            model_config = DreamConfig.from_pretrained(self.config.pretrained)
+            self.model = DreamModel.from_pretrained(
+                self.config.pretrained,
+                config=model_config,
+                torch_dtype=target_dtype,
+                trust_remote_code=False,
+            ).eval()
+            self._apply_rope_scaling(DreamRotaryEmbedding, float(self.config.rope_scale_factor or 1.0))
+            _patch_fastdllm_base_model_position_ids(self.model)
+            return
+
+        llada_dir = self.config.fastdllm_llada_dir or default_fastdllm_llada_dir()
+        self._prepare_fastdllm_module_path(llada_dir)
+        from model.configuration_llada import LLaDAConfig
+        from model.modeling_llada import LLaDAModelLM, RotaryEmbedding
+
+        model_config = LLaDAConfig.from_pretrained(self.config.pretrained)
+        if hasattr(model_config, "flash_attention"):
+            model_config.flash_attention = True
+        self.model = LLaDAModelLM.from_pretrained(
+            self.config.pretrained,
+            config=model_config,
+            torch_dtype=target_dtype,
+            trust_remote_code=self.config.trust_remote_code,
+        ).eval()
+        self._apply_llada_rope_scaling(
+            RotaryEmbedding,
+            float(self.config.rope_scale_factor or 1.0),
+            self.config.rope_scaling_type,
+        )
+        self._patch_llada_attention_capture()
+
+    def _patch_llada_attention_capture(self) -> None:
+        if self.model_backend != "llada" or self._llada_attention_capture_patched:
+            return
+
+        layer_idx = 0
+        for module in self.model.modules():
+            scaled_attn = getattr(module, "_scaled_dot_product_attention", None)
+            attention = getattr(module, "attention", None)
+            if not callable(scaled_attn) or not callable(attention):
+                continue
+
+            module._parallelcomp_layer_idx = layer_idx
+            module._parallelcomp_current_attention_bias = None
+            original_scaled_attn = scaled_attn
+            original_attention = attention
+            parent = self
+
+            def wrapped_attention(
+                q,
+                k,
+                v,
+                mask=None,
+                attention_bias=None,
+                layer_past=None,
+                use_cache=False,
+                replace_position=None,
+                _module=module,
+                _original_attention=original_attention,
+            ):
+                _module._parallelcomp_current_attention_bias = attention_bias if attention_bias is not None else mask
+                try:
+                    return _original_attention(
+                        q,
+                        k,
+                        v,
+                        mask=mask,
+                        attention_bias=attention_bias,
+                        layer_past=layer_past,
+                        use_cache=use_cache,
+                        replace_position=replace_position,
+                    )
+                finally:
+                    _module._parallelcomp_current_attention_bias = None
+
+            def wrapped_scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                _module=module,
+                _original_scaled_attn=original_scaled_attn,
+            ):
+                if not parent._llada_collect_attentions:
+                    return _original_scaled_attn(
+                        q,
+                        k,
+                        v,
+                        attn_mask=attn_mask,
+                        dropout_p=dropout_p,
+                        is_causal=is_causal,
+                    )
+                return parent._llada_attention_with_capture(
+                    _module,
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=is_causal,
+                )
+
+            module.attention = wrapped_attention
+            module._scaled_dot_product_attention = wrapped_scaled_dot_product_attention
+            layer_idx += 1
+
+        self._llada_attention_capture_patched = True
 
     def _apply_rope_scaling(self, rotary_cls, factor: float) -> None:
         if factor <= 1.0:
@@ -409,17 +551,331 @@ class FastDLLMParallelComp:
                 module.__init__(config=self.model.config)
                 module.to(self.device)
 
+    def _apply_llada_rope_scaling(self, rotary_cls, factor: float, scaling_type: str = "yarn") -> None:
+        if factor <= 1.0:
+            return
+
+        scaling_type = (scaling_type or "yarn").lower()
+        if scaling_type not in {"linear", "yarn"}:
+            raise ValueError(f"Unsupported LLaDA RoPE scaling type: {scaling_type}")
+
+        model_config = getattr(getattr(self.model, "model", None), "config", None)
+        if model_config is None:
+            raise ValueError("Cannot apply LLaDA RoPE scaling: model config not found")
+        original_max_pos = getattr(model_config, "max_sequence_length", None)
+        if original_max_pos is not None:
+            setattr(model_config, "parallelcomp_original_max_sequence_length", original_max_pos)
+            setattr(model_config, "max_sequence_length", int(math.ceil(original_max_pos * factor)))
+        setattr(
+            model_config,
+            "parallelcomp_rope_scaling",
+            {
+                "rope_type": scaling_type,
+                "factor": factor,
+                "original_max_sequence_length": original_max_pos,
+            },
+        )
+
+        def yarn_inv_freq(
+            module,
+            dim: int,
+            device: torch.device,
+            max_position_embeddings: int,
+            rope_factor: float,
+        ) -> Tuple[torch.Tensor, float]:
+            attention_factor = 0.1 * math.log(rope_factor) + 1.0
+            beta_fast = 32
+            beta_slow = 1
+
+            def find_correction_dim(num_rotations: int) -> float:
+                return (
+                    dim
+                    * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
+                    / (2 * math.log(module.rope_theta))
+                )
+
+            def find_correction_range() -> Tuple[int, int]:
+                low = math.floor(find_correction_dim(beta_fast))
+                high = math.ceil(find_correction_dim(beta_slow))
+                return max(low, 0), min(high, dim - 1)
+
+            def linear_ramp_factor(low: int, high: int) -> torch.Tensor:
+                if low == high:
+                    high += 1
+                ramp = (torch.arange(dim // 2, device=device, dtype=torch.float32) - low) / (high - low)
+                return torch.clamp(ramp, 0, 1)
+
+            pos_freqs = module.rope_theta ** (
+                torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim
+            )
+            inv_freq_extrapolation = 1.0 / pos_freqs
+            inv_freq_interpolation = 1.0 / (rope_factor * pos_freqs)
+            low, high = find_correction_range()
+            extrapolation_weight = 1 - linear_ramp_factor(low, high)
+            inv_freq = (
+                inv_freq_interpolation * (1 - extrapolation_weight)
+                + inv_freq_extrapolation * extrapolation_weight
+            )
+            return inv_freq, attention_factor
+
+        for module in self.model.modules():
+            if not isinstance(module, rotary_cls):
+                continue
+
+            module._parallelcomp_rope_scale_factor = float(factor)
+            module._parallelcomp_rope_scaling_type = scaling_type
+
+            def scaled_get_rotary_embedding(
+                seq_len: int,
+                device: torch.device,
+                _module=module,
+                _factor=float(factor),
+                _scaling_type=scaling_type,
+                _original_max_pos=int(original_max_pos or 4096),
+            ):
+                cache = getattr(_module, "_RotaryEmbedding__cache")
+                key_sin = f"parallelcomp_rope_pos_sin_{_scaling_type}_{_factor:g}"
+                key_cos = f"parallelcomp_rope_pos_cos_{_scaling_type}_{_factor:g}"
+                pos_sin = cache.get(key_sin)
+                pos_cos = cache.get(key_cos)
+                if (
+                    pos_sin is not None
+                    and pos_cos is not None
+                    and pos_sin.shape[-2] >= seq_len
+                    and pos_cos.shape[-2] >= seq_len
+                ):
+                    if pos_sin.device != device:
+                        pos_sin = pos_sin.to(device)
+                        cache[key_sin] = pos_sin
+                    if pos_cos.device != device:
+                        pos_cos = pos_cos.to(device)
+                        cache[key_cos] = pos_cos
+                    return pos_sin[:, :, :seq_len, :], pos_cos[:, :, :seq_len, :]
+
+                with torch.autocast(device.type, enabled=False):
+                    dim = _module.config.d_model // _module.config.n_heads
+                    attention_factor = 1.0
+                    if _scaling_type == "yarn":
+                        inv_freq, attention_factor = yarn_inv_freq(
+                            _module,
+                            dim,
+                            device,
+                            _original_max_pos,
+                            _factor,
+                        )
+                    else:
+                        inv_freq = 1.0 / (
+                            _module.rope_theta
+                            ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
+                        )
+                    seq = torch.arange(seq_len, device=device, dtype=torch.float)
+                    if _scaling_type == "linear":
+                        seq = seq / _factor
+                    freqs = torch.outer(seq, inv_freq)
+                    positions = torch.cat((freqs, freqs), dim=-1)
+                    pos_sin = positions.sin()[None, None, :, :] * attention_factor
+                    pos_cos = positions.cos()[None, None, :, :] * attention_factor
+                cache[key_sin] = pos_sin
+                cache[key_cos] = pos_cos
+                return pos_sin, pos_cos
+
+            module.get_rotary_embedding = scaled_get_rotary_embedding
+
     def _mask_token_id(self) -> int:
-        mask_token_id = getattr(self.model.config, "mask_token_id", None)
+        mask_token_id = getattr(self.tokenizer, "mask_token_id", None)
+        if mask_token_id is None:
+            mask_token_id = getattr(self.model.config, "mask_token_id", None)
         if mask_token_id is None:
             generation_config = getattr(self.model, "generation_config", None)
             mask_token_id = getattr(generation_config, "mask_token_id", None)
         if mask_token_id is None:
-            raise ValueError("Fast-dLLM Dream mask_token_id is not available")
+            raise ValueError(f"Fast-dLLM {self.model_backend} mask_token_id is not available")
         return int(mask_token_id)
 
     def _ids_tensor(self, ids: Sequence[int]) -> torch.Tensor:
         return torch.tensor([list(ids)], device=self.device, dtype=torch.long)
+
+    def _ids_batch_tensor(self, rows: Sequence[Sequence[int]]) -> torch.Tensor:
+        return torch.tensor([list(row) for row in rows], device=self.device, dtype=torch.long)
+
+    def _model_forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        attention_mask="full",
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_values: Cache = None,
+        use_cache: bool = False,
+        return_dict: bool = True,
+        output_attentions: bool = False,
+        dual_cache: Optional[bool] = None,
+        replace_position: Optional[torch.Tensor] = None,
+    ):
+        if self.model_backend == "dream":
+            kwargs = {
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "return_dict": return_dict,
+            }
+            if output_attentions:
+                kwargs["output_attentions"] = True
+            if dual_cache is not None:
+                kwargs["dual_cache"] = dual_cache
+            if replace_position is not None:
+                kwargs["replace_position"] = replace_position
+            return self.model(input_ids, **kwargs)
+
+        if output_attentions:
+            raise NotImplementedError("Fast-dLLM LLaDA model does not expose output_attentions")
+        kwargs = {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache,
+            "return_dict": return_dict,
+        }
+        if not isinstance(attention_mask, str) or attention_mask != "full":
+            kwargs["attention_bias"] = attention_mask
+        if replace_position is not None:
+            kwargs["replace_position"] = replace_position
+        return self.model(**kwargs)
+
+    def _llada_additive_attention_bias(
+        self,
+        raw_bias: Optional[torch.Tensor],
+        *,
+        query_len: int,
+        key_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if raw_bias is None:
+            return None
+        bias = raw_bias.to(device=device)
+        if bias.dtype in (torch.int8, torch.bool):
+            additive = bias.to(dtype=torch.float32)
+            additive = additive.masked_fill(additive == 0.0, torch.finfo(torch.float32).min)
+            additive = additive.masked_fill(additive == 1.0, 0.0)
+        else:
+            additive = bias.to(dtype=torch.float32)
+        additive = additive[:, :, key_len - query_len:key_len, :key_len]
+        return additive.to(dtype=dtype)
+
+    def _llada_attention_with_capture(
+        self,
+        module,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attn_mask: Optional[torch.Tensor] = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        if q.size(1) != k.size(1):
+            if q.size(1) % k.size(1) != 0:
+                raise ValueError(f"Cannot expand LLaDA KV heads {k.size(1)} to query heads {q.size(1)}")
+            repeat = q.size(1) // k.size(1)
+            k_attn = k.repeat_interleave(repeat, dim=1, output_size=q.size(1))
+            v_attn = v.repeat_interleave(repeat, dim=1, output_size=q.size(1))
+        else:
+            k_attn = k
+            v_attn = v
+
+        query_len = q.shape[-2]
+        key_len = k_attn.shape[-2]
+        scores = torch.matmul(q.float(), k_attn.float().transpose(-2, -1)) / math.sqrt(q.shape[-1])
+
+        if self._llada_apply_attention_bias:
+            raw_bias = getattr(module, "_parallelcomp_current_attention_bias", None)
+            additive_bias = self._llada_additive_attention_bias(
+                raw_bias,
+                query_len=query_len,
+                key_len=key_len,
+                device=scores.device,
+                dtype=scores.dtype,
+            )
+            if additive_bias is not None:
+                scores = scores + additive_bias
+            elif attn_mask is not None:
+                scores = scores + attn_mask.to(device=scores.device, dtype=scores.dtype)
+
+        if is_causal:
+            causal_mask = torch.full(
+                (query_len, key_len),
+                torch.finfo(scores.dtype).min,
+                device=scores.device,
+                dtype=scores.dtype,
+            )
+            offset = key_len - query_len
+            for row in range(query_len):
+                causal_mask[row, :offset + row + 1] = 0
+            scores = scores + causal_mask.view(1, 1, query_len, key_len)
+
+        probs = F.softmax(scores, dim=-1)
+        if dropout_p and dropout_p > 0:
+            probs = F.dropout(probs, p=dropout_p, training=self.model.training)
+
+        layer_idx = getattr(module, "_parallelcomp_layer_idx", None)
+        should_capture = (
+            layer_idx is not None
+            and (
+                self._llada_capture_layer_indices is None
+                or layer_idx in self._llada_capture_layer_indices
+            )
+        )
+        if should_capture:
+            store_dtype = torch.float16 if probs.device.type == "cuda" else torch.float32
+            self._llada_captured_attentions[layer_idx] = probs.detach().to(store_dtype)
+
+        return torch.matmul(probs.to(v_attn.dtype), v_attn)
+
+    def _model_forward_with_attentions(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        attention_mask="full",
+        use_cache: bool = False,
+        return_dict: bool = True,
+        capture_layer_indices: Optional[Sequence[int]] = None,
+        apply_attention_bias: bool = True,
+    ):
+        if self.model_backend == "dream":
+            outputs = self._model_forward(
+                input_ids,
+                attention_mask=attention_mask,
+                use_cache=use_cache,
+                output_attentions=True,
+                return_dict=return_dict,
+            )
+            return outputs, getattr(outputs, "attentions", None)
+
+        self._patch_llada_attention_capture()
+        total_layers = self._num_hidden_layers()
+        self._llada_captured_attentions = [None for _ in range(total_layers)]
+        self._llada_capture_layer_indices = (
+            set(int(idx) for idx in capture_layer_indices)
+            if capture_layer_indices is not None
+            else None
+        )
+        self._llada_apply_attention_bias = bool(apply_attention_bias)
+        self._llada_collect_attentions = True
+        try:
+            outputs = self._model_forward(
+                input_ids,
+                attention_mask=attention_mask,
+                use_cache=use_cache,
+                output_attentions=False,
+                return_dict=return_dict,
+            )
+            attentions = tuple(self._llada_captured_attentions)
+        finally:
+            self._llada_collect_attentions = False
+            self._llada_apply_attention_bias = False
+            self._llada_capture_layer_indices = None
+            self._llada_captured_attentions = []
+        return outputs, attentions
 
     @property
     def _mask_dtype(self) -> torch.dtype:
@@ -557,24 +1013,115 @@ class FastDLLMParallelComp:
             shifted[:, 1:, :] = logits[:, :-1, :]
         return shifted
 
+    def _align_generation_logits(
+        self,
+        logits: torch.Tensor,
+        last_logit: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.model_backend == "dream":
+            return self._shift_logits(logits, last_logit)
+        return logits
+
+    def _num_key_value_heads(self) -> int:
+        model_config = getattr(self.model, "config", None)
+        num_heads = getattr(model_config, "effective_n_kv_heads", None)
+        if num_heads is None:
+            num_heads = getattr(model_config, "n_kv_heads", None)
+        if num_heads is None:
+            num_heads = getattr(model_config, "num_key_value_heads", None)
+        if num_heads is None:
+            num_heads = getattr(model_config, "num_attention_heads", None)
+        if num_heads is None:
+            num_heads = getattr(model_config, "n_heads", None)
+        return max(1, int(num_heads or 1))
+
+    def _num_hidden_layers(self) -> int:
+        model_config = getattr(self.model, "config", None)
+        num_layers = getattr(model_config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = getattr(model_config, "n_layers", None)
+        return max(1, int(num_layers or 1))
+
+    def _cache_seq_dim(self, tensor: torch.Tensor) -> int:
+        return 2 if tensor.dim() == 4 else 1
+
     def _cache_len(self, cache: Cache) -> int:
         if not cache:
             return 0
-        return int(cache[0][0].shape[1])
+        key = cache[0][0]
+        return int(key.shape[self._cache_seq_dim(key)])
 
     def _slice_cache(self, cache: Cache, start: int, end: int) -> Cache:
         if cache is None:
             return None
-        return [(key[:, start:end, :].contiguous(), value[:, start:end, :].contiguous()) for key, value in cache]
+        sliced = []
+        for key, value in cache:
+            if self._cache_seq_dim(key) == 2:
+                sliced.append((key[:, :, start:end, :].contiguous(), value[:, :, start:end, :].contiguous()))
+            else:
+                sliced.append((key[:, start:end, :].contiguous(), value[:, start:end, :].contiguous()))
+        return sliced
 
     def _gather_cache(self, cache: Cache, keep_positions: Sequence[int]) -> Cache:
         if cache is None:
             return None
         keep = torch.tensor(list(keep_positions), device=self.device, dtype=torch.long)
-        return [
-            (key.index_select(1, keep).contiguous(), value.index_select(1, keep).contiguous())
-            for key, value in cache
-        ]
+        gathered = []
+        for key, value in cache:
+            dim = self._cache_seq_dim(key)
+            gathered.append((key.index_select(dim, keep).contiguous(), value.index_select(dim, keep).contiguous()))
+        return gathered
+
+    def _gather_cache_per_layer_per_head(
+        self,
+        cache: Cache,
+        keep_indices_per_layer_per_head: Sequence[torch.Tensor],
+    ) -> Cache:
+        if cache is None:
+            return None
+        gathered: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_idx, (key, value) in enumerate(cache):
+            keep = keep_indices_per_layer_per_head[layer_idx]
+            keep = keep.to(device=key.device, dtype=torch.long)
+            num_heads, keep_count = keep.shape
+            if self._cache_seq_dim(key) == 2:
+                key_index = keep.unsqueeze(0).unsqueeze(-1).expand(key.shape[0], num_heads, keep_count, key.shape[-1])
+                value_index = keep.unsqueeze(0).unsqueeze(-1).expand(
+                    value.shape[0],
+                    num_heads,
+                    keep_count,
+                    value.shape[-1],
+                )
+                gathered.append(
+                    (
+                        key.gather(2, key_index).contiguous(),
+                        value.gather(2, value_index).contiguous(),
+                    )
+                )
+                continue
+            if key.shape[-1] % num_heads != 0 or value.shape[-1] % num_heads != 0:
+                raise ValueError(
+                    f"Cannot gather per-head cache: hidden dims {key.shape[-1]}/{value.shape[-1]} "
+                    f"are not divisible by {num_heads} KV heads"
+                )
+            key_dim = key.shape[-1] // num_heads
+            value_dim = value.shape[-1] // num_heads
+            key_heads = key.view(key.shape[0], key.shape[1], num_heads, key_dim).transpose(1, 2)
+            value_heads = value.view(value.shape[0], value.shape[1], num_heads, value_dim).transpose(1, 2)
+            key_index = keep.unsqueeze(0).unsqueeze(-1).expand(key.shape[0], num_heads, keep_count, key_dim)
+            value_index = keep.unsqueeze(0).unsqueeze(-1).expand(value.shape[0], num_heads, keep_count, value_dim)
+            gathered_key = key_heads.gather(2, key_index).transpose(1, 2).contiguous().view(
+                key.shape[0],
+                keep_count,
+                key.shape[-1],
+            )
+            gathered_value = value_heads.gather(2, value_index).transpose(1, 2).contiguous().view(
+                value.shape[0],
+                keep_count,
+                value.shape[-1],
+            )
+            gathered.append((gathered_key, gathered_value))
+        return gathered
 
     def _concat_caches(self, caches: Sequence[Cache]) -> Cache:
         parts = [cache for cache in caches if cache is not None and self._cache_len(cache) > 0]
@@ -583,10 +1130,11 @@ class FastDLLMParallelComp:
         num_layers = len(parts[0])
         combined: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for layer_idx in range(num_layers):
+            cat_dim = self._cache_seq_dim(parts[0][layer_idx][0])
             combined.append(
                 (
-                    torch.cat([cache[layer_idx][0] for cache in parts], dim=1).contiguous(),
-                    torch.cat([cache[layer_idx][1] for cache in parts], dim=1).contiguous(),
+                    torch.cat([cache[layer_idx][0] for cache in parts], dim=cat_dim).contiguous(),
+                    torch.cat([cache[layer_idx][1] for cache in parts], dim=cat_dim).contiguous(),
                 )
             )
         return combined
@@ -603,7 +1151,7 @@ class FastDLLMParallelComp:
         if not token_ids:
             return past_key_values, None
         full_positions = list(past_positions or []) + list(positions)
-        outputs = self.model(
+        outputs = self._model_forward(
             self._ids_tensor(token_ids),
             attention_mask=attention_mask,
             position_ids=self._position_ids_from_list(full_positions),
@@ -613,6 +1161,98 @@ class FastDLLMParallelComp:
         )
         last_logits = outputs.logits[:, -1, :].detach()
         return outputs.past_key_values, last_logits
+
+    def _llada_leave_one_out_score(
+        self,
+        joint_ids: Sequence[int],
+        label_positions: Sequence[int],
+        label_ids: Sequence[int],
+        attention_mask,
+    ) -> float:
+        if not label_positions:
+            return float("-inf")
+        mask_token_id = self._mask_token_id()
+        batch_size = max(1, int(self.config.llada_score_batch_size or 1))
+        nll_parts: List[torch.Tensor] = []
+        positions = [int(pos) for pos in label_positions]
+        labels = [int(token_id) for token_id in label_ids]
+        for offset in range(0, len(positions), batch_size):
+            batch_positions = positions[offset:offset + batch_size]
+            batch_labels = labels[offset:offset + batch_size]
+            rows = [list(joint_ids) for _ in batch_positions]
+            for row, pos in zip(rows, batch_positions):
+                row[pos] = mask_token_id
+            with torch.inference_mode():
+                outputs = self._model_forward(
+                    self._ids_batch_tensor(rows),
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            pos_tensor = torch.tensor(batch_positions, device=self.device, dtype=torch.long)
+            row_tensor = torch.arange(len(batch_positions), device=self.device, dtype=torch.long)
+            logits = outputs.logits[row_tensor, pos_tensor, :]
+            label_tensor = torch.tensor(batch_labels, device=self.device, dtype=torch.long)
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            nll_parts.append(-log_probs.gather(dim=-1, index=label_tensor.unsqueeze(-1)).squeeze(-1))
+        if not nll_parts:
+            return float("-inf")
+        return float(-torch.cat(nll_parts, dim=0).mean().item())
+
+    def _self_information_score_from_targets(
+        self,
+        *,
+        joint_ids: Sequence[int],
+        label_positions: Sequence[int],
+        label_ids: Sequence[int],
+        attention_mask,
+    ) -> float:
+        if not label_positions:
+            return float("-inf")
+        if self.model_backend == "llada":
+            if self.config.score_llada_shift_logits:
+                positions = torch.tensor(label_positions, device=self.device, dtype=torch.long)
+                if int(positions.min().item()) <= 0:
+                    return float("-inf")
+                with torch.inference_mode():
+                    outputs = self._model_forward(
+                        self._ids_tensor(joint_ids),
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                logits = outputs.logits
+                if int(positions.max().item()) - 1 >= logits.shape[1]:
+                    return float("-inf")
+                query_logits = logits.index_select(1, positions - 1)
+                query_labels = self._ids_tensor(label_ids)
+                if query_logits.shape[1] != query_labels.shape[1]:
+                    return float("-inf")
+                log_probs = F.log_softmax(query_logits.float(), dim=-1)
+                token_nll = -log_probs.gather(dim=-1, index=query_labels.unsqueeze(-1)).squeeze(-1)
+                return float(-token_nll.mean().item())
+            return self._llada_leave_one_out_score(joint_ids, label_positions, label_ids, attention_mask)
+
+        positions = torch.tensor(label_positions, device=self.device, dtype=torch.long)
+        if int(positions.min().item()) <= 0:
+            return float("-inf")
+        with torch.inference_mode():
+            outputs = self._model_forward(
+                self._ids_tensor(joint_ids),
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+        logits = outputs.logits
+        if int(positions.max().item()) - 1 >= logits.shape[1]:
+            return float("-inf")
+        query_logits = logits.index_select(1, positions - 1)
+        query_labels = self._ids_tensor(label_ids)
+        if query_logits.shape[1] != query_labels.shape[1]:
+            return float("-inf")
+        log_probs = F.log_softmax(query_logits.float(), dim=-1)
+        token_nll = -log_probs.gather(dim=-1, index=query_labels.unsqueeze(-1)).squeeze(-1)
+        return float(-token_nll.mean().item())
 
     def score_chunk_self_information(
         self,
@@ -641,53 +1281,34 @@ class FastDLLMParallelComp:
             query_len=query_len,
             current_only=False,
         )
-        with torch.inference_mode():
-            outputs = self.model(
-                self._ids_tensor(joint_ids),
-                attention_mask=attention_mask,
-                use_cache=False,
-                return_dict=True,
-            )
-
-        logits = outputs.logits
         if score_token_mask is not None:
             if len(score_token_mask) != query_len:
                 return float("-inf")
             local_indices = [idx for idx, keep in enumerate(score_token_mask) if keep]
             if not local_indices:
                 return float("-inf")
-            label_positions = torch.tensor(
-                [prefix_len + chunk_len + idx for idx in local_indices],
-                device=self.device,
-                dtype=torch.long,
-            )
-            if int(label_positions.min().item()) <= 0 or int(label_positions.max().item()) - 1 >= logits.shape[1]:
-                return float("-inf")
-            query_logits = logits.index_select(1, label_positions - 1)
-            query_labels = self._ids_tensor([query_ids[idx] for idx in local_indices])
+            label_positions = [prefix_len + chunk_len + idx for idx in local_indices]
+            label_ids = [query_ids[idx] for idx in local_indices]
         elif score_token_count is None:
             window = min(query_len, self.config.score_query_window or query_len)
             start = prefix_len + chunk_len + query_len - window
             end = prefix_len + chunk_len + query_len
-            if start <= 0 or logits.shape[1] < end - 1:
-                return float("-inf")
-            query_logits = logits[:, start - 1:end - 1, :]
-            query_labels = self._ids_tensor(joint_ids[start:end])
+            label_positions = list(range(start, end))
+            label_ids = joint_ids[start:end]
         else:
             target_len = min(query_len, max(0, int(score_token_count)))
             if target_len <= 0:
                 return float("-inf")
             start = prefix_len + chunk_len
             end = start + target_len
-            if start <= 0 or logits.shape[1] < end - 1:
-                return float("-inf")
-            query_logits = logits[:, start - 1:end - 1, :]
-            query_labels = self._ids_tensor(joint_ids[start:end])
-        if query_logits.shape[1] != query_labels.shape[1]:
-            return float("-inf")
-        log_probs = F.log_softmax(query_logits.float(), dim=-1)
-        token_nll = -log_probs.gather(dim=-1, index=query_labels.unsqueeze(-1)).squeeze(-1)
-        return float(-token_nll.mean().item())
+            label_positions = list(range(start, end))
+            label_ids = joint_ids[start:end]
+        return self._self_information_score_from_targets(
+            joint_ids=joint_ids,
+            label_positions=label_positions,
+            label_ids=label_ids,
+            attention_mask=attention_mask,
+        )
 
     def score_chunk_self_information_joint_chunks(
         self,
@@ -741,53 +1362,34 @@ class FastDLLMParallelComp:
             query_len=query_len,
             current_only=False,
         )
-        with torch.inference_mode():
-            outputs = self.model(
-                self._ids_tensor(joint_ids),
-                attention_mask=attention_mask,
-                use_cache=False,
-                return_dict=True,
-            )
-
-        logits = outputs.logits
         if score_token_mask is not None:
             if len(score_token_mask) != query_len:
                 return float("-inf")
             local_indices = [idx for idx, keep in enumerate(score_token_mask) if keep]
             if not local_indices:
                 return float("-inf")
-            label_positions = torch.tensor(
-                [prefix_len + context_len + idx for idx in local_indices],
-                device=self.device,
-                dtype=torch.long,
-            )
-            if int(label_positions.min().item()) <= 0 or int(label_positions.max().item()) - 1 >= logits.shape[1]:
-                return float("-inf")
-            query_logits = logits.index_select(1, label_positions - 1)
-            query_labels = self._ids_tensor([query_ids[idx] for idx in local_indices])
+            label_positions = [prefix_len + context_len + idx for idx in local_indices]
+            label_ids = [query_ids[idx] for idx in local_indices]
         elif score_token_count is None:
             window = min(query_len, self.config.score_query_window or query_len)
             start = prefix_len + context_len + query_len - window
             end = prefix_len + context_len + query_len
-            if start <= 0 or logits.shape[1] < end - 1:
-                return float("-inf")
-            query_logits = logits[:, start - 1:end - 1, :]
-            query_labels = self._ids_tensor(joint_ids[start:end])
+            label_positions = list(range(start, end))
+            label_ids = joint_ids[start:end]
         else:
             target_len = min(query_len, max(0, int(score_token_count)))
             if target_len <= 0:
                 return float("-inf")
             start = prefix_len + context_len
             end = start + target_len
-            if start <= 0 or logits.shape[1] < end - 1:
-                return float("-inf")
-            query_logits = logits[:, start - 1:end - 1, :]
-            query_labels = self._ids_tensor(joint_ids[start:end])
-        if query_logits.shape[1] != query_labels.shape[1]:
-            return float("-inf")
-        log_probs = F.log_softmax(query_logits.float(), dim=-1)
-        token_nll = -log_probs.gather(dim=-1, index=query_labels.unsqueeze(-1)).squeeze(-1)
-        return float(-token_nll.mean().item())
+            label_positions = list(range(start, end))
+            label_ids = joint_ids[start:end]
+        return self._self_information_score_from_targets(
+            joint_ids=joint_ids,
+            label_positions=label_positions,
+            label_ids=label_ids,
+            attention_mask=attention_mask,
+        )
 
     def score_chunk_next_block_logits(
         self,
@@ -802,13 +1404,13 @@ class FastDLLMParallelComp:
         mask_token_id = self._mask_token_id()
         joint_ids = list(prefix_ids) + list(chunk_ids) + list(query_ids) + [mask_token_id] * draft_len
         with torch.inference_mode():
-            outputs = self.model(
+            outputs = self._model_forward(
                 self._ids_tensor(joint_ids),
                 attention_mask="full",
                 use_cache=False,
                 return_dict=True,
             )
-        logits = self._shift_logits(outputs.logits)
+        logits = self._align_generation_logits(outputs.logits)
         draft_logits = logits[:, -draft_len:, :]
         probs = torch.softmax(draft_logits.float(), dim=-1)
         confidence = probs.max(dim=-1).values
@@ -824,15 +1426,20 @@ class FastDLLMParallelComp:
         layer_window: int,
         layer_mode: str,
         reduce_mode: str,
+        pooling: Optional[str] = None,
+        pool_kernel: Optional[int] = None,
+        head_reduce: Optional[str] = None,
+        layer_reduce: Optional[str] = None,
     ) -> torch.Tensor:
         query_ids = self._window_query(query_ids, query_window)
         if not chunk_ids or not query_ids:
             return torch.empty(0, device=self.device)
 
-        prefix_len = len(prefix_ids)
+        score_prefix_ids = list(prefix_ids) if self.config.token_score_include_prefix else []
+        prefix_len = len(score_prefix_ids)
         chunk_len = len(chunk_ids)
         query_len = len(query_ids)
-        joint_ids = list(prefix_ids) + list(chunk_ids) + list(query_ids)
+        joint_ids = score_prefix_ids + list(chunk_ids) + list(query_ids)
         attention_mask = self._attention_mask(
             self.config.token_attention_mask,
             q_len=len(joint_ids),
@@ -844,46 +1451,224 @@ class FastDLLMParallelComp:
         )
         if attention_mask == "full":
             attention_mask = None
+        selected_indices = self._select_attention_layer_indices(
+            self._num_hidden_layers(),
+            layer_window,
+            layer_mode,
+        )
+        if not selected_indices:
+            return torch.empty(0, device=self.device)
         with torch.inference_mode():
-            outputs = self.model(
+            _, attentions = self._model_forward_with_attentions(
                 self._ids_tensor(joint_ids),
                 attention_mask=attention_mask,
                 use_cache=False,
-                output_attentions=True,
                 return_dict=True,
+                capture_layer_indices=selected_indices,
             )
 
-        attentions = getattr(outputs, "attentions", None)
         if not attentions:
             return torch.empty(0, device=self.device)
 
-        selected_layers = self._select_attention_layers(attentions, layer_window, layer_mode)
+        selected_layers = [attentions[idx] for idx in selected_indices]
         layer_scores: List[torch.Tensor] = []
         query_start = prefix_len + chunk_len
         chunk_start = prefix_len
+        pooling = (pooling or self.config.token_score_pooling or "none").lower()
+        pool_kernel = int(pool_kernel or self.config.token_score_pool_kernel or 1)
+        head_reduce = (head_reduce or self.config.token_score_head_reduce or "sum").lower()
+        layer_reduce = (layer_reduce or self.config.token_score_layer_reduce or "mean").lower()
         for attn in selected_layers:
             if attn is None:
                 continue
-            query_to_chunk = attn[0, :, query_start:query_start + query_len, chunk_start:chunk_start + chunk_len].float()
-            if query_to_chunk.numel() == 0:
+            head_scores = self._chunk_attention_head_scores(
+                attn,
+                query_start=query_start,
+                query_len=query_len,
+                chunk_start=chunk_start,
+                chunk_len=chunk_len,
+                reduce_mode=reduce_mode,
+            )
+            if head_scores.numel() == 0:
                 continue
-            if reduce_mode == "mean":
-                layer_scores.append(query_to_chunk.mean(dim=(0, 1)))
+
+            if pooling != "none" and head_scores.shape[-1] > 0:
+                kernel = max(1, min(pool_kernel, head_scores.shape[-1]))
+                padding = kernel // 2
+                pooled = head_scores.unsqueeze(1)
+                if pooling == "avgpool":
+                    pooled = F.avg_pool1d(pooled, kernel_size=kernel, padding=padding, stride=1)
+                elif pooling == "maxpool":
+                    pooled = F.max_pool1d(pooled, kernel_size=kernel, padding=padding, stride=1)
+                else:
+                    raise ValueError(f"Unsupported token_score_pooling: {pooling}")
+                head_scores = pooled.squeeze(1)[..., :chunk_len]
+
+            if head_reduce == "mean":
+                layer_scores.append(head_scores.mean(dim=0))
+            elif head_reduce == "sum":
+                layer_scores.append(head_scores.sum(dim=0))
+            elif head_reduce == "max":
+                layer_scores.append(head_scores.max(dim=0).values)
             else:
-                layer_scores.append(query_to_chunk.sum(dim=(0, 1)))
+                raise ValueError(f"Unsupported token_score_head_reduce: {head_reduce}")
 
         if not layer_scores:
             return torch.empty(0, device=self.device)
-        return torch.stack(layer_scores, dim=0).mean(dim=0)
+        stacked = torch.stack(layer_scores, dim=0)
+        if layer_reduce == "mean":
+            return stacked.mean(dim=0)
+        if layer_reduce == "sum":
+            return stacked.sum(dim=0)
+        if layer_reduce == "max":
+            return stacked.max(dim=0).values
+        raise ValueError(f"Unsupported token_score_layer_reduce: {layer_reduce}")
+
+    def _chunk_attention_head_scores(
+        self,
+        attn: torch.Tensor,
+        *,
+        query_start: int,
+        query_len: int,
+        chunk_start: int,
+        chunk_len: int,
+        reduce_mode: str,
+    ) -> torch.Tensor:
+        direction = self.config.token_score_direction
+        parts: List[torch.Tensor] = []
+        if direction in {"query_to_chunk", "bidirectional"}:
+            query_to_chunk = attn[0, :, query_start:query_start + query_len, chunk_start:chunk_start + chunk_len].float()
+            if query_to_chunk.numel() > 0:
+                if reduce_mode == "mean":
+                    parts.append(query_to_chunk.mean(dim=1))
+                else:
+                    parts.append(query_to_chunk.sum(dim=1))
+        if direction in {"chunk_to_query", "bidirectional"}:
+            chunk_to_query = attn[0, :, chunk_start:chunk_start + chunk_len, query_start:query_start + query_len].float()
+            if chunk_to_query.numel() > 0:
+                if reduce_mode == "mean":
+                    parts.append(chunk_to_query.mean(dim=2))
+                else:
+                    parts.append(chunk_to_query.sum(dim=2))
+        if not parts:
+            return torch.empty(0, device=self.device)
+        return torch.stack(parts, dim=0).sum(dim=0)
+
+    def query_attention_token_scores_per_layer_per_head(
+        self,
+        prefix_ids: Sequence[int],
+        chunk_ids: Sequence[int],
+        query_ids: Sequence[int],
+        *,
+        query_window: int,
+        layer_window: int,
+        layer_mode: str,
+        reduce_mode: str,
+        pooling: Optional[str] = None,
+        pool_kernel: Optional[int] = None,
+    ) -> List[torch.Tensor]:
+        query_ids = self._window_query(query_ids, query_window)
+        if not chunk_ids or not query_ids:
+            return []
+
+        score_prefix_ids = list(prefix_ids) if self.config.token_score_include_prefix else []
+        prefix_len = len(score_prefix_ids)
+        chunk_len = len(chunk_ids)
+        query_len = len(query_ids)
+        joint_ids = score_prefix_ids + list(chunk_ids) + list(query_ids)
+        attention_mask = self._attention_mask(
+            self.config.token_attention_mask,
+            q_len=len(joint_ids),
+            key_len=len(joint_ids),
+            prefix_len=prefix_len,
+            chunk_len=chunk_len,
+            query_len=query_len,
+            current_only=False,
+        )
+        if attention_mask == "full":
+            attention_mask = None
+        selected_indices = self._select_attention_layer_indices(
+            self._num_hidden_layers(),
+            layer_window,
+            layer_mode,
+        )
+        if not selected_indices:
+            return []
+        with torch.inference_mode():
+            _, attentions = self._model_forward_with_attentions(
+                self._ids_tensor(joint_ids),
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+                capture_layer_indices=selected_indices,
+            )
+
+        if not attentions:
+            return []
+
+        num_kv_heads = self._num_key_value_heads()
+        pooling = (pooling or self.config.token_score_pooling or "none").lower()
+        pool_kernel = int(pool_kernel or self.config.token_score_pool_kernel or 1)
+        query_start = prefix_len + chunk_len
+        chunk_start = prefix_len
+        scores_by_layer: List[Optional[torch.Tensor]] = [None for _ in attentions]
+        for layer_idx in selected_indices:
+            attn = attentions[layer_idx]
+            if attn is None:
+                continue
+            query_head_scores = self._chunk_attention_head_scores(
+                attn,
+                query_start=query_start,
+                query_len=query_len,
+                chunk_start=chunk_start,
+                chunk_len=chunk_len,
+                reduce_mode=reduce_mode,
+            )
+            if query_head_scores.numel() == 0:
+                continue
+
+            if pooling != "none" and query_head_scores.shape[-1] > 0:
+                kernel = max(1, min(pool_kernel, query_head_scores.shape[-1]))
+                padding = kernel // 2
+                pooled = query_head_scores.unsqueeze(1)
+                if pooling == "avgpool":
+                    pooled = F.avg_pool1d(pooled, kernel_size=kernel, padding=padding, stride=1)
+                elif pooling == "maxpool":
+                    pooled = F.max_pool1d(pooled, kernel_size=kernel, padding=padding, stride=1)
+                else:
+                    raise ValueError(f"Unsupported token_score_pooling: {pooling}")
+                query_head_scores = pooled.squeeze(1)[..., :chunk_len]
+
+            grouped_scores = []
+            for head_group in torch.tensor_split(query_head_scores, num_kv_heads, dim=0):
+                if head_group.shape[0] == 0:
+                    grouped_scores.append(torch.zeros(chunk_len, device=self.device, dtype=query_head_scores.dtype))
+                else:
+                    grouped_scores.append(head_group.mean(dim=0))
+            scores_by_layer[layer_idx] = torch.stack(grouped_scores, dim=0)
+
+        fallback = next((score for score in scores_by_layer if score is not None), None)
+        if fallback is None:
+            return []
+        return [
+            score if score is not None else fallback.clone()
+            for score in scores_by_layer
+        ]
+
+    def _select_attention_layer_indices(self, total_layers: int, layer_window: int, layer_mode: str) -> List[int]:
+        if total_layers <= 0:
+            return []
+        if layer_mode == "all" or layer_window <= 0:
+            return list(range(total_layers))
+        window = min(max(1, int(layer_window)), total_layers)
+        if layer_mode == "first":
+            return list(range(window))
+        if layer_mode == "last":
+            return list(range(total_layers - window, total_layers))
+        raise ValueError(f"Unsupported attention layer mode: {layer_mode}")
 
     def _select_attention_layers(self, attentions, layer_window: int, layer_mode: str):
-        if layer_mode == "all" or layer_window <= 0:
-            return attentions
-        if layer_mode == "first":
-            return attentions[:layer_window]
-        if layer_mode == "last":
-            return attentions[-layer_window:]
-        raise ValueError(f"Unsupported attention layer mode: {layer_mode}")
+        return [attentions[idx] for idx in self._select_attention_layer_indices(len(attentions), layer_window, layer_mode)]
 
     def _selection_query_ids(
         self,
@@ -1023,6 +1808,10 @@ class FastDLLMParallelComp:
                     layer_window=self.config.attention_score_layers,
                     layer_mode="last",
                     reduce_mode=self.config.token_score_reduce,
+                    pooling=self.config.token_score_pooling,
+                    pool_kernel=self.config.token_score_pool_kernel,
+                    head_reduce=self.config.token_score_head_reduce,
+                    layer_reduce=self.config.token_score_layer_reduce,
                 )
                 score = float(token_scores.mean().item()) if token_scores.numel() else float("-inf")
             else:
@@ -1054,13 +1843,21 @@ class FastDLLMParallelComp:
             layer_window=self.config.token_score_layers,
             layer_mode=self.config.token_score_layer_mode,
             reduce_mode=self.config.token_score_reduce,
+            pooling=self.config.token_score_pooling,
+            pool_kernel=self.config.token_score_pool_kernel,
+            head_reduce=self.config.token_score_head_reduce,
+            layer_reduce=self.config.token_score_layer_reduce,
         )
         if token_scores.numel() != chunk_len:
             head = capacity // 2
             tail = capacity - head
             keep = sorted(set(list(range(head)) + list(range(chunk_len - tail, chunk_len))))
         else:
-            keep = torch.topk(token_scores, k=min(capacity, chunk_len), largest=True).indices.sort().values.tolist()
+            keep = self._select_positions_from_token_scores(
+                token_scores,
+                capacity=capacity,
+                chunk_len=chunk_len,
+            ).tolist()
 
         if self.config.force_keep_chunk_bos and self.config.chunk_bos and chunk_len > 0:
             keep = sorted(set([0] + keep))
@@ -1068,6 +1865,138 @@ class FastDLLMParallelComp:
                 keep = [0] + [idx for idx in keep if idx != 0][-max(0, capacity - 1):]
                 keep = sorted(keep)
         return keep
+
+    def _select_positions_from_token_scores(
+        self,
+        token_scores: torch.Tensor,
+        *,
+        capacity: int,
+        chunk_len: int,
+    ) -> torch.Tensor:
+        keep_count = min(max(1, int(capacity)), chunk_len)
+        if token_scores.numel() != chunk_len:
+            head = keep_count // 2
+            tail = keep_count - head
+            keep = sorted(set(list(range(head)) + list(range(chunk_len - tail, chunk_len))))
+            return torch.tensor(keep[:keep_count], device=self.device, dtype=torch.long)
+
+        largest = self.config.token_score_keep == "high"
+        if self.config.force_keep_chunk_bos and self.config.chunk_bos and chunk_len > 0:
+            if keep_count == 1:
+                return torch.zeros(1, device=self.device, dtype=torch.long)
+            candidate_indices = torch.arange(1, chunk_len, device=self.device, dtype=torch.long)
+            if candidate_indices.numel() <= keep_count - 1:
+                selected = candidate_indices
+            else:
+                candidate_scores = token_scores.index_select(0, candidate_indices)
+                selected = candidate_indices[torch.topk(candidate_scores, k=keep_count - 1, largest=largest).indices]
+            return torch.sort(torch.cat([torch.zeros(1, device=self.device, dtype=torch.long), selected], dim=0)).values
+
+        return torch.topk(token_scores, k=keep_count, largest=largest).indices.sort().values
+
+    def _keep_positions_per_layer_per_head_for_chunk(
+        self,
+        prefix_ids: Sequence[int],
+        chunk_ids: Sequence[int],
+        query_ids: Sequence[int],
+    ) -> List[torch.Tensor]:
+        capacity = int(self.config.token_capacity or 0)
+        chunk_len = len(chunk_ids)
+        num_layers = self._num_hidden_layers()
+        num_heads = self._num_key_value_heads()
+        if chunk_len <= 0:
+            return []
+        if capacity <= 0 or chunk_len <= capacity:
+            base = torch.arange(chunk_len, device=self.device, dtype=torch.long)
+            return [base.unsqueeze(0).expand(num_heads, -1).clone() for _ in range(num_layers)]
+
+        per_layer_scores = self.query_attention_token_scores_per_layer_per_head(
+            prefix_ids,
+            chunk_ids,
+            query_ids,
+            query_window=self.config.token_score_query_window,
+            layer_window=self.config.token_score_layers,
+            layer_mode=self.config.token_score_layer_mode,
+            reduce_mode=self.config.token_score_reduce,
+            pooling=self.config.token_score_pooling,
+            pool_kernel=self.config.token_score_pool_kernel,
+        )
+        keep_count = min(capacity, chunk_len)
+        if not per_layer_scores:
+            fallback = self._select_positions_from_token_scores(
+                torch.empty(0, device=self.device),
+                capacity=keep_count,
+                chunk_len=chunk_len,
+            )
+            return [fallback.unsqueeze(0).expand(num_heads, -1).clone() for _ in range(num_layers)]
+
+        per_layer_keep: List[torch.Tensor] = []
+        for layer_scores in per_layer_scores:
+            if layer_scores.numel() == 0 or layer_scores.shape[-1] != chunk_len:
+                fallback = self._select_positions_from_token_scores(
+                    torch.empty(0, device=self.device),
+                    capacity=keep_count,
+                    chunk_len=chunk_len,
+                )
+                per_layer_keep.append(fallback.unsqueeze(0).expand(num_heads, -1).clone())
+                continue
+            head_keeps = [
+                self._select_positions_from_token_scores(
+                    layer_scores[head_idx],
+                    capacity=keep_count,
+                    chunk_len=chunk_len,
+                )
+                for head_idx in range(layer_scores.shape[0])
+            ]
+            per_layer_keep.append(torch.stack(head_keeps, dim=0))
+
+        if len(per_layer_keep) < num_layers:
+            fallback = per_layer_keep[-1]
+            per_layer_keep.extend(fallback.clone() for _ in range(num_layers - len(per_layer_keep)))
+        return per_layer_keep[:num_layers]
+
+    def _union_keep_positions_per_layer_per_head(self, per_layer_keep: Sequence[torch.Tensor]) -> List[int]:
+        if not per_layer_keep:
+            return []
+        flat_parts = [keep.reshape(-1) for keep in per_layer_keep if keep.numel() > 0]
+        if not flat_parts:
+            return []
+        return torch.sort(torch.unique(torch.cat(flat_parts, dim=0))).values.tolist()
+
+    def _full_prompt_keep_indices_per_layer_per_head(
+        self,
+        *,
+        seq_len: int,
+        chunk_spans: Sequence[Tuple[int, int, List[torch.Tensor]]],
+    ) -> List[torch.Tensor]:
+        num_layers = self._num_hidden_layers()
+        if not chunk_spans:
+            base = torch.arange(seq_len, device=self.device, dtype=torch.long)
+            return [
+                base.unsqueeze(0).expand(self._num_key_value_heads(), -1).clone()
+                for _ in range(num_layers)
+            ]
+
+        per_layer_global: List[torch.Tensor] = []
+        for layer_idx in range(num_layers):
+            layer_template = chunk_spans[0][2][min(layer_idx, len(chunk_spans[0][2]) - 1)]
+            num_heads = int(layer_template.shape[0])
+            head_global_indices = []
+            for head_idx in range(num_heads):
+                pieces = []
+                cursor = 0
+                for start, end, per_layer_keep in chunk_spans:
+                    if start > cursor:
+                        pieces.append(torch.arange(cursor, start, device=self.device, dtype=torch.long))
+                    layer_keep = per_layer_keep[min(layer_idx, len(per_layer_keep) - 1)]
+                    local_keep = layer_keep[min(head_idx, layer_keep.shape[0] - 1)]
+                    pieces.append(local_keep.to(device=self.device, dtype=torch.long) + int(start))
+                    cursor = int(end)
+                if cursor < seq_len:
+                    pieces.append(torch.arange(cursor, seq_len, device=self.device, dtype=torch.long))
+                head_global_indices.append(torch.cat(pieces, dim=0))
+            per_layer_global.append(torch.stack(head_global_indices, dim=0))
+        return per_layer_global
 
     def _build_chunk_cache(
         self,
@@ -1083,7 +2012,7 @@ class FastDLLMParallelComp:
         if self.config.cache_build_mode == "chunk_only":
             if not chunk_ids:
                 return None
-            outputs = self.model(
+            outputs = self._model_forward(
                 self._ids_tensor(chunk_ids),
                 attention_mask="full",
                 position_ids=self._position_ids_from_list(chunk_positions),
@@ -1109,7 +2038,7 @@ class FastDLLMParallelComp:
             query_len=len(query_ids),
             current_only=True,
         )
-        outputs = self.model(
+        outputs = self._model_forward(
             self._ids_tensor(input_ids),
             attention_mask=attention_mask,
             position_ids=self._position_ids_from_list(full_positions),
@@ -1191,7 +2120,22 @@ class FastDLLMParallelComp:
             tmp_query_ids = self._window_query(selection_query_ids, self.config.token_score_query_window)
             tmp_query_positions = self._range_positions(tmp_query_start, len(tmp_query_ids))
 
-            keep_positions = self._keep_positions_for_chunk(prefix_ids, chunk_ids, eviction_query_ids)
+            per_layer_per_head_keep: Optional[List[torch.Tensor]] = None
+            if self.config.token_eviction_granularity == "per_head":
+                per_layer_per_head_keep = self._keep_positions_per_layer_per_head_for_chunk(
+                    prefix_ids,
+                    chunk_ids,
+                    eviction_query_ids,
+                )
+                keep_positions = self._union_keep_positions_per_layer_per_head(per_layer_per_head_keep)
+                kept_count = (
+                    int(per_layer_per_head_keep[0].shape[1])
+                    if per_layer_per_head_keep
+                    else len(chunk_ids)
+                )
+            else:
+                keep_positions = self._keep_positions_for_chunk(prefix_ids, chunk_ids, eviction_query_ids)
+                kept_count = len(keep_positions)
             chunk_cache = self._build_chunk_cache(
                 prefix_cache=prefix_cache,
                 prefix_ids=prefix_ids,
@@ -1201,10 +2145,19 @@ class FastDLLMParallelComp:
                 query_ids=tmp_query_ids,
                 query_positions=tmp_query_positions,
             )
-            if keep_positions and len(keep_positions) < len(chunk_ids):
+            if (
+                self.config.token_eviction_granularity == "per_head"
+                and per_layer_per_head_keep
+                and kept_count < len(chunk_ids)
+            ):
+                chunk_cache = self._gather_cache_per_layer_per_head(chunk_cache, per_layer_per_head_keep)
+            elif keep_positions and len(keep_positions) < len(chunk_ids):
                 chunk_cache = self._gather_cache(chunk_cache, keep_positions)
-            kept_positions_abs = [chunk_positions[idx] for idx in keep_positions]
-            kept_count = len(keep_positions)
+            kept_positions_abs = (
+                chunk_positions[:kept_count]
+                if self.config.token_eviction_granularity == "per_head"
+                else [chunk_positions[idx] for idx in keep_positions]
+            )
             removed = max(0, len(chunk_ids) - kept_count)
             cache_start = cache_len
             if chunk_cache is not None and kept_count > 0:
@@ -1254,7 +2207,7 @@ class FastDLLMParallelComp:
         past_key_values: Cache,
         cache_positions: Sequence[int],
     ) -> torch.Tensor:
-        outputs = self.model(
+        outputs = self._model_forward(
             block_ids,
             attention_mask="full",
             position_ids=self._position_ids_from_list(list(cache_positions) + list(block_positions)),
@@ -1272,7 +2225,7 @@ class FastDLLMParallelComp:
         full_positions: Sequence[int],
         replace_position: torch.Tensor,
     ) -> Tuple[torch.Tensor, Cache]:
-        outputs = self.model(
+        outputs = self._model_forward(
             block_ids,
             attention_mask="full",
             position_ids=self._position_ids_from_list(full_positions),
@@ -1297,7 +2250,7 @@ class FastDLLMParallelComp:
         suffix_ids = [mask_token_id] * int(suffix_len)
         suffix_positions = self._range_positions(suffix_pos_start, suffix_len)
         full_positions = list(active_positions) + suffix_positions
-        outputs = self.model(
+        outputs = self._model_forward(
             self._ids_tensor(suffix_ids),
             attention_mask="full",
             position_ids=self._position_ids_from_list(full_positions),
@@ -1305,7 +2258,7 @@ class FastDLLMParallelComp:
             use_cache=True,
             return_dict=True,
         )
-        shifted_logits = self._shift_logits(outputs.logits, last_context_logit)
+        shifted_logits = self._align_generation_logits(outputs.logits, last_context_logit)
         first_logits = shifted_logits[:, :1, :].reshape(-1, shifted_logits.shape[-1])
         _, first_token = sample_tokens(
             first_logits,
@@ -1337,7 +2290,7 @@ class FastDLLMParallelComp:
                 full_positions=full_positions,
                 replace_position=replace_position,
             )
-            shifted_logits = self._shift_logits(logits, last_context_logit)
+            shifted_logits = self._align_generation_logits(logits, last_context_logit)
             mask_logits = shifted_logits[mask_index]
             confidence, x0 = sample_tokens(
                 mask_logits,
@@ -1383,7 +2336,7 @@ class FastDLLMParallelComp:
                 full_positions=full_positions,
                 replace_position=replace_position,
             )
-            shifted_logits = self._shift_logits(logits, last_context_logit)
+            shifted_logits = self._align_generation_logits(logits, last_context_logit)
             mask_logits = shifted_logits[mask_index]
             if alg in {"origin", "confidence_threshold"}:
                 confidence, x0 = sample_tokens(
@@ -1491,7 +2444,7 @@ class FastDLLMParallelComp:
                 full_positions=full_positions,
                 replace_position=replace_position,
             )
-            shifted_logits = self._shift_logits(logits, last_context_logit)
+            shifted_logits = self._align_generation_logits(logits, last_context_logit)
             mask_logits = shifted_logits[mask_index]
             confidence, x0 = sample_tokens(
                 mask_logits,
@@ -1575,7 +2528,7 @@ class FastDLLMParallelComp:
                 full_positions=full_positions,
                 replace_position=replace_position,
             )
-            shifted_logits = self._shift_logits(logits, last_context_logit)
+            shifted_logits = self._align_generation_logits(logits, last_context_logit)
             mask_logits = shifted_logits[mask_index]
             confidence, x0 = sample_tokens(
                 mask_logits,
@@ -1724,26 +2677,52 @@ class FastDLLMParallelComp:
         cache_positions: List[int] = list(prefix_positions)
         chunk_meta: List[FastDLLMChunkMeta] = []
         total_removed = 0
+        compressed_cache_len = len(prefix_ids)
+        per_head_chunk_spans: List[Tuple[int, int, List[torch.Tensor]]] = []
 
         for chunk_order, chunk_index in enumerate(selected_indices):
             original_chunk_ids = list(candidate_chunks[chunk_index])
             chunk_start = self._chunk_rope_start(len(prefix_ids), chunk_order, chunk_index)
             original_chunk_positions = self._range_positions(chunk_start, len(original_chunk_ids))
-            keep_positions = self._keep_positions_for_chunk(prefix_ids, original_chunk_ids, eviction_query_ids)
-            chunk_ids = [original_chunk_ids[idx] for idx in keep_positions]
-            chunk_positions = [original_chunk_positions[idx] for idx in keep_positions]
-            cache_start = len(prompt_ids)
+            full_span_start = len(prompt_ids)
+            if self.config.token_eviction_granularity == "per_head":
+                per_layer_per_head_keep = self._keep_positions_per_layer_per_head_for_chunk(
+                    prefix_ids,
+                    original_chunk_ids,
+                    eviction_query_ids,
+                )
+                keep_positions = self._union_keep_positions_per_layer_per_head(per_layer_per_head_keep)
+                kept_count = (
+                    int(per_layer_per_head_keep[0].shape[1])
+                    if per_layer_per_head_keep
+                    else len(original_chunk_ids)
+                )
+                chunk_ids = list(original_chunk_ids)
+                chunk_positions = list(original_chunk_positions)
+                compressed_chunk_positions = original_chunk_positions[:kept_count]
+            else:
+                per_layer_per_head_keep = None
+                keep_positions = self._keep_positions_for_chunk(prefix_ids, original_chunk_ids, eviction_query_ids)
+                chunk_ids = [original_chunk_ids[idx] for idx in keep_positions]
+                chunk_positions = [original_chunk_positions[idx] for idx in keep_positions]
+                kept_count = len(chunk_ids)
+                compressed_chunk_positions = chunk_positions
             prompt_ids.extend(chunk_ids)
             prompt_positions.extend(chunk_positions)
-            cache_positions.extend(chunk_positions)
-            cache_end = len(prompt_ids)
-            removed = max(0, len(original_chunk_ids) - len(chunk_ids))
+            full_span_end = len(prompt_ids)
+            if per_layer_per_head_keep is not None:
+                per_head_chunk_spans.append((full_span_start, full_span_end, per_layer_per_head_keep))
+            cache_start = compressed_cache_len
+            cache_positions.extend(compressed_chunk_positions)
+            compressed_cache_len += kept_count
+            cache_end = compressed_cache_len
+            removed = max(0, len(original_chunk_ids) - kept_count)
             total_removed += removed
             chunk_meta.append(
                 FastDLLMChunkMeta(
                     chunk_index=chunk_index,
                     original_tokens=len(original_chunk_ids),
-                    kept_tokens=len(chunk_ids),
+                    kept_tokens=kept_count,
                     removed_tokens=removed,
                     cache_start=cache_start,
                     cache_end=cache_end,
@@ -1759,23 +2738,34 @@ class FastDLLMParallelComp:
             cache_positions,
             selected_count=len(selected_indices),
         )
+        full_query_rope_start = self._final_query_rope_start(
+            len(prefix_ids),
+            prompt_positions,
+            selected_count=len(selected_indices),
+        )
         query_positions = self._range_positions(query_rope_start, len(query_ids))
+        full_query_positions = self._range_positions(full_query_rope_start, len(query_ids))
         max_new = int(self.max_new_tokens)
         suffix_pos_start = query_rope_start + len(query_ids)
+        full_suffix_pos_start = full_query_rope_start + len(query_ids)
         mask_token_id = self._mask_token_id()
 
         full_prompt_len = len(prompt_ids) + len(query_ids)
+        active_prompt_len = len(cache_positions) + len(query_ids)
         include_initial_masks = self.config.cache_build_mode == "full_prompt_mask"
         if include_initial_masks:
             suffix_positions = self._range_positions(suffix_pos_start, max_new)
+            full_suffix_positions = self._range_positions(full_suffix_pos_start, max_new)
             suffix_ids = [mask_token_id] * max_new
             full_ids = list(prompt_ids) + list(query_ids) + suffix_ids
-            full_positions = list(prompt_positions) + query_positions + suffix_positions
+            full_positions = list(prompt_positions) + full_query_positions + full_suffix_positions
+            active_positions_after_prefill = list(cache_positions) + query_positions + suffix_positions
         else:
             full_ids = list(prompt_ids) + list(query_ids)
-            full_positions = list(prompt_positions) + query_positions
+            full_positions = list(prompt_positions) + full_query_positions
+            active_positions_after_prefill = list(cache_positions) + query_positions
 
-        outputs = self.model(
+        outputs = self._model_forward(
             self._ids_tensor(full_ids),
             attention_mask="full",
             position_ids=self._position_ids_from_list(full_positions),
@@ -1785,9 +2775,16 @@ class FastDLLMParallelComp:
         )
         active_cache = outputs.past_key_values
         active_positions = list(full_positions)
+        if self.config.token_eviction_granularity == "per_head" and per_head_chunk_spans:
+            keep_indices = self._full_prompt_keep_indices_per_layer_per_head(
+                seq_len=len(full_ids),
+                chunk_spans=per_head_chunk_spans,
+            )
+            active_cache = self._gather_cache_per_layer_per_head(active_cache, keep_indices)
+            active_positions = active_positions_after_prefill
         first_token: Optional[torch.Tensor] = None
         if include_initial_masks:
-            shifted_logits = self._shift_logits(outputs.logits)
+            shifted_logits = self._align_generation_logits(outputs.logits)
             first_logits = shifted_logits[:, full_prompt_len:full_prompt_len + 1, :].reshape(-1, shifted_logits.shape[-1])
             _, first_token = sample_tokens(
                 first_logits,
@@ -1815,7 +2812,7 @@ class FastDLLMParallelComp:
             if include_initial_masks and block_idx == 0:
                 full_cache = active_cache
                 full_block_positions = active_positions
-                current_slot_start = full_prompt_len
+                current_slot_start = active_prompt_len
                 current_slot_end = current_slot_start + block_len
                 assert first_token is not None
                 current_first_token = first_token
@@ -1988,10 +2985,14 @@ class FastDLLMParallelComp:
 def load_fastdllm_parallelcomp(
     pretrained: str,
     fastdllm_dream_dir: Optional[str] = None,
+    model_backend: str = "dream",
+    fastdllm_llada_dir: Optional[str] = None,
     **kwargs,
 ) -> FastDLLMParallelComp:
     config = FastDLLMParallelCompConfig(
         fastdllm_dream_dir=fastdllm_dream_dir or default_fastdllm_dream_dir(),
+        model_backend=model_backend,
+        fastdllm_llada_dir=fastdllm_llada_dir,
         pretrained=pretrained,
         **kwargs,
     )
