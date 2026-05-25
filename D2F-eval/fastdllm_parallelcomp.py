@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fast-dLLM v1 + ParallelComp runtime.
 
-This module implements the full KV path used by our ParallelComp experiments:
+This public-preview module keeps the main ParallelComp control flow used by our
+experiments:
 
 1. split long context into chunks and prepend BOS to every chunk by default;
 2. select context chunks with the real benchmark query;
@@ -11,8 +12,9 @@ This module implements the full KV path used by our ParallelComp experiments:
 6. run Fast-dLLM blockwise diffusion generation over the compressed cache;
 7. write completed generated blocks back into KV so later blocks can attend them.
 
-The implementation is intentionally benchmark-agnostic.  Evaluation scripts
-should tokenize prefix/context/query and call ``FastDLLMParallelComp.generate``.
+The executable Fast-dLLM backend bridge and internal environment defaults are
+intentionally omitted from this preview.  Evaluation scripts are therefore kept
+for API context, but this branch is not expected to run end-to-end directly.
 """
 
 from __future__ import annotations
@@ -30,14 +32,29 @@ import torch.distributions as dists
 import torch.nn.functional as F
 import transformers
 
-from fastdllm_v1_model import _resolve_dtype, default_fastdllm_dream_dir
+from fastdllm_v1_model import _resolve_dtype
+
+
+def default_fastdllm_dream_dir() -> str:
+    return os.environ.get("FASTDLLM_DREAM_DIR", "third_party/Fast-dLLM/v1/dream")
 
 
 def default_fastdllm_llada_dir() -> str:
-    return os.environ.get("FASTDLLM_LLADA_DIR", "/home/ma-user/work/Fast-dLLM/v1/llada")
+    return os.environ.get("FASTDLLM_LLADA_DIR", "third_party/Fast-dLLM/v1/llada")
 
 
 Cache = Optional[List[Tuple[torch.Tensor, torch.Tensor]]]
+
+_PUBLIC_PREVIEW_ERROR = (
+    "This slim public-preview branch intentionally omits the executable "
+    "Fast-dLLM backend bridge and internal runtime setup. The ParallelComp "
+    "selection/cache/eviction flow is left in place for review, but this "
+    "version is not meant to run end-to-end directly."
+)
+
+
+def _raise_public_preview_unavailable() -> None:
+    raise RuntimeError(_PUBLIC_PREVIEW_ERROR)
 
 
 @dataclass
@@ -419,6 +436,7 @@ class FastDLLMParallelComp:
         sys.path.insert(0, source_dir)
 
     def _load_backend_model(self, target_dtype):
+        _raise_public_preview_unavailable()
         if self.model_backend == "dream":
             self._prepare_fastdllm_module_path(self.config.fastdllm_dream_dir)
             from model.configuration_dream import DreamConfig
