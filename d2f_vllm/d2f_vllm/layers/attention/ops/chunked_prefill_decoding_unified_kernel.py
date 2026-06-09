@@ -15,8 +15,16 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import use_rocm_custom_paged_attention
-from vllm.triton_utils import tl, triton
+try:
+    from vllm.platforms.rocm import use_rocm_custom_paged_attention
+except ImportError:
+    def use_rocm_custom_paged_attention(*args, **kwargs):
+        return False
+try:
+    from vllm.triton_utils import tl, triton
+except ImportError:
+    import triton
+    import triton.language as tl
 
 from d2f_vllm.layers.attention.ops.prefix_prefill import context_attention_fwd
 

@@ -2,6 +2,7 @@ import os
 import torch
 
 import torch.nn as nn
+import torch.nn.functional as F
 
 from typing import List
 from functools import lru_cache, partial
@@ -34,6 +35,7 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.causal = model_type == 'causal_lm'
         self.model_type = model_type
+        self.attention_backend = os.environ.get("D2F_VLLM_ATTENTION_BACKEND", "flex").lower()
         is_rtx_xx90 = lambda x: "4090" in x or "3090" in x
         kernel_options = {
             "BLOCK_M": 64,
@@ -45,8 +47,34 @@ class Attention(nn.Module):
         } if is_rtx_xx90(torch.cuda.get_device_name(0)) else None
         self.attention = torch.compile(
             partial(flex_attention, kernel_options=kernel_options, enable_gqa=True, 
-                    return_lse=False, training=False), dynamic=True)
+                    return_lse=False), dynamic=True)
         self._block_mask_cache = {}
+
+    def _attention_forward(
+        self,
+        q_t: torch.Tensor,
+        k_t: torch.Tensor,
+        v_t: torch.Tensor,
+        *,
+        block_mask=None,
+        dense_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.attention_backend == "sdpa":
+            if q_t.shape[1] != k_t.shape[1]:
+                if q_t.shape[1] % k_t.shape[1] != 0:
+                    raise ValueError(
+                        "Cannot expand KV heads to query heads."
+                    )
+                repeat = q_t.shape[1] // k_t.shape[1]
+                k_t = k_t.repeat_interleave(repeat, dim=1)
+                v_t = v_t.repeat_interleave(repeat, dim=1)
+            attn_mask = None
+            if dense_mask is not None:
+                attn_mask = dense_mask.to(device=q_t.device, dtype=torch.bool)
+                if attn_mask.ndim == 2:
+                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+            return F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_mask, dropout_p=0.0)
+        return self.attention(q_t, k_t, v_t, block_mask=block_mask)
 
     def dllm_block_mask(self, block_mask: torch.Tensor, 
                         B: int, H: int, Q_LEN: int, KV_LEN: int, device: str):
@@ -124,7 +152,7 @@ class Attention(nn.Module):
                 block_mask_fn = self.causal_lm_block_mask if self.model_type == 'causal_lm' else self.dllm_block_mask
                 input_obj = context.cu_seqlens_q if self.model_type == 'causal_lm' else context.block_mask
                 block_mask = block_mask_fn(input_obj, B, H, S, S, str(q.device))
-                o = self.attention(q_t, k_t, v_t, block_mask=block_mask)
+                o = self._attention_forward(q_t, k_t, v_t, block_mask=block_mask, dense_mask=input_obj)
         else:
             if self.model_type == 'causal_lm':
                 o = causal_lm_flash_decoding(
@@ -145,7 +173,7 @@ class Attention(nn.Module):
                     _, _, Skv, _ = k_t.shape
                     block_mask = self.dllm_block_mask(context.block_mask, B, H, Sq, Skv, str(q.device))
 
-                    o = self.attention(q_t, k_t, v_t, block_mask=block_mask)
+                    o = self._attention_forward(q_t, k_t, v_t, block_mask=block_mask, dense_mask=context.block_mask)
                 else:
                     o = torch.empty_like(q)
                     diffusion_lm_parallel_flash_decoding(
