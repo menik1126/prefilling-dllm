@@ -63,6 +63,7 @@ class FastDLLMParallelCompConfig:
     threshold: float = 0.9
     add_bos_token: bool = True
     rope_scale_factor: float = 1.0
+    rope_scaling_type: str = "yarn"
 
     chunk_size: int = 1024
     topk_chunks: int = 4
@@ -80,6 +81,7 @@ class FastDLLMParallelCompConfig:
     score_draft_partial_steps: Optional[int] = None
     score_draft_partial_rounds: Optional[int] = None
     score_draft_score_all_slots: bool = False
+    score_llada_shift_logits: bool = False
     score_attention_mask: str = "causal"
     score_context_mode: str = "single_chunk"
     attention_score_layers: int = 4
@@ -95,6 +97,7 @@ class FastDLLMParallelCompConfig:
     token_score_head_reduce: str = "sum"
     token_score_layer_reduce: str = "mean"
     token_score_direction: str = "query_to_chunk"
+    token_score_keep: str = "high"
     token_score_include_prefix: bool = True
     token_attention_mask: str = "causal"
     token_score_use_generated: bool = False
@@ -381,6 +384,8 @@ class FastDLLMParallelComp:
         )
         if config.token_score_direction not in {"query_to_chunk", "chunk_to_query", "bidirectional"}:
             raise ValueError(f"Unsupported token_score_direction: {config.token_score_direction}")
+        if config.token_score_keep not in {"high", "low"}:
+            raise ValueError(f"Unsupported token_score_keep: {config.token_score_keep}")
         if config.token_eviction_granularity not in {"global", "per_head"}:
             raise ValueError(f"Unsupported token_eviction_granularity: {config.token_eviction_granularity}")
 
@@ -433,10 +438,8 @@ class FastDLLMParallelComp:
         llada_dir = self.config.fastdllm_llada_dir or default_fastdllm_llada_dir()
         self._prepare_fastdllm_module_path(llada_dir)
         from model.configuration_llada import LLaDAConfig
-        from model.modeling_llada import LLaDAModelLM
+        from model.modeling_llada import LLaDAModelLM, RotaryEmbedding
 
-        if float(self.config.rope_scale_factor or 1.0) > 1.0:
-            raise ValueError("RoPE scaling for Fast-dLLM LLaDA is not wired in this adapter yet")
         model_config = LLaDAConfig.from_pretrained(self.config.pretrained)
         if hasattr(model_config, "flash_attention"):
             model_config.flash_attention = True
@@ -446,6 +449,11 @@ class FastDLLMParallelComp:
             torch_dtype=target_dtype,
             trust_remote_code=self.config.trust_remote_code,
         ).eval()
+        self._apply_llada_rope_scaling(
+            RotaryEmbedding,
+            float(self.config.rope_scale_factor or 1.0),
+            self.config.rope_scaling_type,
+        )
         self._patch_llada_attention_capture()
 
     def _patch_llada_attention_capture(self) -> None:
@@ -542,6 +550,136 @@ class FastDLLMParallelComp:
             if isinstance(module, rotary_cls):
                 module.__init__(config=self.model.config)
                 module.to(self.device)
+
+    def _apply_llada_rope_scaling(self, rotary_cls, factor: float, scaling_type: str = "yarn") -> None:
+        if factor <= 1.0:
+            return
+
+        scaling_type = (scaling_type or "yarn").lower()
+        if scaling_type not in {"linear", "yarn"}:
+            raise ValueError(f"Unsupported LLaDA RoPE scaling type: {scaling_type}")
+
+        model_config = getattr(getattr(self.model, "model", None), "config", None)
+        if model_config is None:
+            raise ValueError("Cannot apply LLaDA RoPE scaling: model config not found")
+        original_max_pos = getattr(model_config, "max_sequence_length", None)
+        if original_max_pos is not None:
+            setattr(model_config, "parallelcomp_original_max_sequence_length", original_max_pos)
+            setattr(model_config, "max_sequence_length", int(math.ceil(original_max_pos * factor)))
+        setattr(
+            model_config,
+            "parallelcomp_rope_scaling",
+            {
+                "rope_type": scaling_type,
+                "factor": factor,
+                "original_max_sequence_length": original_max_pos,
+            },
+        )
+
+        def yarn_inv_freq(
+            module,
+            dim: int,
+            device: torch.device,
+            max_position_embeddings: int,
+            rope_factor: float,
+        ) -> Tuple[torch.Tensor, float]:
+            attention_factor = 0.1 * math.log(rope_factor) + 1.0
+            beta_fast = 32
+            beta_slow = 1
+
+            def find_correction_dim(num_rotations: int) -> float:
+                return (
+                    dim
+                    * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
+                    / (2 * math.log(module.rope_theta))
+                )
+
+            def find_correction_range() -> Tuple[int, int]:
+                low = math.floor(find_correction_dim(beta_fast))
+                high = math.ceil(find_correction_dim(beta_slow))
+                return max(low, 0), min(high, dim - 1)
+
+            def linear_ramp_factor(low: int, high: int) -> torch.Tensor:
+                if low == high:
+                    high += 1
+                ramp = (torch.arange(dim // 2, device=device, dtype=torch.float32) - low) / (high - low)
+                return torch.clamp(ramp, 0, 1)
+
+            pos_freqs = module.rope_theta ** (
+                torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim
+            )
+            inv_freq_extrapolation = 1.0 / pos_freqs
+            inv_freq_interpolation = 1.0 / (rope_factor * pos_freqs)
+            low, high = find_correction_range()
+            extrapolation_weight = 1 - linear_ramp_factor(low, high)
+            inv_freq = (
+                inv_freq_interpolation * (1 - extrapolation_weight)
+                + inv_freq_extrapolation * extrapolation_weight
+            )
+            return inv_freq, attention_factor
+
+        for module in self.model.modules():
+            if not isinstance(module, rotary_cls):
+                continue
+
+            module._parallelcomp_rope_scale_factor = float(factor)
+            module._parallelcomp_rope_scaling_type = scaling_type
+
+            def scaled_get_rotary_embedding(
+                seq_len: int,
+                device: torch.device,
+                _module=module,
+                _factor=float(factor),
+                _scaling_type=scaling_type,
+                _original_max_pos=int(original_max_pos or 4096),
+            ):
+                cache = getattr(_module, "_RotaryEmbedding__cache")
+                key_sin = f"parallelcomp_rope_pos_sin_{_scaling_type}_{_factor:g}"
+                key_cos = f"parallelcomp_rope_pos_cos_{_scaling_type}_{_factor:g}"
+                pos_sin = cache.get(key_sin)
+                pos_cos = cache.get(key_cos)
+                if (
+                    pos_sin is not None
+                    and pos_cos is not None
+                    and pos_sin.shape[-2] >= seq_len
+                    and pos_cos.shape[-2] >= seq_len
+                ):
+                    if pos_sin.device != device:
+                        pos_sin = pos_sin.to(device)
+                        cache[key_sin] = pos_sin
+                    if pos_cos.device != device:
+                        pos_cos = pos_cos.to(device)
+                        cache[key_cos] = pos_cos
+                    return pos_sin[:, :, :seq_len, :], pos_cos[:, :, :seq_len, :]
+
+                with torch.autocast(device.type, enabled=False):
+                    dim = _module.config.d_model // _module.config.n_heads
+                    attention_factor = 1.0
+                    if _scaling_type == "yarn":
+                        inv_freq, attention_factor = yarn_inv_freq(
+                            _module,
+                            dim,
+                            device,
+                            _original_max_pos,
+                            _factor,
+                        )
+                    else:
+                        inv_freq = 1.0 / (
+                            _module.rope_theta
+                            ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
+                        )
+                    seq = torch.arange(seq_len, device=device, dtype=torch.float)
+                    if _scaling_type == "linear":
+                        seq = seq / _factor
+                    freqs = torch.outer(seq, inv_freq)
+                    positions = torch.cat((freqs, freqs), dim=-1)
+                    pos_sin = positions.sin()[None, None, :, :] * attention_factor
+                    pos_cos = positions.cos()[None, None, :, :] * attention_factor
+                cache[key_sin] = pos_sin
+                cache[key_cos] = pos_cos
+                return pos_sin, pos_cos
+
+            module.get_rotary_embedding = scaled_get_rotary_embedding
 
     def _mask_token_id(self) -> int:
         mask_token_id = getattr(self.tokenizer, "mask_token_id", None)
@@ -1072,6 +1210,27 @@ class FastDLLMParallelComp:
         if not label_positions:
             return float("-inf")
         if self.model_backend == "llada":
+            if self.config.score_llada_shift_logits:
+                positions = torch.tensor(label_positions, device=self.device, dtype=torch.long)
+                if int(positions.min().item()) <= 0:
+                    return float("-inf")
+                with torch.inference_mode():
+                    outputs = self._model_forward(
+                        self._ids_tensor(joint_ids),
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                logits = outputs.logits
+                if int(positions.max().item()) - 1 >= logits.shape[1]:
+                    return float("-inf")
+                query_logits = logits.index_select(1, positions - 1)
+                query_labels = self._ids_tensor(label_ids)
+                if query_logits.shape[1] != query_labels.shape[1]:
+                    return float("-inf")
+                log_probs = F.log_softmax(query_logits.float(), dim=-1)
+                token_nll = -log_probs.gather(dim=-1, index=query_labels.unsqueeze(-1)).squeeze(-1)
+                return float(-token_nll.mean().item())
             return self._llada_leave_one_out_score(joint_ids, label_positions, label_ids, attention_mask)
 
         positions = torch.tensor(label_positions, device=self.device, dtype=torch.long)
@@ -1694,7 +1853,11 @@ class FastDLLMParallelComp:
             tail = capacity - head
             keep = sorted(set(list(range(head)) + list(range(chunk_len - tail, chunk_len))))
         else:
-            keep = torch.topk(token_scores, k=min(capacity, chunk_len), largest=True).indices.sort().values.tolist()
+            keep = self._select_positions_from_token_scores(
+                token_scores,
+                capacity=capacity,
+                chunk_len=chunk_len,
+            ).tolist()
 
         if self.config.force_keep_chunk_bos and self.config.chunk_bos and chunk_len > 0:
             keep = sorted(set([0] + keep))
@@ -1717,6 +1880,7 @@ class FastDLLMParallelComp:
             keep = sorted(set(list(range(head)) + list(range(chunk_len - tail, chunk_len))))
             return torch.tensor(keep[:keep_count], device=self.device, dtype=torch.long)
 
+        largest = self.config.token_score_keep == "high"
         if self.config.force_keep_chunk_bos and self.config.chunk_bos and chunk_len > 0:
             if keep_count == 1:
                 return torch.zeros(1, device=self.device, dtype=torch.long)
@@ -1725,10 +1889,10 @@ class FastDLLMParallelComp:
                 selected = candidate_indices
             else:
                 candidate_scores = token_scores.index_select(0, candidate_indices)
-                selected = candidate_indices[torch.topk(candidate_scores, k=keep_count - 1, largest=True).indices]
+                selected = candidate_indices[torch.topk(candidate_scores, k=keep_count - 1, largest=largest).indices]
             return torch.sort(torch.cat([torch.zeros(1, device=self.device, dtype=torch.long), selected], dim=0)).values
 
-        return torch.topk(token_scores, k=keep_count, largest=True).indices.sort().values
+        return torch.topk(token_scores, k=keep_count, largest=largest).indices.sort().values
 
     def _keep_positions_per_layer_per_head_for_chunk(
         self,

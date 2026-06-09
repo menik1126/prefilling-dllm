@@ -33,6 +33,20 @@ CACHE_BUILD_MODE="${CACHE_BUILD_MODE:-full_prompt_mask}"
 CHUNK_POSITION_MODE="${CHUNK_POSITION_MODE:-continuous}"
 QUERY_POSITION_MODE="${QUERY_POSITION_MODE:-after_selected_chunks}"
 TOKEN_CAPACITY="${TOKEN_CAPACITY:-0}"
+TOKEN_SCORE_QUERY_WINDOW="${TOKEN_SCORE_QUERY_WINDOW:-8}"
+TOKEN_SCORE_LAYERS="${TOKEN_SCORE_LAYERS:-0}"
+TOKEN_SCORE_LAYER_MODE="${TOKEN_SCORE_LAYER_MODE:-all}"
+TOKEN_SCORE_REDUCE="${TOKEN_SCORE_REDUCE:-sum}"
+TOKEN_SCORE_POOLING="${TOKEN_SCORE_POOLING:-maxpool}"
+TOKEN_SCORE_POOL_KERNEL="${TOKEN_SCORE_POOL_KERNEL:-7}"
+TOKEN_SCORE_HEAD_REDUCE="${TOKEN_SCORE_HEAD_REDUCE:-sum}"
+TOKEN_SCORE_LAYER_REDUCE="${TOKEN_SCORE_LAYER_REDUCE:-mean}"
+TOKEN_SCORE_DIRECTION="${TOKEN_SCORE_DIRECTION:-query_to_chunk}"
+TOKEN_SCORE_KEEP="${TOKEN_SCORE_KEEP:-high}"
+TOKEN_SCORE_INCLUDE_PREFIX="${TOKEN_SCORE_INCLUDE_PREFIX:-1}"
+TOKEN_SCORE_USE_GENERATED="${TOKEN_SCORE_USE_GENERATED:-0}"
+TOKEN_ATTENTION_MASK="${TOKEN_ATTENTION_MASK:-causal}"
+TOKEN_EVICTION_GRANULARITY="${TOKEN_EVICTION_GRANULARITY:-global}"
 
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
 BLOCK_LENGTH="${BLOCK_LENGTH:-32}"
@@ -50,6 +64,10 @@ export REPO_DIR D2F_VLLM_DIR D2F_EVAL_DIR DREAM_BASE FASTDLLM_DREAM DATA_DIR CON
 export START_INDEX LIMIT RUN_TS SAMPLE_BATCH_CHUNK_SIZE
 export PC_CHUNK_SIZE TOPK_CHUNKS SCORE_MODE SCORE_DRAFT_TOKENS SCORE_DRAFT_PARTIAL_ROUNDS
 export CACHE_BUILD_MODE CHUNK_POSITION_MODE QUERY_POSITION_MODE TOKEN_CAPACITY
+export TOKEN_SCORE_QUERY_WINDOW TOKEN_SCORE_LAYERS TOKEN_SCORE_LAYER_MODE TOKEN_SCORE_REDUCE
+export TOKEN_SCORE_POOLING TOKEN_SCORE_POOL_KERNEL TOKEN_SCORE_HEAD_REDUCE TOKEN_SCORE_LAYER_REDUCE
+export TOKEN_SCORE_DIRECTION TOKEN_SCORE_KEEP TOKEN_SCORE_INCLUDE_PREFIX TOKEN_SCORE_USE_GENERATED
+export TOKEN_ATTENTION_MASK TOKEN_EVICTION_GRANULARITY
 export MAX_NEW_TOKENS BLOCK_LENGTH MAX_MODEL_LEN TENSOR_PARALLEL_SIZE MAX_NUM_SEQS
 export GPU_MEMORY_UTILIZATION ACCEPT_THRESHOLD COMPLETE_THRESHOLD ADD_NEW_BLOCK_THRESHOLD DRY_RUN
 export CHECK_ONLY
@@ -97,7 +115,7 @@ find_stably_free_gpu() {
       echo "${picked}"
       return 0
     fi
-    log "waiting for a stably free GPU; memory threshold=${threshold_mb}MB hits=${hits}"
+    log "waiting for a stably free GPU; memory threshold=${threshold_mb}MB hits=${hits}" >&2
     sleep "${sleep_sec}"
   done
 }
@@ -121,6 +139,7 @@ log "Data dir            : $DATA_DIR"
 log "Run timestamp       : $RUN_TS"
 log "Bridge mode         : Fast-DLLM selector -> d2f_vllm engine decode"
 log "ParallelComp setting: topk=$TOPK_CHUNKS chunk=$PC_CHUNK_SIZE score=$SCORE_MODE draft=$SCORE_DRAFT_TOKENS partial_rounds=$SCORE_DRAFT_PARTIAL_ROUNDS cache=$CACHE_BUILD_MODE positions=$CHUNK_POSITION_MODE/$QUERY_POSITION_MODE token_capacity=$TOKEN_CAPACITY"
+log "Token eviction      : granularity=$TOKEN_EVICTION_GRANULARITY direction=$TOKEN_SCORE_DIRECTION keep=$TOKEN_SCORE_KEEP layers=$TOKEN_SCORE_LAYER_MODE:$TOKEN_SCORE_LAYERS query_window=$TOKEN_SCORE_QUERY_WINDOW"
 log "Engine setting      : max_model_len=$MAX_MODEL_LEN max_new=$MAX_NEW_TOKENS block=$BLOCK_LENGTH accept=$ACCEPT_THRESHOLD complete=$COMPLETE_THRESHOLD"
 log "Check/dry run       : CHECK_ONLY=$CHECK_ONLY DRY_RUN=$DRY_RUN"
 log "Log file            : $LOG_FILE"
@@ -172,6 +191,13 @@ def env_float(name, default):
     return float(value) if value != "" else float(default)
 
 
+def env_bool(name, default):
+    value = os.environ.get(name, "")
+    if value == "":
+        return bool(default)
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 def save_json(path, payload):
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -198,6 +224,20 @@ topk_chunks = env_int("TOPK_CHUNKS", 4)
 score_draft_tokens = env_int("SCORE_DRAFT_TOKENS", 4)
 score_draft_partial_rounds = env_int("SCORE_DRAFT_PARTIAL_ROUNDS", 1)
 token_capacity = env_int("TOKEN_CAPACITY", 0)
+token_score_query_window = env_int("TOKEN_SCORE_QUERY_WINDOW", 8)
+token_score_layers = env_int("TOKEN_SCORE_LAYERS", 0)
+token_score_layer_mode = os.environ.get("TOKEN_SCORE_LAYER_MODE", "all")
+token_score_reduce = os.environ.get("TOKEN_SCORE_REDUCE", "sum")
+token_score_pooling = os.environ.get("TOKEN_SCORE_POOLING", "maxpool")
+token_score_pool_kernel = env_int("TOKEN_SCORE_POOL_KERNEL", 7)
+token_score_head_reduce = os.environ.get("TOKEN_SCORE_HEAD_REDUCE", "sum")
+token_score_layer_reduce = os.environ.get("TOKEN_SCORE_LAYER_REDUCE", "mean")
+token_score_direction = os.environ.get("TOKEN_SCORE_DIRECTION", "query_to_chunk")
+token_score_keep = os.environ.get("TOKEN_SCORE_KEEP", "high")
+token_score_include_prefix = env_bool("TOKEN_SCORE_INCLUDE_PREFIX", True)
+token_score_use_generated = env_bool("TOKEN_SCORE_USE_GENERATED", False)
+token_attention_mask = os.environ.get("TOKEN_ATTENTION_MASK", "causal")
+token_eviction_granularity = os.environ.get("TOKEN_EVICTION_GRANULARITY", "global")
 max_new_tokens = env_int("MAX_NEW_TOKENS", 32)
 block_length = env_int("BLOCK_LENGTH", 32)
 max_model_len = env_int("MAX_MODEL_LEN", 8192)
@@ -214,8 +254,11 @@ if check_only:
     print("CHECK_ONLY=1: imports and paths are valid; no model is loaded.", flush=True)
     raise SystemExit(0)
 
-if token_capacity != 0:
-    raise ValueError("This engine bridge intentionally supports TOKEN_CAPACITY=0 only.")
+if token_eviction_granularity != "global":
+    raise ValueError(
+        "This bridge can only represent global token eviction in prompt_ids. "
+        "Per-head eviction needs engine KV-cache level support."
+    )
 
 result_path = log_dir / f"longbench_multifieldqa_en_parallelcomp_engine_bridge_results_{run_ts}.json"
 compressed_path = log_dir / f"longbench_multifieldqa_en_parallelcomp_engine_bridge_compressed_{run_ts}.json"
@@ -252,8 +295,20 @@ selector = load_fastdllm_parallelcomp(
     score_attention_mask="causal",
     score_context_mode="single_chunk",
     token_capacity=token_capacity,
-    token_score_layer_mode="first",
-    token_score_layers=1,
+    token_score_query_window=token_score_query_window,
+    token_score_layers=token_score_layers,
+    token_score_layer_mode=token_score_layer_mode,
+    token_score_reduce=token_score_reduce,
+    token_score_pooling=token_score_pooling,
+    token_score_pool_kernel=token_score_pool_kernel,
+    token_score_head_reduce=token_score_head_reduce,
+    token_score_layer_reduce=token_score_layer_reduce,
+    token_score_direction=token_score_direction,
+    token_score_keep=token_score_keep,
+    token_score_include_prefix=token_score_include_prefix,
+    token_score_use_generated=token_score_use_generated,
+    token_attention_mask=token_attention_mask,
+    token_eviction_granularity=token_eviction_granularity,
     chunk_position_mode=os.environ["CHUNK_POSITION_MODE"],
     query_position_mode=os.environ["QUERY_POSITION_MODE"],
 )
@@ -263,11 +318,12 @@ selection_t0 = time.time()
 template = prompt_templates[TASK]
 for idx, example in enumerate(examples):
     parts = render_prompt_parts(template, example, "\n")
-    prefix_ids, context_ids, query_ids, scoring_query_ids = build_token_parts(
+    token_parts = build_token_parts(
         selector,
         parts,
         add_bos_token=True,
     )
+    prefix_ids, context_ids, query_ids, scoring_query_ids = token_parts[:4]
     candidate_chunks, selected_indices, chunk_scores, selection_query_ids, score_token_mask = (
         selector._prepare_candidate_chunks(
             prefix_ids=prefix_ids,
@@ -275,9 +331,30 @@ for idx, example in enumerate(examples):
             scoring_query_ids=scoring_query_ids,
         )
     )
+    eviction_query_ids = selector._token_eviction_query_ids(
+        scoring_query_ids=scoring_query_ids,
+        selection_query_ids=selection_query_ids,
+        score_token_mask=score_token_mask,
+    )
     prompt_ids = list(prefix_ids)
+    kept_context_tokens = 0
+    removed_context_tokens = 0
+    chunk_keep_counts = []
     for chunk_idx in selected_indices:
-        prompt_ids.extend(candidate_chunks[chunk_idx])
+        original_chunk_ids = list(candidate_chunks[chunk_idx])
+        keep_positions = selector._keep_positions_for_chunk(prefix_ids, original_chunk_ids, eviction_query_ids)
+        chunk_ids = [original_chunk_ids[pos] for pos in keep_positions]
+        kept_context_tokens += len(chunk_ids)
+        removed_context_tokens += max(0, len(original_chunk_ids) - len(chunk_ids))
+        chunk_keep_counts.append(
+            {
+                "chunk_index": int(chunk_idx),
+                "original_tokens": len(original_chunk_ids),
+                "kept_tokens": len(chunk_ids),
+                "removed_tokens": max(0, len(original_chunk_ids) - len(chunk_ids)),
+            }
+        )
+        prompt_ids.extend(chunk_ids)
     prompt_ids.extend(query_ids)
     if len(prompt_ids) + max_new_tokens > max_model_len:
         raise ValueError(
@@ -294,9 +371,12 @@ for idx, example in enumerate(examples):
             "prompt_meta": {
                 "prefix_tokens": len(prefix_ids),
                 "context_tokens": len(context_ids),
+                "kept_context_tokens": kept_context_tokens,
+                "removed_context_tokens": removed_context_tokens,
                 "query_tokens": len(query_ids),
                 "scoring_query_tokens": len(scoring_query_ids),
                 "candidate_chunks": len(candidate_chunks),
+                "chunk_keep_counts": chunk_keep_counts,
                 "compressed_prompt_tokens": len(prompt_ids),
                 "selection_query_tokens": len(selection_query_ids),
                 "score_token_mask_true": (
@@ -326,6 +406,20 @@ save_json(
             "chunk_position_mode": os.environ["CHUNK_POSITION_MODE"],
             "query_position_mode": os.environ["QUERY_POSITION_MODE"],
             "token_capacity": token_capacity,
+            "token_score_query_window": token_score_query_window,
+            "token_score_layers": token_score_layers,
+            "token_score_layer_mode": token_score_layer_mode,
+            "token_score_reduce": token_score_reduce,
+            "token_score_pooling": token_score_pooling,
+            "token_score_pool_kernel": token_score_pool_kernel,
+            "token_score_head_reduce": token_score_head_reduce,
+            "token_score_layer_reduce": token_score_layer_reduce,
+            "token_score_direction": token_score_direction,
+            "token_score_keep": token_score_keep,
+            "token_score_include_prefix": token_score_include_prefix,
+            "token_score_use_generated": token_score_use_generated,
+            "token_attention_mask": token_attention_mask,
+            "token_eviction_granularity": token_eviction_granularity,
         },
         "records": compressed_records,
     },
@@ -422,6 +516,20 @@ for chunk_start in range(0, len(compressed_records), sample_batch_chunk_size):
             "chunk_position_mode": os.environ["CHUNK_POSITION_MODE"],
             "query_position_mode": os.environ["QUERY_POSITION_MODE"],
             "token_capacity": token_capacity,
+            "token_score_query_window": token_score_query_window,
+            "token_score_layers": token_score_layers,
+            "token_score_layer_mode": token_score_layer_mode,
+            "token_score_reduce": token_score_reduce,
+            "token_score_pooling": token_score_pooling,
+            "token_score_pool_kernel": token_score_pool_kernel,
+            "token_score_head_reduce": token_score_head_reduce,
+            "token_score_layer_reduce": token_score_layer_reduce,
+            "token_score_direction": token_score_direction,
+            "token_score_keep": token_score_keep,
+            "token_score_include_prefix": token_score_include_prefix,
+            "token_score_use_generated": token_score_use_generated,
+            "token_attention_mask": token_attention_mask,
+            "token_eviction_granularity": token_eviction_granularity,
             "max_model_len": max_model_len,
             "max_new_tokens": max_new_tokens,
             "block_length": block_length,

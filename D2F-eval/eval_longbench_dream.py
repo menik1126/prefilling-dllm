@@ -444,8 +444,18 @@ def build_arg_parser():
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=32768)
     parser.add_argument("--rope_scale_factor", type=float, default=1.0)
+    parser.add_argument(
+        "--truncate_strategy",
+        choices=["left", "head_tail"],
+        default="left",
+        help="Prompt truncation when tokenized prompt exceeds the budget. head_tail drops the middle.",
+    )
     parser.add_argument("--block_size", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--block_add_threshold", type=float, default=0.5)
+    parser.add_argument("--skip_threshold", type=float, default=1.0)
+    parser.add_argument("--decoded_token_threshold", type=float, default=0.9)
     parser.add_argument("--stop_tokens", nargs="*", default=[])
     parser.add_argument(
         "--segment_separator",
@@ -521,8 +531,13 @@ def main():
         rope_scale_factor=args.rope_scale_factor,
         max_new_tokens=generation_max_new_tokens,
         max_length=args.max_length,
+        truncate_strategy=args.truncate_strategy,
         block_size=args.block_size,
         temperature=args.temperature,
+        dtype=args.dtype,
+        block_add_threshold=args.block_add_threshold,
+        skip_threshold=args.skip_threshold,
+        decoded_token_threshold=args.decoded_token_threshold,
         add_bos_token=True,
         parallelcomp_mode=args.parallelcomp_mode,
         parallelcomp_pre_runtime_mode=args.parallelcomp_pre_runtime_mode,

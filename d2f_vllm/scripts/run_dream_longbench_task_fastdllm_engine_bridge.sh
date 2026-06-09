@@ -69,11 +69,12 @@ export MAX_NEW_TOKENS BLOCK_LENGTH MAX_MODEL_LEN GPU_MEMORY_UTILIZATION THRESHOL
 
 LOG_DIR="$D2F_VLLM_DIR/log"
 mkdir -p "$LOG_DIR"
-RESULTS_TAG="longbench_multifieldqa_en_fastdllm_engine_bridge"
+TASK_NAME="${LONGBENCH_TASK:-multifieldqa_en}"
+RESULTS_TAG="longbench_${TASK_NAME}_fastdllm_engine_bridge"
 LOG_FILE="$LOG_DIR/${RESULTS_TAG}_${RUN_TS}.log"
 
 echo "============================================"
-echo "  Fast-DLLM semantic engine bridge - LongBench multifieldqa_en"
+echo "  Fast-DLLM semantic engine bridge - LongBench ${TASK_NAME}"
 echo "============================================"
 echo "Python              : $PYTHON"
 echo "Model               : $DREAM_BASE"
@@ -115,8 +116,8 @@ from eval_fastdllm_parallelcomp_longbench import (
 from fastdllm_parallelcomp import load_fastdllm_parallelcomp
 
 
-TASK = "multifieldqa_en"
-STOP_STRINGS = ["</s>", "<|im_end|>", "\n"]
+TASK = os.environ.get("LONGBENCH_TASK", "multifieldqa_en")
+STOP_STRINGS = ["</s>", "<|im_end|>"]
 
 
 def env_int(name, default):
@@ -200,8 +201,8 @@ if token_score_backend not in {"selector", "engine"}:
 if token_score_backend == "engine" and token_eviction_granularity != "per_head":
     raise ValueError("TOKEN_SCORE_BACKEND=engine is currently implemented for per_head token eviction only.")
 
-result_path = log_dir / f"longbench_multifieldqa_en_fastdllm_engine_bridge_results_{run_ts}.json"
-compressed_path = log_dir / f"longbench_multifieldqa_en_fastdllm_engine_bridge_compressed_{run_ts}.json"
+result_path = log_dir / f"longbench_{TASK}_fastdllm_engine_bridge_results_{run_ts}.json"
+compressed_path = log_dir / f"longbench_{TASK}_fastdllm_engine_bridge_compressed_{run_ts}.json"
 print(f"Effective token score backend: {token_score_backend}", flush=True)
 
 print("Loading LongBench examples...", flush=True)
@@ -541,7 +542,8 @@ try:
             prompt_keep_indices_per_layer_per_head=compressed.get("prompt_keep_indices_per_layer_per_head"),
             stop_token_ids=[engine.tokenizer.eos_token_id] if engine.tokenizer.eos_token_id is not None else None,
         )
-        prediction = trim_stop_tokens(output.text, STOP_STRINGS)
+        raw_prediction = output.text
+        prediction = trim_stop_tokens(raw_prediction, STOP_STRINGS)
         answers = example.get("answers", [])
         all_classes = example.get("all_classes")
         score = score_prediction(TASK, prediction, answers, all_classes)
@@ -551,6 +553,7 @@ try:
                 "example_id": compressed["example_id"],
                 "index": start_index + idx,
                 "pred": prediction,
+                "raw_pred": raw_prediction,
                 "answers": answers,
                 "all_classes": all_classes,
                 "score": score,
@@ -621,7 +624,7 @@ finally:
 final_metrics = summarize_metrics(results, longbench_e=False)
 print()
 print("=" * 60)
-print("LongBench multifieldqa_en Fast-DLLM semantic engine bridge")
+print("LongBench task Fast-DLLM semantic engine bridge")
 print("=" * 60)
 print(f"Score             : {final_metrics['score']:.2f}")
 print(f"Completed         : {len(results)}/{len(examples)}")

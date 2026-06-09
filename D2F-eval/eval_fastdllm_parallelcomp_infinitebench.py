@@ -133,6 +133,7 @@ def add_parallelcomp_args(parser):
     parser.add_argument("--score_draft_partial_steps", type=int, default=None)
     parser.add_argument("--score_draft_partial_rounds", type=int, default=None)
     parser.add_argument("--score_draft_score_all_slots", action="store_true")
+    parser.add_argument("--score_llada_shift_logits", action="store_true")
     parser.add_argument(
         "--score_attention_mask",
         choices=["causal", "full", "query_to_chunk"],
@@ -240,6 +241,7 @@ def main():
     print(f"Score partial steps   : {args.score_draft_partial_steps}")
     print(f"Score partial rounds  : {args.score_draft_partial_rounds}")
     print(f"Score all draft slots : {args.score_draft_score_all_slots}")
+    print(f"LLaDA shifted score   : {args.score_llada_shift_logits}")
     print(f"Chunk size/top-k      : {args.chunk_size}/{args.topk_chunks}")
     print(f"Token capacity        : {args.token_capacity}")
     print(f"Token score generated : {args.token_score_use_generated}")
@@ -286,6 +288,7 @@ def main():
         score_draft_partial_steps=args.score_draft_partial_steps,
         score_draft_partial_rounds=args.score_draft_partial_rounds,
         score_draft_score_all_slots=args.score_draft_score_all_slots,
+        score_llada_shift_logits=args.score_llada_shift_logits,
         score_attention_mask=args.score_attention_mask,
         attention_score_layers=args.attention_score_layers,
         attention_query_window=args.attention_query_window,
@@ -399,6 +402,7 @@ def main():
                 "score_draft_partial_steps": args.score_draft_partial_steps,
                 "score_draft_partial_rounds": args.score_draft_partial_rounds,
                 "score_draft_score_all_slots": args.score_draft_score_all_slots,
+                "score_llada_shift_logits": args.score_llada_shift_logits,
                 "token_capacity": args.token_capacity,
                 "token_score_use_generated": args.token_score_use_generated,
                 "token_score_direction": args.token_score_direction,
