@@ -11,6 +11,12 @@ from transformers import AutoTokenizer
 
 from d2f_vllm.config import Config
 from d2f_vllm.engine.model_runner import AutoModelRunner
+try:
+    from d2f_vllm.layers.attention.ops.triton_eviction_scorer import (
+        query_to_chunk_attention_scores as _triton_query_to_chunk_attention_scores,
+    )
+except Exception:
+    _triton_query_to_chunk_attention_scores = None
 from d2f_vllm.sampling_params import SamplingParams
 from d2f_vllm.utils.context import reset_context_diffusion_lm, set_context_diffusion_lm
 
@@ -176,11 +182,14 @@ class FastDLLMDreamEngine:
         self.config = cfg
         self.runner = AutoModelRunner.from_config(cfg, 0, [])
         self.model = self.runner.model
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            layer.self_attn.attn.layer_idx = layer_idx
         self.tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True, trust_remote_code=True)
         self.page_size = self.runner.block_size
         self._prefix_cache = _PrefixPageAllocator(
             num_pages=cfg.num_kvcache_blocks, page_size=self.page_size
         )
+        self._active_decode_delta_state = None
 
     def close(self) -> None:
         if getattr(self, "runner", None) is not None:
@@ -252,6 +261,7 @@ class FastDLLMDreamEngine:
             seq_lens_ts=torch.tensor([block_len], dtype=torch.int32, device=torch.cuda.current_device()),
             kv_cache_layout=self.config.kv_cache_layout,
             need_kv_cache_store=True,
+            decode_delta_state=self._active_decode_delta_state,
         )
 
     def _forward_prefill(self, ids: Sequence[int], positions: Sequence[int]) -> torch.Tensor:
@@ -336,6 +346,7 @@ class FastDLLMDreamEngine:
             seq_lens_ts=torch.tensor([block_len], dtype=torch.int32, device=torch.cuda.current_device()),
             kv_cache_layout=self.config.kv_cache_layout,
             need_kv_cache_store=True,
+            decode_delta_state=self._active_decode_delta_state,
         )
         try:
             hidden = self.model(block_ids.reshape(-1), self._positions_tensor(block_positions))
@@ -568,6 +579,30 @@ class FastDLLMDreamEngine:
                 compacted = layer_cache[:, src_pages, src_offsets, head_idx, :].clone()
                 layer_cache[:, dst_pages, dst_offsets, head_idx, :] = compacted
         return active_len
+
+    def _snapshot_prompt_cache_per_layer(
+        self,
+        prompt_page_ids: List[int],
+        prompt_len: int,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Copy full prompt KV before compaction for decode-time delta attention."""
+        if self.config.kv_cache_layout != "unified":
+            raise ValueError("decode delta reservoir currently supports kv_cache_layout='unified' only.")
+        if prompt_len <= 0:
+            return [], []
+        kv_cache = self.runner.kv_cache
+        page_ids = torch.tensor(prompt_page_ids, dtype=torch.long, device=torch.cuda.current_device())
+        token_idx = torch.arange(int(prompt_len), dtype=torch.long, device=torch.cuda.current_device())
+        pages = page_ids.index_select(0, token_idx // self.page_size)
+        offsets = token_idx % self.page_size
+
+        full_k: List[torch.Tensor] = []
+        full_v: List[torch.Tensor] = []
+        for layer_idx in range(int(kv_cache.shape[1])):
+            layer_cache = kv_cache[:, layer_idx]
+            full_k.append(layer_cache[0, pages, offsets, :, :].clone().contiguous())
+            full_v.append(layer_cache[1, pages, offsets, :, :].clone().contiguous())
+        return full_k, full_v
 
     @staticmethod
     def _select_attention_layer_indices(total_layers: int, layer_window: int, layer_mode: str) -> List[int]:
@@ -927,6 +962,7 @@ class FastDLLMDreamEngine:
         direction: str,
         reduce_mode: str,
         attention_mask: str,
+        backend: str = "torch",
     ) -> torch.Tensor:
         if chunk_len <= 0 or query_len <= 0:
             return torch.empty(0, device=q.device)
@@ -941,7 +977,28 @@ class FastDLLMDreamEngine:
         chunk_start = int(prefix_len)
         query_start = int(prefix_len + chunk_len)
         direction = (direction or "query_to_chunk").lower()
+        backend = (backend or "torch").lower()
         parts: List[torch.Tensor] = []
+
+        if direction == "query_to_chunk" and backend in {"triton", "auto"}:
+            if _triton_query_to_chunk_attention_scores is None:
+                if backend == "triton":
+                    raise RuntimeError("TOKEN_SCORE_BACKEND=triton requested, but Triton eviction scorer is unavailable.")
+            else:
+                try:
+                    return _triton_query_to_chunk_attention_scores(
+                        q,
+                        k,
+                        prefix_len=prefix_len,
+                        chunk_len=chunk_len,
+                        query_len=query_len,
+                        scale=float(self.model.model.layers[0].self_attn.scaling),
+                        reduce_mode=reduce_mode,
+                        attention_mask=attention_mask,
+                    )
+                except Exception:
+                    if backend == "triton":
+                        raise
 
         def probs_for_rows(rows: torch.Tensor) -> torch.Tensor:
             per_query_head_probs = []
@@ -1007,6 +1064,7 @@ class FastDLLMDreamEngine:
         token_score_keep: str = "high",
         token_score_include_prefix: bool = True,
         token_attention_mask: str = "causal",
+        token_score_backend: str = "torch",
     ) -> Tuple[List[List[List[int]]], List[Dict[str, int]]]:
         capacity = int(token_capacity or 0)
         query_ids = self._window_query(query_ids, token_score_query_window)
@@ -1063,6 +1121,7 @@ class FastDLLMDreamEngine:
                                 direction=token_score_direction,
                                 reduce_mode=token_score_reduce,
                                 attention_mask=token_attention_mask,
+                                backend=token_score_backend,
                             )
                             if scores.numel() > 0 and scores.shape[-1] == chunk_len:
                                 pooling = (token_score_pooling or "none").lower()
@@ -1425,6 +1484,11 @@ class FastDLLMDreamEngine:
         prompt_positions: Optional[Sequence[int]] = None,
         active_prompt_positions: Optional[Sequence[int]] = None,
         prompt_keep_indices_per_layer_per_head: Optional[Sequence[Sequence[Sequence[int]]]] = None,
+        decode_delta_mode: str = "none",
+        decode_delta_stride: int = 4,
+        decode_delta_left: int = 3,
+        decode_delta_scale: float = 1.0,
+        decode_delta_debug: bool = False,
         stop_token_ids: Optional[Iterable[int]] = None,
     ) -> FastDLLMEngineOutput:
         if max_new_tokens <= 0:
@@ -1485,6 +1549,8 @@ class FastDLLMDreamEngine:
         num_prompt_pages = math.ceil(full_prompt_len / self.page_size)
         num_block_pages = math.ceil(decode_len / self.page_size)
         use_prefix_cache = per_head_keep_indices is None
+        decode_delta_mode = (decode_delta_mode or "none").lower()
+        decode_delta_state = None
 
         cached = self._prefix_cache.lookup_prefix(prompt_ids) if use_prefix_cache else None
         owns_prompt_pages = False
@@ -1519,6 +1585,24 @@ class FastDLLMDreamEngine:
                 full_ids, full_positions, prompt_page_ids, block_page_ids, full_prompt_len
             )
             if per_head_keep_indices is not None:
+                if decode_delta_mode in {"s4_left3", "delta_s4_left3", "sampled_delta_s4_left3"}:
+                    full_k, full_v = self._snapshot_prompt_cache_per_layer(prompt_page_ids, full_prompt_len)
+                    stride = max(1, int(decode_delta_stride or 4))
+                    decode_delta_state = {
+                        "enabled": True,
+                        "mode": "s4_left3",
+                        "full_k": full_k,
+                        "full_v": full_v,
+                        "full_prompt_len": full_prompt_len,
+                        "active_prompt_len": int(per_head_active_len or 0),
+                        "stride": stride,
+                        "left": max(0, int(decode_delta_left)),
+                        "anchor_offset": stride - 1,
+                        "scale": float(decode_delta_scale),
+                        "debug": bool(decode_delta_debug),
+                    }
+                elif decode_delta_mode not in {"none", "off", "0", ""}:
+                    raise ValueError(f"Unsupported decode_delta_mode: {decode_delta_mode}")
                 self._compact_prompt_cache_per_layer_per_head(prompt_page_ids, per_head_keep_indices)
                 active_prompt_pages = math.ceil(prompt_len / self.page_size)
                 if active_prompt_pages < len(prompt_page_ids):
@@ -1535,31 +1619,46 @@ class FastDLLMDreamEngine:
         block_ids[0] = first_token[0]
         all_page_ids_for_decode = prompt_page_ids + block_page_ids
         n_steps = 0
-        while bool((block_ids == self.mask_token_id).any()):
-            n_steps += 1
-            mask_index = block_ids == self.mask_token_id
-            logits = self._forward_replace_block_paged(
-                block_ids,
-                prompt_len=prompt_len,
-                block_page_ids=block_page_ids,
-                all_page_ids=all_page_ids_for_decode,
-                block_positions=suffix_positions,
-            )
-            shifted_logits = self._shift_logits(logits, last_context_logit)
-            confidence, sampled = self._sample_tokens(shifted_logits[mask_index])
+        previous_delta_state = self._active_decode_delta_state
+        self._active_decode_delta_state = decode_delta_state
+        try:
+            while bool((block_ids == self.mask_token_id).any()):
+                n_steps += 1
+                mask_index = block_ids == self.mask_token_id
+                logits = self._forward_replace_block_paged(
+                    block_ids,
+                    prompt_len=prompt_len,
+                    block_page_ids=block_page_ids,
+                    all_page_ids=all_page_ids_for_decode,
+                    block_positions=suffix_positions,
+                )
+                shifted_logits = self._shift_logits(logits, last_context_logit)
+                confidence, sampled = self._sample_tokens(shifted_logits[mask_index])
 
-            candidate = torch.full_like(block_ids, self.mask_token_id)
-            candidate[mask_index] = sampled
-            full_confidence = torch.full_like(block_ids, -torch.inf, dtype=confidence.dtype)
-            full_confidence[mask_index] = confidence
-            transfer_count = int(mask_index.sum().item())
-            selected_confidence, select_index = torch.topk(full_confidence, transfer_count)
-            transfer_index = torch.zeros_like(block_ids, dtype=torch.bool)
-            transfer_index[select_index[0]] = True
-            for idx in range(1, transfer_count):
-                if selected_confidence[idx] >= self.threshold:
-                    transfer_index[select_index[idx]] = True
-            block_ids[transfer_index] = candidate[transfer_index]
+                candidate = torch.full_like(block_ids, self.mask_token_id)
+                candidate[mask_index] = sampled
+                full_confidence = torch.full_like(block_ids, -torch.inf, dtype=confidence.dtype)
+                full_confidence[mask_index] = confidence
+                transfer_count = int(mask_index.sum().item())
+                selected_confidence, select_index = torch.topk(full_confidence, transfer_count)
+                transfer_index = torch.zeros_like(block_ids, dtype=torch.bool)
+                transfer_index[select_index[0]] = True
+                for idx in range(1, transfer_count):
+                    if selected_confidence[idx] >= self.threshold:
+                        transfer_index[select_index[idx]] = True
+                block_ids[transfer_index] = candidate[transfer_index]
+        finally:
+            self._active_decode_delta_state = previous_delta_state
+        if decode_delta_state is not None and decode_delta_state.get("debug", False):
+            print(
+                "[decode-delta] "
+                f"mode={decode_delta_state.get('mode')} "
+                f"calls={decode_delta_state.get('calls', 0)} "
+                f"nonzero_calls={decode_delta_state.get('nonzero_calls', 0)} "
+                f"anchor_count={decode_delta_state.get('anchor_count', 0)} "
+                f"max_abs={float(decode_delta_state.get('max_abs', 0.0)):.6e}",
+                flush=True,
+            )
 
         self._prefix_cache.release_pages(block_page_ids)
         if owns_prompt_pages:

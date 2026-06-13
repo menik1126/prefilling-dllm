@@ -49,6 +49,7 @@ class Attention(nn.Module):
             partial(flex_attention, kernel_options=kernel_options, enable_gqa=True, 
                     return_lse=False), dynamic=True)
         self._block_mask_cache = {}
+        self.layer_idx = -1
 
     def _attention_forward(
         self,
@@ -81,6 +82,74 @@ class Attention(nn.Module):
         def _mask_mod(batch, head, token_q, token_kv):
             return block_mask[token_q, token_kv]
         return create_block_mask(_mask_mod, B, H, Q_LEN, KV_LEN, device=device)
+
+    def _maybe_apply_decode_delta(
+        self,
+        o: torch.Tensor,
+        q_t: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        context: ContextForDiffusionLM,
+    ) -> torch.Tensor:
+        state = getattr(context, "decode_delta_state", None)
+        if not state or not state.get("enabled", False):
+            return o
+        if self.layer_idx < 0:
+            return o
+        full_k_by_layer = state.get("full_k")
+        full_v_by_layer = state.get("full_v")
+        if full_k_by_layer is None or full_v_by_layer is None:
+            return o
+        if self.layer_idx >= len(full_k_by_layer):
+            return o
+        full_prompt_k = full_k_by_layer[self.layer_idx]
+        full_prompt_v = full_v_by_layer[self.layer_idx]
+        if full_prompt_k is None or full_prompt_v is None or full_prompt_k.numel() == 0:
+            return o
+
+        _, num_heads, seq_len, _ = q_t.shape
+        stride = max(1, int(state.get("stride", 4)))
+        left = max(0, int(state.get("left", stride - 1)))
+        anchor_offset = int(state.get("anchor_offset", stride - 1))
+        if seq_len <= 0:
+            return o
+        if anchor_offset < 0:
+            anchor_offset = stride - 1
+        anchor_offset = min(anchor_offset, stride - 1)
+        anchors = torch.arange(anchor_offset, seq_len, stride, device=q_t.device, dtype=torch.long)
+        if anchors.numel() == 0:
+            return o
+
+        full_k = torch.cat([full_prompt_k.to(device=k_new.device, dtype=k_new.dtype), k_new], dim=0)
+        full_v = torch.cat([full_prompt_v.to(device=v_new.device, dtype=v_new.dtype), v_new], dim=0)
+        q_anchor = q_t.index_select(2, anchors)
+        k_t, v_t = [rearrange(t, 's h d -> 1 h s d').contiguous() for t in (full_k, full_v)]
+
+        full_prompt_len = int(full_prompt_k.shape[0])
+        prompt_mask = torch.ones((anchors.numel(), full_prompt_len), dtype=torch.bool, device=q_t.device)
+        if context.block_mask is not None:
+            active_start = int(context.context_lens[0].item()) if context.context_lens is not None else 0
+            active_mask = context.block_mask.index_select(0, anchors)[:, active_start:]
+        else:
+            active_mask = torch.ones((anchors.numel(), seq_len), dtype=torch.bool, device=q_t.device)
+        delta_mask = torch.cat([prompt_mask, active_mask], dim=1)
+        block_mask = self.dllm_block_mask(delta_mask, 1, num_heads, int(anchors.numel()), int(full_k.shape[0]), str(q_t.device))
+        dense_anchor = self._attention_forward(q_anchor, k_t, v_t, block_mask=block_mask, dense_mask=delta_mask)
+        base_anchor = o.index_select(2, anchors)
+        delta = (dense_anchor - base_anchor) * float(state.get("scale", 1.0))
+        if state.get("debug", False):
+            delta_abs_max = float(delta.abs().max().item()) if delta.numel() else 0.0
+            state["calls"] = int(state.get("calls", 0)) + 1
+            state["nonzero_calls"] = int(state.get("nonzero_calls", 0)) + int(delta_abs_max > 0.0)
+            state["max_abs"] = max(float(state.get("max_abs", 0.0)), delta_abs_max)
+            state["anchor_count"] = int(state.get("anchor_count", 0)) + int(anchors.numel())
+
+        correction = torch.zeros_like(o)
+        for delta_idx, anchor in enumerate(anchors.tolist()):
+            start = max(0, int(anchor) - left)
+            rows = torch.arange(start, int(anchor) + 1, device=q_t.device, dtype=torch.long)
+            correction[:, :, rows, :] += delta[:, :, delta_idx:delta_idx + 1, :]
+        return o + correction
     
     @lru_cache(maxsize=32)
     def causal_lm_block_mask(self, cum_seq_lens: torch.Tensor, B: int, H: int, Q_LEN: int, KV_LEN: int, device: str):
@@ -174,6 +243,7 @@ class Attention(nn.Module):
                     block_mask = self.dllm_block_mask(context.block_mask, B, H, Sq, Skv, str(q.device))
 
                     o = self._attention_forward(q_t, k_t, v_t, block_mask=block_mask, dense_mask=context.block_mask)
+                    o = self._maybe_apply_decode_delta(o, q_t, k, v, context)
                 else:
                     o = torch.empty_like(q)
                     diffusion_lm_parallel_flash_decoding(

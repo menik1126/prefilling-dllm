@@ -49,6 +49,7 @@ TOKEN_SCORE_KEEP="${TOKEN_SCORE_KEEP:-high}"
 TOKEN_SCORE_INCLUDE_PREFIX="${TOKEN_SCORE_INCLUDE_PREFIX:-1}"
 TOKEN_SCORE_USE_GENERATED="${TOKEN_SCORE_USE_GENERATED:-0}"
 TOKEN_ATTENTION_MASK="${TOKEN_ATTENTION_MASK:-causal}"
+TOKEN_SCORE_BACKEND="${TOKEN_SCORE_BACKEND:-torch}"
 TOKEN_EVICTION_GRANULARITY="${TOKEN_EVICTION_GRANULARITY:-per_head}"
 
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
@@ -57,6 +58,11 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.60}"
 THRESHOLD="${THRESHOLD:-0.9}"
 KV_CACHE_LAYOUT="${KV_CACHE_LAYOUT:-unified}"
+DECODE_DELTA_MODE="${DECODE_DELTA_MODE:-none}"
+DECODE_DELTA_STRIDE="${DECODE_DELTA_STRIDE:-4}"
+DECODE_DELTA_LEFT="${DECODE_DELTA_LEFT:-3}"
+DECODE_DELTA_SCALE="${DECODE_DELTA_SCALE:-1.0}"
+DECODE_DELTA_DEBUG="${DECODE_DELTA_DEBUG:-0}"
 
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
 export HF_HOME="${HF_HOME:-/home/ma-user/work/hf-cache}"
@@ -71,8 +77,9 @@ export SPLIT_FROM_TAIL CHUNK_BOS FORCE_KEEP_CHUNK_BOS
 export TOKEN_CAPACITY TOKEN_SCORE_QUERY_WINDOW TOKEN_SCORE_LAYERS TOKEN_SCORE_LAYER_MODE TOKEN_SCORE_REDUCE
 export TOKEN_SCORE_POOLING TOKEN_SCORE_POOL_KERNEL TOKEN_SCORE_HEAD_REDUCE TOKEN_SCORE_LAYER_REDUCE
 export TOKEN_SCORE_DIRECTION TOKEN_SCORE_KEEP TOKEN_SCORE_INCLUDE_PREFIX TOKEN_SCORE_USE_GENERATED
-export TOKEN_ATTENTION_MASK TOKEN_EVICTION_GRANULARITY MAX_NEW_TOKENS BLOCK_LENGTH MAX_MODEL_LEN
+export TOKEN_ATTENTION_MASK TOKEN_SCORE_BACKEND TOKEN_EVICTION_GRANULARITY MAX_NEW_TOKENS BLOCK_LENGTH MAX_MODEL_LEN
 export GPU_MEMORY_UTILIZATION THRESHOLD KV_CACHE_LAYOUT
+export DECODE_DELTA_MODE DECODE_DELTA_STRIDE DECODE_DELTA_LEFT DECODE_DELTA_SCALE DECODE_DELTA_DEBUG
 
 LOG_DIR="$D2F_VLLM_DIR/log"
 mkdir -p "$LOG_DIR"
@@ -87,8 +94,8 @@ echo "Model               : $DREAM_BASE"
 echo "CUDA devices        : $CUDA_VISIBLE_DEVICES"
 echo "Run timestamp       : $RUN_TS"
 echo "Chunk selection     : backend=engine topk=$TOPK_CHUNKS chunk=$PC_CHUNK_SIZE score=$SCORE_MODE draft=$SCORE_DRAFT_TOKENS partial_rounds=$SCORE_DRAFT_PARTIAL_ROUNDS mask=$SCORE_ATTENTION_MASK"
-echo "Token eviction      : capacity=$TOKEN_CAPACITY granularity=$TOKEN_EVICTION_GRANULARITY backend=engine layers=$TOKEN_SCORE_LAYER_MODE:$TOKEN_SCORE_LAYERS pool=$TOKEN_SCORE_POOLING/$TOKEN_SCORE_POOL_KERNEL"
-echo "Decode setting      : FastDLLMDreamEngine block=$BLOCK_LENGTH max_new=$MAX_NEW_TOKENS"
+echo "Token eviction      : capacity=$TOKEN_CAPACITY granularity=$TOKEN_EVICTION_GRANULARITY backend=engine score_backend=$TOKEN_SCORE_BACKEND layers=$TOKEN_SCORE_LAYER_MODE:$TOKEN_SCORE_LAYERS pool=$TOKEN_SCORE_POOLING/$TOKEN_SCORE_POOL_KERNEL"
+echo "Decode setting      : FastDLLMDreamEngine block=$BLOCK_LENGTH max_new=$MAX_NEW_TOKENS delta=$DECODE_DELTA_MODE stride=$DECODE_DELTA_STRIDE left=$DECODE_DELTA_LEFT scale=$DECODE_DELTA_SCALE debug=$DECODE_DELTA_DEBUG"
 echo "Log file            : $LOG_FILE"
 echo "============================================"
 
@@ -267,6 +274,7 @@ token_score_keep = os.environ.get("TOKEN_SCORE_KEEP", "high")
 token_score_include_prefix = env_bool("TOKEN_SCORE_INCLUDE_PREFIX", True)
 token_score_use_generated = env_bool("TOKEN_SCORE_USE_GENERATED", False)
 token_attention_mask = os.environ.get("TOKEN_ATTENTION_MASK", "causal")
+token_score_backend = os.environ.get("TOKEN_SCORE_BACKEND", "torch")
 token_eviction_granularity = os.environ.get("TOKEN_EVICTION_GRANULARITY", "per_head")
 max_new_tokens = env_int("MAX_NEW_TOKENS", 32)
 block_length = env_int("BLOCK_LENGTH", 32)
@@ -274,6 +282,11 @@ max_model_len = env_int("MAX_MODEL_LEN", 8192)
 gpu_memory_utilization = env_float("GPU_MEMORY_UTILIZATION", 0.60)
 threshold = env_float("THRESHOLD", 0.9)
 kv_cache_layout = os.environ.get("KV_CACHE_LAYOUT", "unified")
+decode_delta_mode = os.environ.get("DECODE_DELTA_MODE", "none")
+decode_delta_stride = env_int("DECODE_DELTA_STRIDE", 4)
+decode_delta_left = env_int("DECODE_DELTA_LEFT", 3)
+decode_delta_scale = env_float("DECODE_DELTA_SCALE", 1.0)
+decode_delta_debug = env_bool("DECODE_DELTA_DEBUG", False)
 dry_run = env_int("DRY_RUN", 0)
 
 if token_eviction_granularity != "per_head":
@@ -365,7 +378,7 @@ try:
                     "removed_tokens": max(0, len(original_chunk_ids) - kept_count),
                     "union_kept_tokens": None,
                     "chunk_selection_backend": "engine",
-                    "token_score_backend": "engine",
+                    "token_score_backend": f"engine:{token_score_backend}",
                 }
             )
             prompt_ids.extend(chunk_ids)
@@ -404,6 +417,7 @@ try:
             token_score_keep=token_score_keep,
             token_score_include_prefix=token_score_include_prefix,
             token_attention_mask=token_attention_mask,
+            token_score_backend=token_score_backend,
         )
         active_len = len(keep_indices[0][0]) if keep_indices and keep_indices[0] else 0
         if active_len != len(active_prompt_positions):
@@ -439,7 +453,7 @@ try:
                     "selection_query_tokens": len(selection_query_ids),
                     "score_token_mask_true": sum(1 for x in score_token_mask if x) if score_token_mask is not None else None,
                     "chunk_selection_backend": "engine",
-                    "token_score_backend": "engine",
+                    "token_score_backend": f"engine:{token_score_backend}",
                 },
             }
         )
@@ -456,7 +470,7 @@ try:
             "selection_seconds": selection_seconds,
             "setting": {
                 "chunk_selection_backend": "engine",
-                "token_score_backend": "engine",
+                "token_score_backend": token_score_backend,
                 "topk_chunks": topk_chunks,
                 "parallelcomp_chunk_size": pc_chunk_size,
                 "score_mode": score_mode,
@@ -477,7 +491,13 @@ try:
                 "token_score_direction": token_score_direction,
                 "token_score_keep": token_score_keep,
                 "token_attention_mask": token_attention_mask,
+                "token_score_backend": token_score_backend,
                 "token_eviction_granularity": token_eviction_granularity,
+                "decode_delta_mode": decode_delta_mode,
+                "decode_delta_stride": decode_delta_stride,
+                "decode_delta_left": decode_delta_left,
+                "decode_delta_scale": decode_delta_scale,
+                "decode_delta_debug": decode_delta_debug,
             },
             "records": compressed_records,
         },
@@ -498,6 +518,11 @@ try:
             prompt_positions=compressed["prompt_positions"],
             active_prompt_positions=compressed["active_prompt_positions"],
             prompt_keep_indices_per_layer_per_head=compressed["prompt_keep_indices_per_layer_per_head"],
+            decode_delta_mode=decode_delta_mode,
+            decode_delta_stride=decode_delta_stride,
+            decode_delta_left=decode_delta_left,
+            decode_delta_scale=decode_delta_scale,
+            decode_delta_debug=decode_delta_debug,
             stop_token_ids=[engine.tokenizer.eos_token_id] if engine.tokenizer.eos_token_id is not None else None,
         )
         raw_prediction = output.text
@@ -540,7 +565,7 @@ try:
                 "metrics": metrics,
                 "setting": {
                     "chunk_selection_backend": "engine",
-                    "token_score_backend": "engine",
+                    "token_score_backend": token_score_backend,
                     "topk_chunks": topk_chunks,
                     "parallelcomp_chunk_size": pc_chunk_size,
                     "score_mode": score_mode,
@@ -555,6 +580,11 @@ try:
                     "max_new_tokens": max_new_tokens,
                     "block_length": block_length,
                     "threshold": threshold,
+                    "decode_delta_mode": decode_delta_mode,
+                    "decode_delta_stride": decode_delta_stride,
+                    "decode_delta_left": decode_delta_left,
+                    "decode_delta_scale": decode_delta_scale,
+                    "decode_delta_debug": decode_delta_debug,
                 },
                 "results": results,
             }
