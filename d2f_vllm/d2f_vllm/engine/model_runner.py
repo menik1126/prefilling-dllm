@@ -55,7 +55,12 @@ class ModelRunnerBase(ABC):
         
         # When using accelerate, each process should use its local rank as device_id
         # Check if we're in an accelerate environment
-        if dist.is_initialized() and not self._process_group_initialized_by_us:
+        if self.world_size == 1:
+            # Single-runner PD workers may coexist in one process. In that case
+            # the global process group can already be initialized by another
+            # engine, so honor device_start instead of deriving cuda:0 from rank.
+            device_id = getattr(config, "device_start", 0) or 0
+        elif dist.is_initialized() and not self._process_group_initialized_by_us:
             # We're using accelerate or similar, use local rank for device assignment
             device_id = actual_rank
         else:

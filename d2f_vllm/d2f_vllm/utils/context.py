@@ -1,6 +1,8 @@
+import threading
+
 import torch
 
-from typing import List
+from typing import Any, List
 from dataclasses import dataclass
 
 from d2f_vllm.engine.sequence import SequenceForDiffusionLM
@@ -22,10 +24,18 @@ class ContextForCausalLM(ContextBase):
     kv_cache_layout: str = "unified"  # Only "unified" is supported for Causal LM currently
     need_kv_cache_store: bool = True
 
-_CONTEXT_FOR_CAUSAL_LM = ContextForCausalLM()
+_THREAD_CONTEXT = threading.local()
+
+
+def _get_thread_causal_lm() -> ContextForCausalLM:
+    context = getattr(_THREAD_CONTEXT, "causal_lm", None)
+    if context is None:
+        context = ContextForCausalLM()
+        _THREAD_CONTEXT.causal_lm = context
+    return context
 
 def get_context_causal_lm() -> ContextForCausalLM:
-    return _CONTEXT_FOR_CAUSAL_LM
+    return _get_thread_causal_lm()
 
 def set_context_causal_lm(
     is_prefill,
@@ -33,8 +43,7 @@ def set_context_causal_lm(
     max_seqlen_q=0, max_seqlen_k=0,
     slot_mapping=None, context_lens=None, block_tables=None
 ) -> None:
-    global _CONTEXT_FOR_CAUSAL_LM
-    _CONTEXT_FOR_CAUSAL_LM = ContextForCausalLM(
+    _THREAD_CONTEXT.causal_lm = ContextForCausalLM(
         is_prefill, 
         cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k, 
@@ -42,8 +51,7 @@ def set_context_causal_lm(
     )
 
 def reset_context_causal_lm() -> None:
-    global _CONTEXT_FOR_CAUSAL_LM
-    _CONTEXT_FOR_CAUSAL_LM = ContextForCausalLM()
+    _THREAD_CONTEXT.causal_lm = ContextForCausalLM()
 
 
 # Global context for diffusion language model
@@ -55,6 +63,8 @@ class ContextForDiffusionLM(ContextBase):
     kv_cache_layout: str = "unified"  # "unified" or "distinct"
     need_kv_cache_store: bool = True
     block_mask: List[torch.Tensor] | None = None
+    decode_delta_state: Any | None = None
+    prefill_sparse_state: Any | None = None
     
     def __post_init__(self):
         if self.seq_lens_ts is not None and self.context_lens is not None:
@@ -113,27 +123,33 @@ class ContextForDiffusionLM(ContextBase):
     def total_num_seqs(self) -> int:
         return len(self.seqs) if self.seqs is not None else 0
 
-_CONTEXT_FOR_DIFFUSION_LM = ContextForDiffusionLM()
+def _get_thread_diffusion_lm() -> ContextForDiffusionLM:
+    context = getattr(_THREAD_CONTEXT, "diffusion_lm", None)
+    if context is None:
+        context = ContextForDiffusionLM()
+        _THREAD_CONTEXT.diffusion_lm = context
+    return context
 
 def get_context_diffusion_lm() -> ContextForDiffusionLM:
-    return _CONTEXT_FOR_DIFFUSION_LM
+    return _get_thread_diffusion_lm()
 
 def set_context_diffusion_lm(
     is_prefill,
     cu_seqlens_q=None, cu_seqlens_k=None,
     max_seqlen_q=0, max_seqlen_k=0,
     slot_mapping=None, context_lens=None, block_tables=None,
-    seqs= None, seq_lens=None, seq_lens_ts=None, kv_cache_layout="unified", need_kv_cache_store=True
+    seqs= None, seq_lens=None, seq_lens_ts=None, kv_cache_layout="unified", need_kv_cache_store=True,
+    decode_delta_state=None,
+    prefill_sparse_state=None,
 ) -> None:
-    global _CONTEXT_FOR_DIFFUSION_LM
-    _CONTEXT_FOR_DIFFUSION_LM = ContextForDiffusionLM(
+    _THREAD_CONTEXT.diffusion_lm = ContextForDiffusionLM(
         is_prefill,
         cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k,
         slot_mapping, context_lens, block_tables,
-        seqs, seq_lens, seq_lens_ts, kv_cache_layout, need_kv_cache_store
+        seqs, seq_lens, seq_lens_ts, kv_cache_layout, need_kv_cache_store, None, decode_delta_state,
+        prefill_sparse_state
     )
 
 def reset_context_diffusion_lm() -> None:
-    global _CONTEXT_FOR_DIFFUSION_LM
-    _CONTEXT_FOR_DIFFUSION_LM = ContextForDiffusionLM()
+    _THREAD_CONTEXT.diffusion_lm = ContextForDiffusionLM()
