@@ -46,7 +46,9 @@ def main(args):
     
     # Use unified model and data loading functions
     denoiser, tokenizer = get_model_by_config(config)
-    dataloader = get_dataloader_by_config(tokenizer, config.data, config)
+    dataloader = get_dataloader_by_config(
+        tokenizer, config.data, config, max_length=config.data.max_length
+    )
     
     if config.train.decoder_resume_path is not None:
         ckpt = torch.load(config.train.decoder_resume_path, map_location='cpu', weights_only=True)
@@ -100,6 +102,7 @@ def main(args):
                 input_ids = batch['data']
                 # print("input_ids",input_ids.dtype)
                 question_length = batch['question_length']
+                sequence_length = batch.get('sequence_length')
                 
                 # Use unified loss function selection
                 losses = compute_loss_by_config(
@@ -114,7 +117,8 @@ def main(args):
                     feature_align = config.train.feature_align,
                     self_step     = config.train.self_step,
                     eos_id        = tokenizer.eos_token_id,
-                    config        = config
+                    config        = config,
+                    sequence_length = sequence_length,
                 )
                 
                 if config.train.share_steps > 1:
@@ -146,7 +150,12 @@ def main(args):
                 accelerator.log(logs, step=global_step)
                 progress_bar.set_postfix(**logs)
 
-            if global_step > 0 and global_step % config.train.eval_every == 0 and accelerator.is_main_process:
+            if (
+                config.training_mode != 'dream_full_long'
+                and global_step > 0
+                and global_step % config.train.eval_every == 0
+                and accelerator.is_main_process
+            ):
                 denoiser.eval();
                 question = 'Henry made two stops during his 60-mile bike trip. He first stopped after 20 miles. His second stop was 15 miles before the end of the trip. How many miles did he travel between his first and second stops?'
                 # prompt = tokenizer(question)['input_ids']

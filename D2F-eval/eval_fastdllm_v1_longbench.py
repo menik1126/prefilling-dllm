@@ -68,7 +68,16 @@ def build_context_truncated_prompt_ids(tokenizer, template, example, args):
     query_ids = encode_fragment(tokenizer, parts.get("query", ""))
     context_ids = encode_fragment(tokenizer, parts.get("context", ""))
     prompt_budget = max(1, args.max_length - args.max_new_tokens)
-    context_budget = prompt_budget - len(prefix_ids) - len(query_ids)
+    requested_context_budget = getattr(args, "context_budget_tokens", None)
+    if requested_context_budget is not None:
+        requested_context_budget = int(requested_context_budget)
+        if requested_context_budget < 0:
+            raise ValueError(f"context_budget_tokens must be non-negative: {requested_context_budget}")
+
+    if requested_context_budget is None:
+        context_budget = prompt_budget - len(prefix_ids) - len(query_ids)
+    else:
+        context_budget = min(requested_context_budget, len(context_ids))
 
     if context_budget < 0:
         keep_query = query_ids[-max(prompt_budget // 2, 1):]
@@ -76,6 +85,12 @@ def build_context_truncated_prompt_ids(tokenizer, template, example, args):
         prefix_ids = prefix_ids[-prefix_budget:] if prefix_budget else []
         query_ids = keep_query
         context_budget = 0
+
+    if requested_context_budget is not None and len(prefix_ids) + len(query_ids) + context_budget > prompt_budget:
+        raise ValueError(
+            f"Prompt with context_budget_tokens={requested_context_budget} exceeds budget: "
+            f"{len(prefix_ids) + len(query_ids) + context_budget} > {prompt_budget}"
+        )
 
     kept_context_ids, head_len, dropped, tail_len = split_context_ids(
         context_ids,
@@ -96,6 +111,7 @@ def build_context_truncated_prompt_ids(tokenizer, template, example, args):
         "raw_prompt_tokens": len(prefix_ids) + len(context_ids) + len(query_ids),
         "prompt_tokens_after_truncation": len(prompt_ids),
         "prompt_budget_tokens": prompt_budget,
+        "requested_context_budget_tokens": requested_context_budget,
         "context_budget_tokens": max(context_budget, 0),
         "context_head_tokens": head_len,
         "context_tail_tokens": tail_len,
@@ -117,6 +133,7 @@ def build_arg_parser():
     parser.add_argument("--output_dir", default="./results_longbench_fastdllm_v1")
     parser.add_argument("--max_new_tokens", type=int, default=32)
     parser.add_argument("--max_length", type=int, default=4096)
+    parser.add_argument("--context_budget_tokens", type=int, default=None)
     parser.add_argument("--block_length", type=int, default=32)
     parser.add_argument("--diffusion_steps", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -161,6 +178,7 @@ def main():
     print(f"Run name           : {args.run_name}")
     print(f"Fast-dLLM Dream dir: {args.fastdllm_dream_dir}")
     print(f"Model max_length   : {args.max_length}")
+    print(f"Context budget     : {args.context_budget_tokens}")
     print(f"Generation max_new : {args.max_new_tokens}")
     print(f"Block length       : {args.block_length}")
     print(f"Diffusion steps    : {args.diffusion_steps or max(1, args.max_new_tokens // args.block_length)}")
@@ -266,6 +284,7 @@ def main():
                 "generation_max_new_tokens": args.max_new_tokens,
                 "run_name": args.run_name,
                 "max_length": args.max_length,
+                "requested_context_budget_tokens": args.context_budget_tokens,
                 "block_length": args.block_length,
                 "diffusion_steps": model.diffusion_steps,
                 "alg": args.alg,

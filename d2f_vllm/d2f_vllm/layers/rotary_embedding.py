@@ -65,7 +65,6 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -73,6 +72,23 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
-    assert rope_scaling is None
+    if isinstance(rope_scaling, dict):
+        rope_scaling = tuple(sorted(rope_scaling.items()))
+    device = torch.cuda.current_device() if torch.cuda.is_available() else -1
+    return _get_rope_cached(head_size, rotary_dim, max_position, base, rope_scaling, device)
+
+
+@lru_cache(8)
+def _get_rope_cached(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling: tuple | None = None,
+    device: int = -1,
+):
+    assert rope_scaling is None or dict(rope_scaling).get("rope_type") in {None, "default"}
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    if device >= 0:
+        rotary_emb = rotary_emb.to(f"cuda:{device}")
     return rotary_emb

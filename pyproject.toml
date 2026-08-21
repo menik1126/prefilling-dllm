@@ -9,6 +9,7 @@ dependencies = [
     "transformers==4.49.0",
     "accelerate==0.34.2",
     "peft==0.18.1",
+    "omegaconf==2.3.0",
     "lm_eval==0.4.8",
     "datasets==4.8.4",
     "numpy==2.2.6",

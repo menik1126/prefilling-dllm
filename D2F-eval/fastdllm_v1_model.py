@@ -15,6 +15,31 @@ import torch
 import transformers
 
 
+def _ensure_default_rope_init():
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    if "default" in ROPE_INIT_FUNCTIONS:
+        return
+    if "proportional" not in ROPE_INIT_FUNCTIONS:
+        available = ", ".join(sorted(ROPE_INIT_FUNCTIONS))
+        raise RuntimeError(f"Cannot alias default RoPE; available rope types: {available}")
+    ROPE_INIT_FUNCTIONS["default"] = ROPE_INIT_FUNCTIONS["proportional"]
+
+
+def _ensure_generation_config_validate_compat():
+    from model.generation_utils import DreamGenerationConfig
+
+    original_validate = DreamGenerationConfig.validate
+    if getattr(original_validate, "_d2f_accepts_extra_kwargs", False):
+        return
+
+    def validate(self, is_init=False, **kwargs):
+        return original_validate(self, is_init=is_init)
+
+    validate._d2f_accepts_extra_kwargs = True
+    DreamGenerationConfig.validate = validate
+
+
 def _resolve_dtype(dtype):
     if dtype in (None, "auto"):
         return dtype
@@ -77,9 +102,12 @@ class FastDLLMv1Dream:
         if dream_dir not in sys.path:
             sys.path.insert(0, dream_dir)
 
+        _ensure_default_rope_init()
         from model.configuration_dream import DreamConfig
+        from model.generation_utils import DreamGenerationConfig
         from model.generation_utils_block import DreamGenerationMixin
         from model.modeling_dream import DreamModel, DreamRotaryEmbedding
+        _ensure_generation_config_validate_compat()
 
         model_config = DreamConfig.from_pretrained(config.pretrained)
         target_dtype = _resolve_dtype(config.dtype)

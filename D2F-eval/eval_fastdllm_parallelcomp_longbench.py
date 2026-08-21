@@ -119,6 +119,7 @@ def add_parallelcomp_args(parser):
     parser.add_argument("--score_draft_partial_rounds", type=int, default=None)
     parser.add_argument("--score_draft_score_all_slots", action="store_true")
     parser.add_argument("--score_llada_shift_logits", action="store_true")
+    parser.add_argument("--score_batch_size", type=int, default=8)
     parser.add_argument(
         "--score_attention_mask",
         choices=["causal", "full", "query_to_chunk"],
@@ -245,6 +246,7 @@ def main():
     print(f"Score partial steps   : {args.score_draft_partial_steps}")
     print(f"Score partial rounds  : {args.score_draft_partial_rounds}")
     print(f"Score all draft slots : {args.score_draft_score_all_slots}")
+    print(f"Score batch size      : {args.score_batch_size}")
     print(f"LLaDA shifted score   : {args.score_llada_shift_logits}")
     print(f"Score attention mask  : {args.score_attention_mask}")
     print(f"Score context mode    : {args.score_context_mode}")
@@ -307,6 +309,7 @@ def main():
         score_draft_partial_rounds=args.score_draft_partial_rounds,
         score_draft_score_all_slots=args.score_draft_score_all_slots,
         score_llada_shift_logits=args.score_llada_shift_logits,
+        score_batch_size=args.score_batch_size,
         score_attention_mask=args.score_attention_mask,
         score_context_mode=args.score_context_mode,
         attention_score_layers=args.attention_score_layers,
@@ -431,6 +434,7 @@ def main():
                 "score_draft_partial_rounds": args.score_draft_partial_rounds,
                 "score_draft_score_all_slots": args.score_draft_score_all_slots,
                 "score_llada_shift_logits": args.score_llada_shift_logits,
+                "score_batch_size": args.score_batch_size,
                 "score_attention_mask": args.score_attention_mask,
                 "score_context_mode": args.score_context_mode,
                 "token_capacity": args.token_capacity,

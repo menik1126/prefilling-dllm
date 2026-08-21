@@ -13,6 +13,7 @@ CONFIG_DIR="${LONGBENCH_CONFIG_DIR:-/home/ma-user/work/ParallelComp_official/lon
 TASK_NAME="${LONGBENCH_TASK:-multifieldqa_en}"
 
 CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+MASTER_PORT="${MASTER_PORT:-2333}"
 START_INDEX="${START_INDEX:-0}"
 LIMIT="${LIMIT:-}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
@@ -63,8 +64,20 @@ DECODE_DELTA_STRIDE="${DECODE_DELTA_STRIDE:-4}"
 DECODE_DELTA_LEFT="${DECODE_DELTA_LEFT:-3}"
 DECODE_DELTA_SCALE="${DECODE_DELTA_SCALE:-1.0}"
 DECODE_DELTA_DEBUG="${DECODE_DELTA_DEBUG:-0}"
+PREFILL_SPARSE_MODE="${PREFILL_SPARSE_MODE:-none}"
+PREFILL_DELTA_MODE="${PREFILL_DELTA_MODE:-none}"
+PREFILL_DELTA_STRIDE="${PREFILL_DELTA_STRIDE:-8}"
+PREFILL_DELTA_LEFT="${PREFILL_DELTA_LEFT:-7}"
+PREFILL_DELTA_SCALE="${PREFILL_DELTA_SCALE:-1.0}"
+PREFILL_DELTA_DEBUG="${PREFILL_DELTA_DEBUG:-0}"
+PD_REMOTE_ENGINE="${PD_REMOTE_ENGINE:-0}"
+PD_PIPELINE_OVERLAP="${PD_PIPELINE_OVERLAP:-0}"
+PD_DECODE_DEVICE_START="${PD_DECODE_DEVICE_START:-1}"
+PD_DECODE_MASTER_PORT="${PD_DECODE_MASTER_PORT:-$((MASTER_PORT + 1))}"
+PD_DECODE_SHM_NAME="${PD_DECODE_SHM_NAME:-d2f_vllm_pd_decode}"
 
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
+export MASTER_PORT
 export HF_HOME="${HF_HOME:-/home/ma-user/work/hf-cache}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export PYTHONPATH="$REPO_DIR:$D2F_EVAL_DIR:${PYTHONPATH:-}"
@@ -80,6 +93,8 @@ export TOKEN_SCORE_DIRECTION TOKEN_SCORE_KEEP TOKEN_SCORE_INCLUDE_PREFIX TOKEN_S
 export TOKEN_ATTENTION_MASK TOKEN_SCORE_BACKEND TOKEN_EVICTION_GRANULARITY MAX_NEW_TOKENS BLOCK_LENGTH MAX_MODEL_LEN
 export GPU_MEMORY_UTILIZATION THRESHOLD KV_CACHE_LAYOUT
 export DECODE_DELTA_MODE DECODE_DELTA_STRIDE DECODE_DELTA_LEFT DECODE_DELTA_SCALE DECODE_DELTA_DEBUG
+export PREFILL_SPARSE_MODE PREFILL_DELTA_MODE PREFILL_DELTA_STRIDE PREFILL_DELTA_LEFT PREFILL_DELTA_SCALE PREFILL_DELTA_DEBUG
+export PD_REMOTE_ENGINE PD_PIPELINE_OVERLAP PD_DECODE_DEVICE_START PD_DECODE_MASTER_PORT PD_DECODE_SHM_NAME
 
 LOG_DIR="$D2F_VLLM_DIR/log"
 mkdir -p "$LOG_DIR"
@@ -92,10 +107,13 @@ echo "============================================"
 echo "Python              : $PYTHON"
 echo "Model               : $DREAM_BASE"
 echo "CUDA devices        : $CUDA_VISIBLE_DEVICES"
+echo "Master port         : $MASTER_PORT"
 echo "Run timestamp       : $RUN_TS"
 echo "Chunk selection     : backend=engine topk=$TOPK_CHUNKS chunk=$PC_CHUNK_SIZE score=$SCORE_MODE draft=$SCORE_DRAFT_TOKENS partial_rounds=$SCORE_DRAFT_PARTIAL_ROUNDS mask=$SCORE_ATTENTION_MASK"
 echo "Token eviction      : capacity=$TOKEN_CAPACITY granularity=$TOKEN_EVICTION_GRANULARITY backend=engine score_backend=$TOKEN_SCORE_BACKEND layers=$TOKEN_SCORE_LAYER_MODE:$TOKEN_SCORE_LAYERS pool=$TOKEN_SCORE_POOLING/$TOKEN_SCORE_POOL_KERNEL"
+echo "Prefill sparse      : mode=$PREFILL_SPARSE_MODE delta=$PREFILL_DELTA_MODE stride=$PREFILL_DELTA_STRIDE left=$PREFILL_DELTA_LEFT scale=$PREFILL_DELTA_SCALE debug=$PREFILL_DELTA_DEBUG"
 echo "Decode setting      : FastDLLMDreamEngine block=$BLOCK_LENGTH max_new=$MAX_NEW_TOKENS delta=$DECODE_DELTA_MODE stride=$DECODE_DELTA_STRIDE left=$DECODE_DELTA_LEFT scale=$DECODE_DELTA_SCALE debug=$DECODE_DELTA_DEBUG"
+echo "PD remote engine    : enabled=$PD_REMOTE_ENGINE overlap=$PD_PIPELINE_OVERLAP decode_device_start=$PD_DECODE_DEVICE_START decode_master_port=$PD_DECODE_MASTER_PORT"
 echo "Log file            : $LOG_FILE"
 echo "============================================"
 
@@ -109,6 +127,7 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Sequence
+import torch
 
 repo_dir = os.environ["REPO_DIR"]
 d2f_eval_dir = os.environ["D2F_EVAL_DIR"]
@@ -118,6 +137,7 @@ if d2f_eval_dir not in sys.path:
     sys.path.insert(0, d2f_eval_dir)
 
 from d2f_vllm import FastDLLMDreamEngine
+from d2f_vllm.pd_pipeline import ordered_prefetch_map
 from eval_fastdllm_parallelcomp_longbench import (
     load_json,
     load_task_examples,
@@ -282,15 +302,35 @@ max_model_len = env_int("MAX_MODEL_LEN", 8192)
 gpu_memory_utilization = env_float("GPU_MEMORY_UTILIZATION", 0.60)
 threshold = env_float("THRESHOLD", 0.9)
 kv_cache_layout = os.environ.get("KV_CACHE_LAYOUT", "unified")
+master_port = env_int("MASTER_PORT", 2333)
+pd_remote_engine = env_bool("PD_REMOTE_ENGINE", False)
+pd_pipeline_overlap = env_bool("PD_PIPELINE_OVERLAP", False)
+pd_decode_device_start = env_int("PD_DECODE_DEVICE_START", 1)
+pd_decode_master_port = env_int("PD_DECODE_MASTER_PORT", master_port + 1)
+pd_decode_shm_name = os.environ.get("PD_DECODE_SHM_NAME", "d2f_vllm_pd_decode")
 decode_delta_mode = os.environ.get("DECODE_DELTA_MODE", "none")
 decode_delta_stride = env_int("DECODE_DELTA_STRIDE", 4)
 decode_delta_left = env_int("DECODE_DELTA_LEFT", 3)
 decode_delta_scale = env_float("DECODE_DELTA_SCALE", 1.0)
 decode_delta_debug = env_bool("DECODE_DELTA_DEBUG", False)
+prefill_sparse_mode = os.environ.get("PREFILL_SPARSE_MODE", "none")
+prefill_delta_mode = os.environ.get("PREFILL_DELTA_MODE", "none")
+prefill_delta_stride = env_int("PREFILL_DELTA_STRIDE", 8)
+prefill_delta_left = env_int("PREFILL_DELTA_LEFT", 7)
+prefill_delta_scale = env_float("PREFILL_DELTA_SCALE", 1.0)
+prefill_delta_debug = env_bool("PREFILL_DELTA_DEBUG", False)
 dry_run = env_int("DRY_RUN", 0)
 
 if token_eviction_granularity != "per_head":
     raise ValueError("full-engine bridge currently targets per_head token eviction.")
+if pd_pipeline_overlap and not pd_remote_engine:
+    raise ValueError("PD_PIPELINE_OVERLAP=1 requires PD_REMOTE_ENGINE=1.")
+
+bridge_mode = (
+    "fastdllm_full_engine_selection_keep_decode_pd_overlap"
+    if pd_remote_engine and pd_pipeline_overlap
+    else "fastdllm_full_engine_selection_keep_decode"
+)
 
 prompt_templates = load_json(Path(config_dir) / "dataset2prompt_raw.json")
 dataset2maxlen = load_json(Path(config_dir) / "dataset2maxlen.json")
@@ -312,7 +352,94 @@ engine = FastDLLMDreamEngine(
     max_num_batched_tokens=max_model_len,
     max_num_seqs=1,
     kv_cache_layout=kv_cache_layout,
+    master_port=master_port,
+    device_start=0,
 )
+decode_engine = None
+if pd_remote_engine:
+    print("Loading Decode FastDLLMDreamEngine for PD remote decode...", flush=True)
+    torch.cuda.set_device(pd_decode_device_start)
+    decode_engine = FastDLLMDreamEngine(
+        dream_base,
+        max_model_len=max_model_len,
+        block_length=block_length,
+        gpu_memory_utilization=gpu_memory_utilization,
+        threshold=threshold,
+        temperature=0.0,
+        max_num_batched_tokens=max_model_len,
+        max_num_seqs=1,
+        kv_cache_layout=kv_cache_layout,
+        master_port=pd_decode_master_port,
+        shm_name=pd_decode_shm_name,
+        device_start=pd_decode_device_start,
+    )
+    torch.cuda.set_device(0)
+
+
+def generation_kwargs(compressed):
+    return {
+        "max_new_tokens": max_new_tokens,
+        "prompt_positions": compressed["prompt_positions"],
+        "active_prompt_positions": compressed["active_prompt_positions"],
+        "prompt_keep_indices_per_layer_per_head": compressed["prompt_keep_indices_per_layer_per_head"],
+        "decode_delta_mode": decode_delta_mode,
+        "decode_delta_stride": decode_delta_stride,
+        "decode_delta_left": decode_delta_left,
+        "decode_delta_scale": decode_delta_scale,
+        "decode_delta_debug": decode_delta_debug,
+        "prefill_sparse_mode": prefill_sparse_mode,
+        "prefill_delta_mode": prefill_delta_mode,
+        "prefill_delta_stride": prefill_delta_stride,
+        "prefill_delta_left": prefill_delta_left,
+        "prefill_delta_scale": prefill_delta_scale,
+        "prefill_delta_debug": prefill_delta_debug,
+    }
+
+
+def stop_token_ids():
+    return [engine.tokenizer.eos_token_id] if engine.tokenizer.eos_token_id is not None else None
+
+
+def prepare_pd_decode_record(compressed):
+    kwargs = generation_kwargs(compressed)
+    source_record = None
+    try:
+        torch.cuda.set_device(0)
+        source_record = engine.prefill_to_pd_record(compressed["prompt_ids"], **kwargs)
+        torch.cuda.set_device(pd_decode_device_start)
+        decode_record = decode_engine.make_pd_record_from_remote_engine(engine, source_record)
+        torch.cuda.synchronize(pd_decode_device_start)
+        return decode_record
+    finally:
+        if source_record is not None:
+            torch.cuda.set_device(0)
+            engine.release_pd_record(source_record)
+
+
+def decode_prepared_pd_record(record):
+    torch.cuda.set_device(pd_decode_device_start)
+    return decode_engine.decode_from_pd_record(
+        record,
+        max_new_tokens=max_new_tokens,
+        stop_token_ids=stop_token_ids(),
+    )
+
+
+def release_prepared_pd_record(record):
+    torch.cuda.set_device(pd_decode_device_start)
+    decode_engine.release_pd_record(record)
+
+
+def generate_with_optional_pd(compressed):
+    kwargs = generation_kwargs(compressed)
+    if not pd_remote_engine:
+        torch.cuda.set_device(0)
+        return engine.generate_token_ids(
+            compressed["prompt_ids"],
+            stop_token_ids=stop_token_ids(),
+            **kwargs,
+        )
+    return decode_prepared_pd_record(prepare_pd_decode_record(compressed))
 
 result_path = log_dir / f"longbench_{task}_fastdllm_engine_full_bridge_results_{run_ts}.json"
 compressed_path = log_dir / f"longbench_{task}_fastdllm_engine_full_bridge_compressed_{run_ts}.json"
@@ -322,6 +449,7 @@ template = prompt_templates[task]
 
 try:
     for idx, example in enumerate(examples):
+        torch.cuda.set_device(0)
         parts = render_prompt_parts(template, example, "\n")
         prefix_ids = bos_ids(engine.tokenizer) + encode_fragment(engine.tokenizer, parts.get("prefix", ""))
         context_ids = encode_fragment(engine.tokenizer, parts.get("context", ""))
@@ -466,7 +594,7 @@ try:
         {
             "task": task,
             "run_ts": run_ts,
-            "bridge_mode": "fastdllm_full_engine_selection_keep_decode",
+            "bridge_mode": bridge_mode,
             "selection_seconds": selection_seconds,
             "setting": {
                 "chunk_selection_backend": "engine",
@@ -493,6 +621,15 @@ try:
                 "token_attention_mask": token_attention_mask,
                 "token_score_backend": token_score_backend,
                 "token_eviction_granularity": token_eviction_granularity,
+                "pd_remote_engine": pd_remote_engine,
+                "pd_pipeline_overlap": pd_pipeline_overlap,
+                "pd_decode_device_start": pd_decode_device_start,
+                "prefill_sparse_mode": prefill_sparse_mode,
+                "prefill_delta_mode": prefill_delta_mode,
+                "prefill_delta_stride": prefill_delta_stride,
+                "prefill_delta_left": prefill_delta_left,
+                "prefill_delta_scale": prefill_delta_scale,
+                "prefill_delta_debug": prefill_delta_debug,
                 "decode_delta_mode": decode_delta_mode,
                 "decode_delta_stride": decode_delta_stride,
                 "decode_delta_left": decode_delta_left,
@@ -511,20 +648,8 @@ try:
 
     results = []
     decode_t0 = time.time()
-    for idx, (example, compressed) in enumerate(zip(examples, compressed_records)):
-        output = engine.generate_token_ids(
-            compressed["prompt_ids"],
-            max_new_tokens=max_new_tokens,
-            prompt_positions=compressed["prompt_positions"],
-            active_prompt_positions=compressed["active_prompt_positions"],
-            prompt_keep_indices_per_layer_per_head=compressed["prompt_keep_indices_per_layer_per_head"],
-            decode_delta_mode=decode_delta_mode,
-            decode_delta_stride=decode_delta_stride,
-            decode_delta_left=decode_delta_left,
-            decode_delta_scale=decode_delta_scale,
-            decode_delta_debug=decode_delta_debug,
-            stop_token_ids=[engine.tokenizer.eos_token_id] if engine.tokenizer.eos_token_id is not None else None,
-        )
+
+    def append_result(idx, example, compressed, output):
         raw_prediction = output.text
         prediction = trim_stop_tokens(raw_prediction, STOP_STRINGS)
         answers = example.get("answers", [])
@@ -552,12 +677,14 @@ try:
                 },
             }
         )
+
+    def save_progress(idx):
         if (idx + 1) % 10 == 0 or idx + 1 == len(examples):
             metrics = summarize_metrics(results, longbench_e=False)
             payload = {
                 "task": task,
                 "run_ts": run_ts,
-                "bridge_mode": "fastdllm_full_engine_selection_keep_decode",
+                "bridge_mode": bridge_mode,
                 "completed": len(results),
                 "total": len(examples),
                 "selection_seconds": selection_seconds,
@@ -580,6 +707,15 @@ try:
                     "max_new_tokens": max_new_tokens,
                     "block_length": block_length,
                     "threshold": threshold,
+                    "pd_remote_engine": pd_remote_engine,
+                    "pd_pipeline_overlap": pd_pipeline_overlap,
+                    "pd_decode_device_start": pd_decode_device_start,
+                    "prefill_sparse_mode": prefill_sparse_mode,
+                    "prefill_delta_mode": prefill_delta_mode,
+                    "prefill_delta_stride": prefill_delta_stride,
+                    "prefill_delta_left": prefill_delta_left,
+                    "prefill_delta_scale": prefill_delta_scale,
+                    "prefill_delta_debug": prefill_delta_debug,
                     "decode_delta_mode": decode_delta_mode,
                     "decode_delta_stride": decode_delta_stride,
                     "decode_delta_left": decode_delta_left,
@@ -590,7 +726,39 @@ try:
             }
             save_json(result_path, payload)
             print(f"completed={len(results)}/{len(examples)} score={metrics['score']:.2f} decode_seconds={time.time() - decode_t0:.2f}", flush=True)
+
+    if pd_remote_engine and pd_pipeline_overlap:
+        def prepare_item(item):
+            _idx, _example, compressed = item
+            return prepare_pd_decode_record(compressed)
+
+        def consume_item(item, record):
+            _idx, _example, _compressed = item
+            return decode_prepared_pd_record(record)
+
+        decode_items = list(zip(range(len(examples)), examples, compressed_records))
+        for item, output in zip(
+            decode_items,
+            ordered_prefetch_map(
+                decode_items,
+                prepare=prepare_item,
+                consume=consume_item,
+                release_prepared=release_prepared_pd_record,
+            ),
+        ):
+            idx, example, compressed = item
+            append_result(idx, example, compressed, output)
+            save_progress(idx)
+    else:
+        for idx, (example, compressed) in enumerate(zip(examples, compressed_records)):
+            output = generate_with_optional_pd(compressed)
+            append_result(idx, example, compressed, output)
+            save_progress(idx)
 finally:
+    if decode_engine is not None:
+        torch.cuda.set_device(pd_decode_device_start)
+        decode_engine.close()
+    torch.cuda.set_device(0)
     engine.close()
 
 final_metrics = summarize_metrics(results, longbench_e=False) if 'results' in locals() else {"score": 0.0}

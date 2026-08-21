@@ -1,4 +1,5 @@
 import math
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -26,6 +27,38 @@ class FastDLLMEngineOutput:
     text: str
     token_ids: List[int]
     n_diff_steps: int
+
+
+@dataclass
+class DreamPrefillRecord:
+    """Boundary state between Dream/Fast-DLLM prefill and decode."""
+
+    prompt_ids: List[int]
+    prompt_positions: List[int]
+    suffix_positions: List[int]
+    prompt_len: int
+    full_prompt_len: int
+    decode_len: int
+    prompt_page_ids: List[int]
+    block_page_ids: List[int]
+    first_token_id: int
+    last_context_logit: Optional[torch.Tensor]
+    decode_delta_state: Optional[dict]
+    owns_prompt_pages: bool
+    cached_prefix: Optional["_CachedPrefix"] = None
+    kv_mode: str = "full_dense"
+
+
+@dataclass
+class DreamKVSnapshot:
+    """Transferable prompt KV payload for a Dream prefill record."""
+
+    prompt_len: int
+    page_size: int
+    kv_mode: str
+    k_by_layer: List[torch.Tensor]
+    v_by_layer: List[torch.Tensor]
+    last_context_logit: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -61,6 +94,7 @@ class _PrefixPageAllocator:
         self.free_pages: deque = deque(range(num_pages))
         self.page_ref_count: List[int] = [0] * num_pages
         self.hash_to_prefix: Dict[int, _CachedPrefix] = {}
+        self._lock = threading.RLock()
 
     @staticmethod
     def compute_prompt_hash(prompt_ids: List[int]) -> int:
@@ -70,59 +104,67 @@ class _PrefixPageAllocator:
 
     @property
     def num_free_pages(self) -> int:
-        return len(self.free_pages)
+        with self._lock:
+            return len(self.free_pages)
 
     def allocate_pages(self, n: int) -> List[int]:
-        if n > len(self.free_pages):
-            raise RuntimeError(f"Cannot allocate {n} pages, only {len(self.free_pages)} free")
-        pages = [self.free_pages.popleft() for _ in range(n)]
-        for p in pages:
-            self.page_ref_count[p] = 1
-        return pages
+        with self._lock:
+            if n > len(self.free_pages):
+                raise RuntimeError(f"Cannot allocate {n} pages, only {len(self.free_pages)} free")
+            pages = [self.free_pages.popleft() for _ in range(n)]
+            for p in pages:
+                self.page_ref_count[p] = 1
+            return pages
 
     def ref_pages(self, pages: List[int]) -> None:
-        for p in pages:
-            self.page_ref_count[p] += 1
+        with self._lock:
+            for p in pages:
+                self.page_ref_count[p] += 1
 
     def release_pages(self, pages: List[int]) -> None:
-        for p in pages:
-            self.page_ref_count[p] -= 1
-            if self.page_ref_count[p] == 0:
-                self.free_pages.append(p)
+        with self._lock:
+            for p in pages:
+                self.page_ref_count[p] -= 1
+                if self.page_ref_count[p] == 0:
+                    self.free_pages.append(p)
 
     def lookup_prefix(self, prompt_ids: List[int]) -> Optional[_CachedPrefix]:
-        h = self.compute_prompt_hash(prompt_ids)
-        return self.hash_to_prefix.get(h)
+        with self._lock:
+            h = self.compute_prompt_hash(prompt_ids)
+            return self.hash_to_prefix.get(h)
 
     def register_prefix(
         self, prompt_ids: List[int], page_ids: List[int], prompt_len: int, last_context_logit: torch.Tensor
     ) -> _CachedPrefix:
-        h = self.compute_prompt_hash(prompt_ids)
-        entry = _CachedPrefix(
-            prompt_hash=h,
-            page_ids=list(page_ids),
-            prompt_len=prompt_len,
-            last_context_logit=last_context_logit.detach(),
-            ref_count=0,
-        )
-        self.hash_to_prefix[h] = entry
-        return entry
+        with self._lock:
+            h = self.compute_prompt_hash(prompt_ids)
+            entry = _CachedPrefix(
+                prompt_hash=h,
+                page_ids=list(page_ids),
+                prompt_len=prompt_len,
+                last_context_logit=last_context_logit.detach(),
+                ref_count=0,
+            )
+            self.hash_to_prefix[h] = entry
+            return entry
 
     def release_prefix(self, prompt_ids: List[int]) -> None:
-        h = self.compute_prompt_hash(prompt_ids)
-        entry = self.hash_to_prefix.get(h)
-        if entry is None:
-            return
-        entry.ref_count -= 1
+        with self._lock:
+            h = self.compute_prompt_hash(prompt_ids)
+            entry = self.hash_to_prefix.get(h)
+            if entry is None:
+                return
+            entry.ref_count -= 1
 
     def evict_one(self) -> bool:
         """Evict a cached prefix that has no active users. Returns True if evicted."""
-        for h, entry in list(self.hash_to_prefix.items()):
-            if entry.ref_count <= 0:
-                self.release_pages(entry.page_ids)
-                del self.hash_to_prefix[h]
-                return True
-        return False
+        with self._lock:
+            for h, entry in list(self.hash_to_prefix.items()):
+                if entry.ref_count <= 0:
+                    self.release_pages(entry.page_ids)
+                    del self.hash_to_prefix[h]
+                    return True
+            return False
 
 
 class FastDLLMDreamEngine:
@@ -141,6 +183,7 @@ class FastDLLMDreamEngine:
         max_model_len: int = 8192,
         block_length: int = 32,
         tensor_parallel_size: int = 1,
+        device_start: int = 0,
         gpu_memory_utilization: float = 0.60,
         max_num_batched_tokens: Optional[int] = None,
         max_num_seqs: int = 1,
@@ -171,6 +214,7 @@ class FastDLLMDreamEngine:
             max_num_batched_tokens=max_num_batched_tokens or max_model_len,
             max_num_seqs=max_num_seqs,
             tensor_parallel_size=tensor_parallel_size,
+            device_start=device_start,
             gpu_memory_utilization=gpu_memory_utilization,
             enforce_eager=enforce_eager,
             kv_cache_layout=kv_cache_layout,
@@ -215,6 +259,7 @@ class FastDLLMDreamEngine:
         slot_mapping: torch.Tensor,
         *,
         need_kv_cache_store: bool = True,
+        prefill_sparse_state: Optional[dict] = None,
     ) -> None:
         seq = _StaticMaskSeq(self._full_mask(seq_len), self.block_length)
         seq_lens_ts = torch.tensor([seq_len], dtype=torch.int32, device=torch.cuda.current_device())
@@ -232,6 +277,7 @@ class FastDLLMDreamEngine:
             seq_lens_ts=seq_lens_ts,
             kv_cache_layout=self.config.kv_cache_layout,
             need_kv_cache_store=need_kv_cache_store,
+            prefill_sparse_state=prefill_sparse_state,
         )
 
     def _set_replace_context(self, context_len: int, block_len: int, slot_mapping: torch.Tensor) -> None:
@@ -264,12 +310,18 @@ class FastDLLMDreamEngine:
             decode_delta_state=self._active_decode_delta_state,
         )
 
-    def _forward_prefill(self, ids: Sequence[int], positions: Sequence[int]) -> torch.Tensor:
+    def _forward_prefill(
+        self,
+        ids: Sequence[int],
+        positions: Sequence[int],
+        *,
+        prefill_sparse_state: Optional[dict] = None,
+    ) -> torch.Tensor:
         if len(ids) != len(positions):
             raise ValueError(f"ids/positions length mismatch: {len(ids)} vs {len(positions)}")
         input_ids = self._ids_tensor(ids)
         slot_mapping = torch.arange(len(ids), dtype=torch.int32, device=torch.cuda.current_device())
-        self._set_full_prefill_context(len(ids), slot_mapping)
+        self._set_full_prefill_context(len(ids), slot_mapping, prefill_sparse_state=prefill_sparse_state)
         try:
             hidden = self.model(input_ids, self._positions_tensor(positions))
             return self.model.compute_logits(hidden)
@@ -300,13 +352,18 @@ class FastDLLMDreamEngine:
 
     def _forward_prefill_paged(self, ids: Sequence[int], positions: Sequence[int],
                                prompt_page_ids: List[int], block_page_ids: List[int],
-                               prompt_len: int) -> torch.Tensor:
+                               prompt_len: int,
+                               prefill_sparse_state: Optional[dict] = None) -> torch.Tensor:
         if len(ids) != len(positions):
             raise ValueError(f"ids/positions length mismatch: {len(ids)} vs {len(positions)}")
         input_ids = self._ids_tensor(ids)
         block_len = len(ids) - prompt_len
         slot_mapping = self._split_slot_mapping(prompt_page_ids, block_page_ids, prompt_len, block_len)
-        self._set_full_prefill_context(len(ids), slot_mapping)
+        self._set_full_prefill_context(
+            len(ids),
+            slot_mapping,
+            prefill_sparse_state=prefill_sparse_state,
+        )
         try:
             hidden = self.model(input_ids, self._positions_tensor(positions))
             return self.model.compute_logits(hidden)
@@ -603,6 +660,225 @@ class FastDLLMDreamEngine:
             full_k.append(layer_cache[0, pages, offsets, :, :].clone().contiguous())
             full_v.append(layer_cache[1, pages, offsets, :, :].clone().contiguous())
         return full_k, full_v
+
+    def _load_prompt_cache_per_layer(
+        self,
+        prompt_page_ids: List[int],
+        prompt_len: int,
+        k_by_layer: Sequence[torch.Tensor],
+        v_by_layer: Sequence[torch.Tensor],
+    ) -> None:
+        """Load per-layer prompt KV tensors into prompt pages."""
+        if self.config.kv_cache_layout != "unified":
+            raise ValueError("PD prompt KV load currently supports kv_cache_layout='unified' only.")
+        if prompt_len <= 0:
+            return
+        kv_cache = self.runner.kv_cache
+        if len(k_by_layer) != int(kv_cache.shape[1]) or len(v_by_layer) != int(kv_cache.shape[1]):
+            raise ValueError(
+                "PD KV snapshot layer count mismatch: "
+                f"k={len(k_by_layer)} v={len(v_by_layer)} expected={int(kv_cache.shape[1])}"
+            )
+        page_ids = torch.tensor(prompt_page_ids, dtype=torch.long, device=torch.cuda.current_device())
+        token_idx = torch.arange(int(prompt_len), dtype=torch.long, device=torch.cuda.current_device())
+        pages = page_ids.index_select(0, token_idx // self.page_size)
+        offsets = token_idx % self.page_size
+
+        for layer_idx, (layer_k, layer_v) in enumerate(zip(k_by_layer, v_by_layer)):
+            layer_cache = kv_cache[:, layer_idx]
+            layer_k = layer_k.to(device=layer_cache.device, dtype=layer_cache.dtype)
+            layer_v = layer_v.to(device=layer_cache.device, dtype=layer_cache.dtype)
+            expected = (int(prompt_len), int(layer_cache.shape[3]), int(layer_cache.shape[4]))
+            if tuple(layer_k.shape) != expected or tuple(layer_v.shape) != expected:
+                raise ValueError(
+                    f"PD KV snapshot shape mismatch at layer {layer_idx}: "
+                    f"k={tuple(layer_k.shape)} v={tuple(layer_v.shape)} expected={expected}"
+                )
+            layer_cache[0, pages, offsets, :, :] = layer_k
+            layer_cache[1, pages, offsets, :, :] = layer_v
+
+    def snapshot_pd_record_kv(
+        self,
+        record: DreamPrefillRecord,
+        *,
+        device: str | torch.device = "cpu",
+    ) -> DreamKVSnapshot:
+        """Copy prompt KV referenced by a prefill record into a transferable snapshot."""
+        k_by_layer, v_by_layer = self._snapshot_prompt_cache_per_layer(
+            record.prompt_page_ids,
+            record.prompt_len,
+        )
+        target = torch.device(device)
+        current_cuda = torch.device("cuda", torch.cuda.current_device())
+        if target != current_cuda:
+            k_by_layer = [layer.to(device=target).contiguous() for layer in k_by_layer]
+            v_by_layer = [layer.to(device=target).contiguous() for layer in v_by_layer]
+        last_context_logit = record.last_context_logit
+        if last_context_logit is not None:
+            last_context_logit = last_context_logit.detach().to(device=target).contiguous()
+        return DreamKVSnapshot(
+            prompt_len=record.prompt_len,
+            page_size=self.page_size,
+            kv_mode=record.kv_mode,
+            k_by_layer=k_by_layer,
+            v_by_layer=v_by_layer,
+            last_context_logit=last_context_logit,
+        )
+
+    def make_pd_record_from_kv_snapshot(
+        self,
+        source: DreamPrefillRecord,
+        snapshot: DreamKVSnapshot,
+    ) -> DreamPrefillRecord:
+        """Allocate local pages, load a KV snapshot, and return a decode record."""
+        if snapshot.page_size != self.page_size:
+            raise ValueError(
+                f"PD KV snapshot page_size mismatch: snapshot={snapshot.page_size}, engine={self.page_size}"
+            )
+        if snapshot.prompt_len != source.prompt_len:
+            raise ValueError(
+                f"PD KV snapshot prompt_len mismatch: snapshot={snapshot.prompt_len}, source={source.prompt_len}"
+            )
+        if snapshot.kv_mode != source.kv_mode:
+            raise ValueError(
+                f"PD KV snapshot mode mismatch: snapshot={snapshot.kv_mode}, source={source.kv_mode}"
+            )
+
+        num_prompt_pages = math.ceil(source.prompt_len / self.page_size)
+        num_block_pages = math.ceil(source.decode_len / self.page_size)
+        while self._prefix_cache.num_free_pages < num_prompt_pages + num_block_pages:
+            if not self._prefix_cache.evict_one():
+                break
+        prompt_page_ids = self._prefix_cache.allocate_pages(num_prompt_pages)
+        block_page_ids = self._prefix_cache.allocate_pages(num_block_pages)
+        self._load_prompt_cache_per_layer(
+            prompt_page_ids,
+            source.prompt_len,
+            snapshot.k_by_layer,
+            snapshot.v_by_layer,
+        )
+        last_context_logit = snapshot.last_context_logit
+        if last_context_logit is not None:
+            last_context_logit = last_context_logit.to(
+                device=torch.device("cuda", torch.cuda.current_device())
+            ).contiguous()
+
+        return DreamPrefillRecord(
+            prompt_ids=list(source.prompt_ids),
+            prompt_positions=list(source.prompt_positions),
+            suffix_positions=list(source.suffix_positions),
+            prompt_len=source.prompt_len,
+            full_prompt_len=source.full_prompt_len,
+            decode_len=source.decode_len,
+            prompt_page_ids=prompt_page_ids,
+            block_page_ids=block_page_ids,
+            first_token_id=source.first_token_id,
+            last_context_logit=last_context_logit,
+            decode_delta_state=source.decode_delta_state,
+            owns_prompt_pages=True,
+            cached_prefix=None,
+            kv_mode=source.kv_mode,
+        )
+
+    @staticmethod
+    def _copy_decode_delta_state_to_device(
+        state: Optional[dict],
+        device: torch.device,
+    ) -> Optional[dict]:
+        if state is None:
+            return None
+        copied = dict(state)
+        for key in ("full_k", "full_v"):
+            values = copied.get(key)
+            if values is not None:
+                copied[key] = [
+                    item.to(device=device).contiguous() if item is not None else None
+                    for item in values
+                ]
+        return copied
+
+    def make_pd_record_from_remote_engine(
+        self,
+        source_engine: "FastDLLMDreamEngine",
+        source: DreamPrefillRecord,
+        *,
+        non_blocking: bool = True,
+    ) -> DreamPrefillRecord:
+        """Copy prompt KV directly from another engine into this engine.
+
+        When source and target caches live on different CUDA devices, PyTorch
+        uses the available CUDA copy path, including P2P when the devices allow
+        peer access. This is the worker-to-worker shape before adding an async
+        transfer stream wrapper.
+        """
+        if self.config.kv_cache_layout != "unified" or source_engine.config.kv_cache_layout != "unified":
+            raise ValueError("remote-engine PD transfer currently supports kv_cache_layout='unified' only.")
+        if self.page_size != source_engine.page_size:
+            raise ValueError(
+                f"remote-engine PD page_size mismatch: source={source_engine.page_size}, target={self.page_size}"
+            )
+
+        prompt_len = int(source.prompt_len)
+        num_prompt_pages = math.ceil(prompt_len / self.page_size)
+        num_block_pages = math.ceil(source.decode_len / self.page_size)
+        while self._prefix_cache.num_free_pages < num_prompt_pages + num_block_pages:
+            if not self._prefix_cache.evict_one():
+                break
+        prompt_page_ids = self._prefix_cache.allocate_pages(num_prompt_pages)
+        block_page_ids = self._prefix_cache.allocate_pages(num_block_pages)
+
+        src_cache = source_engine.runner.kv_cache
+        dst_cache = self.runner.kv_cache
+        if int(src_cache.shape[1]) != int(dst_cache.shape[1]):
+            raise ValueError(
+                f"remote-engine PD layer mismatch: source={int(src_cache.shape[1])}, target={int(dst_cache.shape[1])}"
+            )
+        src_page_ids = torch.tensor(source.prompt_page_ids, dtype=torch.long, device=src_cache.device)
+        dst_page_ids = torch.tensor(prompt_page_ids, dtype=torch.long, device=dst_cache.device)
+        src_token_idx = torch.arange(prompt_len, dtype=torch.long, device=src_cache.device)
+        dst_token_idx = torch.arange(prompt_len, dtype=torch.long, device=dst_cache.device)
+        src_pages = src_page_ids.index_select(0, src_token_idx // source_engine.page_size)
+        src_offsets = src_token_idx % source_engine.page_size
+        dst_pages = dst_page_ids.index_select(0, dst_token_idx // self.page_size)
+        dst_offsets = dst_token_idx % self.page_size
+
+        for layer_idx in range(int(src_cache.shape[1])):
+            src_layer = src_cache[:, layer_idx]
+            dst_layer = dst_cache[:, layer_idx]
+            src_k = src_layer[0, src_pages, src_offsets, :, :].to(
+                device=dst_cache.device,
+                dtype=dst_cache.dtype,
+                non_blocking=non_blocking,
+            )
+            src_v = src_layer[1, src_pages, src_offsets, :, :].to(
+                device=dst_cache.device,
+                dtype=dst_cache.dtype,
+                non_blocking=non_blocking,
+            )
+            dst_layer[0, dst_pages, dst_offsets, :, :] = src_k
+            dst_layer[1, dst_pages, dst_offsets, :, :] = src_v
+
+        target_device = torch.device(dst_cache.device)
+        last_context_logit = source.last_context_logit
+        if last_context_logit is not None:
+            last_context_logit = last_context_logit.to(device=target_device).contiguous()
+
+        return DreamPrefillRecord(
+            prompt_ids=list(source.prompt_ids),
+            prompt_positions=list(source.prompt_positions),
+            suffix_positions=list(source.suffix_positions),
+            prompt_len=source.prompt_len,
+            full_prompt_len=source.full_prompt_len,
+            decode_len=source.decode_len,
+            prompt_page_ids=prompt_page_ids,
+            block_page_ids=block_page_ids,
+            first_token_id=source.first_token_id,
+            last_context_logit=last_context_logit,
+            decode_delta_state=self._copy_decode_delta_state_to_device(source.decode_delta_state, target_device),
+            owns_prompt_pages=True,
+            cached_prefix=None,
+            kv_mode=source.kv_mode,
+        )
 
     @staticmethod
     def _select_attention_layer_indices(total_layers: int, layer_window: int, layer_mode: str) -> List[int]:
@@ -1065,7 +1341,8 @@ class FastDLLMDreamEngine:
         token_score_include_prefix: bool = True,
         token_attention_mask: str = "causal",
         token_score_backend: str = "torch",
-    ) -> Tuple[List[List[List[int]]], List[Dict[str, int]]]:
+        return_selection_dense_outputs: bool = False,
+    ) -> Tuple[List[List[List[int]]], List[Dict[str, int]]] | Tuple[List[List[List[int]]], List[Dict[str, int]], dict]:
         capacity = int(token_capacity or 0)
         query_ids = self._window_query(query_ids, token_score_query_window)
         num_layers = len(self.model.model.layers)
@@ -1075,6 +1352,8 @@ class FastDLLMDreamEngine:
 
         all_layer_keeps: List[List[torch.Tensor]] = [[] for _ in range(num_layers)]
         chunk_meta: List[Dict[str, int]] = []
+        selection_dense_sums: Dict[int, torch.Tensor] = {}
+        selection_dense_counts: Dict[int, torch.Tensor] = {}
         for span in chunk_spans:
             chunk_ids = [int(x) for x in span["chunk_ids"]]
             start = int(span["start"])
@@ -1153,6 +1432,29 @@ class FastDLLMDreamEngine:
                                     scores = torch.stack(grouped_scores, dim=0)
                                 scores_by_layer[layer_idx] = scores
                         hidden_states = layer.self_attn(positions, normed)
+                        if return_selection_dense_outputs and layer_idx in selected_layers:
+                            attn = layer.self_attn
+                            dense_chunk = hidden_states[
+                                prefix_len:prefix_len + chunk_len
+                            ].view(chunk_len, int(attn.num_heads), int(attn.head_dim)).detach()
+                            if layer_idx not in selection_dense_sums:
+                                selection_dense_sums[layer_idx] = torch.zeros(
+                                    (full_prompt_len, int(attn.num_heads), int(attn.head_dim)),
+                                    device=dense_chunk.device,
+                                    dtype=torch.float32,
+                                )
+                                selection_dense_counts[layer_idx] = torch.zeros(
+                                    (full_prompt_len,),
+                                    device=dense_chunk.device,
+                                    dtype=torch.float32,
+                                )
+                            global_rows = torch.arange(start, end, device=dense_chunk.device, dtype=torch.long)
+                            selection_dense_sums[layer_idx].index_add_(0, global_rows, dense_chunk.float())
+                            selection_dense_counts[layer_idx].index_add_(
+                                0,
+                                global_rows,
+                                torch.ones((chunk_len,), device=dense_chunk.device, dtype=torch.float32),
+                            )
                         hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
                         hidden_states = layer.mlp(hidden_states)
                 finally:
@@ -1242,7 +1544,105 @@ class FastDLLMDreamEngine:
                     pieces.append(torch.arange(cursor, full_prompt_len, device=torch.cuda.current_device(), dtype=torch.long))
                 head_indices.append(torch.cat(pieces, dim=0))
             prompt_keep.append(torch.stack(head_indices, dim=0).tolist())
-        return prompt_keep, chunk_meta
+        if not return_selection_dense_outputs:
+            return prompt_keep, chunk_meta
+
+        dense_outputs: List[Optional[torch.Tensor]] = [None for _ in range(num_layers)]
+        dense_counts: List[Optional[torch.Tensor]] = [None for _ in range(num_layers)]
+        for layer_idx, dense_sum in selection_dense_sums.items():
+            counts = selection_dense_counts[layer_idx].clamp_min(1.0)
+            dense_avg = dense_sum / counts.view(-1, 1, 1)
+            dense_outputs[layer_idx] = dense_avg.to(dtype=torch.float16, device="cpu").contiguous()
+            dense_counts[layer_idx] = selection_dense_counts[layer_idx].to(dtype=torch.float16, device="cpu").contiguous()
+        selection_dense = {
+            "outputs": dense_outputs,
+            "counts": dense_counts,
+            "reduce": "mean",
+            "layers": [int(x) for x in selected_layers],
+        }
+        return prompt_keep, chunk_meta, selection_dense
+
+    @torch.inference_mode()
+    def compute_joint_selection_dense_outputs(
+        self,
+        *,
+        prompt_ids: Sequence[int],
+        prompt_positions: Sequence[int],
+        chunk_spans: Sequence[Dict[str, object]],
+        token_score_layers: int = 1,
+        token_score_layer_mode: str = "first",
+    ) -> dict:
+        full_prompt_len = len(prompt_ids)
+        if full_prompt_len != len(prompt_positions):
+            raise ValueError(
+                f"prompt_ids/prompt_positions length mismatch: {full_prompt_len} vs {len(prompt_positions)}"
+            )
+        num_layers = len(self.model.model.layers)
+        selected_layers = self._select_attention_layer_indices(num_layers, token_score_layers, token_score_layer_mode)
+        if not selected_layers:
+            selected_layers = [0]
+
+        dense_outputs: List[Optional[torch.Tensor]] = [None for _ in range(num_layers)]
+        dense_counts: List[Optional[torch.Tensor]] = [None for _ in range(num_layers)]
+        if full_prompt_len <= 0:
+            return {"outputs": dense_outputs, "counts": dense_counts, "reduce": "joint_selected", "layers": selected_layers}
+
+        input_ids = self._ids_tensor(prompt_ids)
+        positions = self._positions_tensor(prompt_positions)
+        slot_mapping = torch.arange(full_prompt_len, dtype=torch.int32, device=torch.cuda.current_device())
+        self._set_full_prefill_context(full_prompt_len, slot_mapping, need_kv_cache_store=False)
+        try:
+            hidden_states = self.model.model.embed_tokens(input_ids)
+            residual = None
+            for layer_idx, layer in enumerate(self.model.model.layers):
+                if residual is None:
+                    residual = hidden_states
+                    normed = layer.input_layernorm(hidden_states)
+                else:
+                    normed, residual = layer.input_layernorm(hidden_states, residual)
+                hidden_states = layer.self_attn(positions, normed)
+                if layer_idx in selected_layers:
+                    attn = layer.self_attn
+                    dense_all = hidden_states.view(
+                        full_prompt_len, int(attn.num_heads), int(attn.head_dim)
+                    ).detach()
+                    dense_sum = torch.zeros(
+                        dense_all.shape,
+                        device=dense_all.device,
+                        dtype=torch.float32,
+                    )
+                    counts = torch.zeros(
+                        (full_prompt_len,),
+                        device=dense_all.device,
+                        dtype=torch.float32,
+                    )
+                    for span in chunk_spans:
+                        start = int(span["start"])
+                        end = int(span["end"])
+                        if end <= start:
+                            continue
+                        start = max(0, min(start, full_prompt_len))
+                        end = max(start, min(end, full_prompt_len))
+                        rows = torch.arange(start, end, device=dense_all.device, dtype=torch.long)
+                        dense_sum.index_add_(0, rows, dense_all.index_select(0, rows).float())
+                        counts.index_add_(
+                            0,
+                            rows,
+                            torch.ones((end - start,), device=dense_all.device, dtype=torch.float32),
+                        )
+                    dense_outputs[layer_idx] = dense_sum.to(dtype=torch.float16, device="cpu").contiguous()
+                    dense_counts[layer_idx] = counts.to(dtype=torch.float16, device="cpu").contiguous()
+                hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+                hidden_states = layer.mlp(hidden_states)
+        finally:
+            reset_context_diffusion_lm()
+
+        return {
+            "outputs": dense_outputs,
+            "counts": dense_counts,
+            "reduce": "joint_selected",
+            "layers": [int(x) for x in selected_layers],
+        }
 
     @staticmethod
     def _shift_logits(logits: torch.Tensor, last_logit: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1476,6 +1876,385 @@ class FastDLLMDreamEngine:
         return FastDLLMEngineOutput(text=text, token_ids=generated, n_diff_steps=n_steps)
 
     @torch.inference_mode()
+    def prefill_to_pd_record(
+        self,
+        prompt_ids: Sequence[int],
+        *,
+        max_new_tokens: int,
+        prompt_positions: Optional[Sequence[int]] = None,
+        active_prompt_positions: Optional[Sequence[int]] = None,
+        prompt_keep_indices_per_layer_per_head: Optional[Sequence[Sequence[Sequence[int]]]] = None,
+        decode_delta_mode: str = "none",
+        decode_delta_stride: int = 4,
+        decode_delta_left: int = 3,
+        decode_delta_scale: float = 1.0,
+        decode_delta_debug: bool = False,
+        prefill_sparse_mode: str = "none",
+        prefill_delta_mode: str = "none",
+        prefill_delta_stride: int = 8,
+        prefill_delta_left: int = 7,
+        prefill_delta_right: int = 0,
+        prefill_delta_direction: str = "left",
+        prefill_delta_scale: float = 1.0,
+        prefill_delta_debug: bool = False,
+        prefill_delta_selection_mode: str = "none",
+        prefill_delta_selection_scale: float = 1.0,
+        prefill_selection_dense_outputs: Optional[dict] = None,
+    ) -> DreamPrefillRecord:
+        """Run the Dream prefill half and return decode-ready boundary state.
+
+        This first PD boundary keeps KV pages inside the same engine. A later
+        transfer backend can replace the page references with copied KV blocks.
+        """
+        if max_new_tokens <= 0:
+            raise ValueError("prefill_to_pd_record requires max_new_tokens > 0")
+        if max_new_tokens > self.block_length:
+            raise NotImplementedError(
+                "The first FastDLLMDreamEngine version supports one generation block only. "
+                f"Got max_new_tokens={max_new_tokens}, block_length={self.block_length}."
+            )
+
+        prompt_ids = list(int(x) for x in prompt_ids)
+        if prompt_positions is None:
+            prompt_positions = list(range(len(prompt_ids)))
+        else:
+            prompt_positions = [int(x) for x in prompt_positions]
+        if len(prompt_ids) != len(prompt_positions):
+            raise ValueError(
+                f"prompt_ids/prompt_positions length mismatch: {len(prompt_ids)} vs {len(prompt_positions)}"
+            )
+        decode_len = self.block_length
+
+        per_head_keep_indices: Optional[List[torch.Tensor]] = None
+        per_head_active_len: Optional[int] = None
+        prefill_sparse_mode = (prefill_sparse_mode or "none").lower()
+        prefill_delta_mode = (prefill_delta_mode or "none").lower()
+        prefill_delta_selection_mode = (prefill_delta_selection_mode or "none").lower()
+        prefill_delta_direction = (prefill_delta_direction or "left").lower()
+        use_prefill_sparse = prefill_sparse_mode not in {"none", "off", "0", ""}
+        if use_prefill_sparse and prefill_sparse_mode != "eviction_mask":
+            raise ValueError(f"Unsupported prefill_sparse_mode: {prefill_sparse_mode}")
+        if use_prefill_sparse and prompt_keep_indices_per_layer_per_head is None:
+            raise ValueError("prefill_sparse_mode=eviction_mask requires prompt_keep_indices_per_layer_per_head.")
+        if prompt_keep_indices_per_layer_per_head is not None:
+            per_head_keep_indices, per_head_active_len = self._normalize_per_head_keep_indices(
+                prompt_keep_indices_per_layer_per_head,
+                full_prompt_len=len(prompt_ids),
+            )
+            if active_prompt_positions is None:
+                raise ValueError("active_prompt_positions is required for per-head KV eviction.")
+            active_prompt_positions = [int(x) for x in active_prompt_positions]
+            if len(active_prompt_positions) != per_head_active_len:
+                raise ValueError(
+                    "active_prompt_positions length mismatch: "
+                    f"{len(active_prompt_positions)} vs per-head active length {per_head_active_len}"
+                )
+        elif active_prompt_positions is not None:
+            raise ValueError("active_prompt_positions requires prompt_keep_indices_per_layer_per_head.")
+
+        prefill_suffix_pos_start = (max(prompt_positions) + 1) if prompt_positions else 0
+        prefill_suffix_positions = list(range(prefill_suffix_pos_start, prefill_suffix_pos_start + decode_len))
+        if per_head_keep_indices is not None and not use_prefill_sparse:
+            suffix_pos_start = (max(active_prompt_positions) + 1) if active_prompt_positions else 0
+            suffix_positions = list(range(suffix_pos_start, suffix_pos_start + decode_len))
+            prompt_len = int(per_head_active_len or 0)
+            full_prompt_len = len(prompt_ids)
+            kv_mode = "compacted_posthoc_eviction"
+        else:
+            suffix_positions = prefill_suffix_positions
+            prompt_len = len(prompt_ids)
+            full_prompt_len = prompt_len
+            kv_mode = "full_prefill_sparse_delta" if use_prefill_sparse else "full_dense"
+
+        full_len = full_prompt_len + decode_len
+        if full_len > self.config.max_model_len:
+            raise ValueError(
+                f"full_prompt_mask length {full_len} exceeds max_model_len={self.config.max_model_len}"
+            )
+
+        num_prompt_pages = math.ceil(full_prompt_len / self.page_size)
+        num_block_pages = math.ceil(decode_len / self.page_size)
+        use_prefix_cache = per_head_keep_indices is None
+        decode_delta_mode = (decode_delta_mode or "none").lower()
+        decode_delta_state = None
+
+        cached = self._prefix_cache.lookup_prefix(prompt_ids) if use_prefix_cache else None
+        owns_prompt_pages = False
+        if cached is not None:
+            prompt_page_ids = cached.page_ids
+            cached.ref_count += 1
+            last_context_logit = cached.last_context_logit
+            while self._prefix_cache.num_free_pages < num_block_pages:
+                if not self._prefix_cache.evict_one():
+                    break
+            block_page_ids = self._prefix_cache.allocate_pages(num_block_pages)
+            init_logits = self._forward_replace_block_for_init(
+                prompt_len=prompt_len,
+                prompt_page_ids=prompt_page_ids,
+                block_page_ids=block_page_ids,
+                suffix_positions=suffix_positions,
+            )
+            shifted_init = self._shift_logits(init_logits, last_context_logit)
+            _, first_token = self._sample_tokens(shifted_init[:1, :])
+        else:
+            total_pages_needed = num_prompt_pages + num_block_pages
+            while self._prefix_cache.num_free_pages < total_pages_needed:
+                if not self._prefix_cache.evict_one():
+                    break
+            prompt_page_ids = self._prefix_cache.allocate_pages(num_prompt_pages)
+            owns_prompt_pages = not use_prefix_cache
+            block_page_ids = self._prefix_cache.allocate_pages(num_block_pages)
+
+            full_ids = prompt_ids + [self.mask_token_id] * decode_len
+            full_positions = list(prompt_positions) + prefill_suffix_positions
+            prefill_sparse_state = None
+            if use_prefill_sparse:
+                if prefill_delta_mode not in {"none", "off", "0", "", "s4_left3", "delta_s4_left3", "sampled_delta_s4_left3"}:
+                    raise ValueError(f"Unsupported prefill_delta_mode: {prefill_delta_mode}")
+                if prefill_delta_selection_mode not in {"none", "off", "0", "", "selection_dense_replace", "selection_dense_add"}:
+                    raise ValueError(f"Unsupported prefill_delta_selection_mode: {prefill_delta_selection_mode}")
+                if prefill_delta_direction not in {"left", "right", "both"}:
+                    raise ValueError(f"Unsupported prefill_delta_direction: {prefill_delta_direction}")
+                prefill_delta_stride = max(1, int(prefill_delta_stride or 1))
+                prefill_delta_anchor_offset = 0 if prefill_delta_direction == "right" else prefill_delta_stride - 1
+                prefill_sparse_state = {
+                    "enabled": True,
+                    "mode": "eviction_mask",
+                    "keep_indices": per_head_keep_indices,
+                    "full_prompt_len": full_prompt_len,
+                    "delta_mode": prefill_delta_mode,
+                    "stride": prefill_delta_stride,
+                    "left": max(0, int(prefill_delta_left)),
+                    "right": max(0, int(prefill_delta_right)),
+                    "direction": prefill_delta_direction,
+                    "anchor_offset": prefill_delta_anchor_offset,
+                    "scale": float(prefill_delta_scale),
+                    "debug": bool(prefill_delta_debug),
+                    "selection_mode": prefill_delta_selection_mode,
+                    "selection_scale": float(prefill_delta_selection_scale),
+                    "selection_dense": prefill_selection_dense_outputs,
+                }
+            prefill_logits = self._forward_prefill_paged(
+                full_ids,
+                full_positions,
+                prompt_page_ids,
+                block_page_ids,
+                full_prompt_len,
+                prefill_sparse_state=prefill_sparse_state,
+            )
+            if use_prefill_sparse and prefill_sparse_state is not None and prefill_sparse_state.get("debug", False):
+                print(
+                    "[prefill-sparse] "
+                    f"mode={prefill_sparse_state.get('mode')} "
+                    f"delta={prefill_sparse_state.get('delta_mode')} "
+                    f"direction={prefill_sparse_state.get('direction')} "
+                    f"right={prefill_sparse_state.get('right')} "
+                    f"selection={prefill_sparse_state.get('selection_mode')} "
+                    f"calls={prefill_sparse_state.get('calls', 0)} "
+                    f"nonzero_calls={prefill_sparse_state.get('nonzero_calls', 0)} "
+                    f"selection_used_calls={prefill_sparse_state.get('selection_used_calls', 0)} "
+                    f"anchor_count={prefill_sparse_state.get('anchor_count', 0)} "
+                    f"union_min={prefill_sparse_state.get('union_min', 'na')} "
+                    f"union_max={prefill_sparse_state.get('union_max', 'na')} "
+                    f"max_abs={float(prefill_sparse_state.get('max_abs', 0.0)):.6e}",
+                    flush=True,
+                )
+            if per_head_keep_indices is not None and not use_prefill_sparse:
+                if decode_delta_mode in {"s4_left3", "delta_s4_left3", "sampled_delta_s4_left3"}:
+                    full_k, full_v = self._snapshot_prompt_cache_per_layer(prompt_page_ids, full_prompt_len)
+                    stride = max(1, int(decode_delta_stride or 4))
+                    decode_delta_state = {
+                        "enabled": True,
+                        "mode": "s4_left3",
+                        "full_k": full_k,
+                        "full_v": full_v,
+                        "full_prompt_len": full_prompt_len,
+                        "active_prompt_len": int(per_head_active_len or 0),
+                        "stride": stride,
+                        "left": max(0, int(decode_delta_left)),
+                        "anchor_offset": stride - 1,
+                        "scale": float(decode_delta_scale),
+                        "debug": bool(decode_delta_debug),
+                    }
+                elif decode_delta_mode not in {"none", "off", "0", ""}:
+                    raise ValueError(f"Unsupported decode_delta_mode: {decode_delta_mode}")
+                self._compact_prompt_cache_per_layer_per_head(prompt_page_ids, per_head_keep_indices)
+                active_prompt_pages = math.ceil(prompt_len / self.page_size)
+                if active_prompt_pages < len(prompt_page_ids):
+                    self._prefix_cache.release_pages(prompt_page_ids[active_prompt_pages:])
+                    prompt_page_ids = prompt_page_ids[:active_prompt_pages]
+            shifted_prefill = self._shift_logits(prefill_logits)
+            first_logits = shifted_prefill[full_prompt_len:full_prompt_len + 1, :]
+            _, first_token = self._sample_tokens(first_logits)
+            last_context_logit = prefill_logits[full_prompt_len - 1, :].detach() if full_prompt_len > 0 else None
+            if use_prefix_cache:
+                self._prefix_cache.register_prefix(prompt_ids, prompt_page_ids, prompt_len, last_context_logit)
+
+        return DreamPrefillRecord(
+            prompt_ids=prompt_ids,
+            prompt_positions=prompt_positions,
+            suffix_positions=suffix_positions,
+            prompt_len=prompt_len,
+            full_prompt_len=full_prompt_len,
+            decode_len=decode_len,
+            prompt_page_ids=prompt_page_ids,
+            block_page_ids=block_page_ids,
+            first_token_id=int(first_token.reshape(-1)[0].item()),
+            last_context_logit=last_context_logit,
+            decode_delta_state=decode_delta_state,
+            owns_prompt_pages=owns_prompt_pages,
+            cached_prefix=cached,
+            kv_mode=kv_mode,
+        )
+
+    @torch.inference_mode()
+    def decode_from_pd_record(
+        self,
+        record: DreamPrefillRecord,
+        *,
+        max_new_tokens: int,
+        stop_token_ids: Optional[Iterable[int]] = None,
+    ) -> FastDLLMEngineOutput:
+        if max_new_tokens <= 0:
+            return FastDLLMEngineOutput(text="", token_ids=[], n_diff_steps=0)
+        if max_new_tokens > record.decode_len:
+            raise ValueError(
+                f"max_new_tokens={max_new_tokens} exceeds record decode_len={record.decode_len}."
+            )
+
+        block_ids = torch.full((record.decode_len,), self.mask_token_id, dtype=torch.long, device=torch.cuda.current_device())
+        block_ids[0] = int(record.first_token_id)
+        all_page_ids_for_decode = record.prompt_page_ids + record.block_page_ids
+        n_steps = 0
+        previous_delta_state = self._active_decode_delta_state
+        self._active_decode_delta_state = record.decode_delta_state
+        try:
+            try:
+                while bool((block_ids == self.mask_token_id).any()):
+                    n_steps += 1
+                    mask_index = block_ids == self.mask_token_id
+                    logits = self._forward_replace_block_paged(
+                        block_ids,
+                        prompt_len=record.prompt_len,
+                        block_page_ids=record.block_page_ids,
+                        all_page_ids=all_page_ids_for_decode,
+                        block_positions=record.suffix_positions,
+                    )
+                    shifted_logits = self._shift_logits(logits, record.last_context_logit)
+                    confidence, sampled = self._sample_tokens(shifted_logits[mask_index])
+
+                    candidate = torch.full_like(block_ids, self.mask_token_id)
+                    candidate[mask_index] = sampled
+                    full_confidence = torch.full_like(block_ids, -torch.inf, dtype=confidence.dtype)
+                    full_confidence[mask_index] = confidence
+                    transfer_count = int(mask_index.sum().item())
+                    selected_confidence, select_index = torch.topk(full_confidence, transfer_count)
+                    transfer_index = torch.zeros_like(block_ids, dtype=torch.bool)
+                    transfer_index[select_index[0]] = True
+                    for idx in range(1, transfer_count):
+                        if selected_confidence[idx] >= self.threshold:
+                            transfer_index[select_index[idx]] = True
+                    block_ids[transfer_index] = candidate[transfer_index]
+            finally:
+                self._active_decode_delta_state = previous_delta_state
+
+            decode_delta_state = record.decode_delta_state
+            if decode_delta_state is not None and decode_delta_state.get("debug", False):
+                print(
+                    "[decode-delta] "
+                    f"mode={decode_delta_state.get('mode')} "
+                    f"calls={decode_delta_state.get('calls', 0)} "
+                    f"nonzero_calls={decode_delta_state.get('nonzero_calls', 0)} "
+                    f"anchor_count={decode_delta_state.get('anchor_count', 0)} "
+                    f"max_abs={float(decode_delta_state.get('max_abs', 0.0)):.6e}",
+                    flush=True,
+                )
+
+            generated = block_ids[:max_new_tokens].tolist()
+            if stop_token_ids:
+                stop_set = set(int(x) for x in stop_token_ids)
+                for idx, token_id in enumerate(generated):
+                    if token_id in stop_set:
+                        generated = generated[:idx]
+                        break
+            text = self.tokenizer.decode(generated, skip_special_tokens=False)
+            eos = getattr(self.tokenizer, "eos_token", None)
+            if eos and eos in text:
+                text = text.split(eos)[0]
+            return FastDLLMEngineOutput(text=text, token_ids=generated, n_diff_steps=n_steps)
+        finally:
+            self._prefix_cache.release_pages(record.block_page_ids)
+            if record.owns_prompt_pages:
+                self._prefix_cache.release_pages(record.prompt_page_ids)
+            if record.cached_prefix is not None:
+                record.cached_prefix.ref_count -= 1
+
+    def release_pd_record(self, record: DreamPrefillRecord) -> None:
+        """Release KV pages held by a prefill record that will not be decoded."""
+        self._prefix_cache.release_pages(record.block_page_ids)
+        if record.owns_prompt_pages:
+            self._prefix_cache.release_pages(record.prompt_page_ids)
+        if record.cached_prefix is not None:
+            record.cached_prefix.ref_count -= 1
+
+    @torch.inference_mode()
+    def generate_token_ids_pd_split(
+        self,
+        prompt_ids: Sequence[int],
+        *,
+        max_new_tokens: int,
+        prompt_positions: Optional[Sequence[int]] = None,
+        active_prompt_positions: Optional[Sequence[int]] = None,
+        prompt_keep_indices_per_layer_per_head: Optional[Sequence[Sequence[Sequence[int]]]] = None,
+        decode_delta_mode: str = "none",
+        decode_delta_stride: int = 4,
+        decode_delta_left: int = 3,
+        decode_delta_scale: float = 1.0,
+        decode_delta_debug: bool = False,
+        prefill_sparse_mode: str = "none",
+        prefill_delta_mode: str = "none",
+        prefill_delta_stride: int = 8,
+        prefill_delta_left: int = 7,
+        prefill_delta_right: int = 0,
+        prefill_delta_direction: str = "left",
+        prefill_delta_scale: float = 1.0,
+        prefill_delta_debug: bool = False,
+        prefill_delta_selection_mode: str = "none",
+        prefill_delta_selection_scale: float = 1.0,
+        prefill_selection_dense_outputs: Optional[dict] = None,
+        stop_token_ids: Optional[Iterable[int]] = None,
+    ) -> FastDLLMEngineOutput:
+        """Generate through the explicit prefill/decode PD boundary."""
+        record = self.prefill_to_pd_record(
+            prompt_ids,
+            max_new_tokens=max_new_tokens,
+            prompt_positions=prompt_positions,
+            active_prompt_positions=active_prompt_positions,
+            prompt_keep_indices_per_layer_per_head=prompt_keep_indices_per_layer_per_head,
+            decode_delta_mode=decode_delta_mode,
+            decode_delta_stride=decode_delta_stride,
+            decode_delta_left=decode_delta_left,
+            decode_delta_scale=decode_delta_scale,
+            decode_delta_debug=decode_delta_debug,
+            prefill_sparse_mode=prefill_sparse_mode,
+            prefill_delta_mode=prefill_delta_mode,
+            prefill_delta_stride=prefill_delta_stride,
+            prefill_delta_left=prefill_delta_left,
+            prefill_delta_right=prefill_delta_right,
+            prefill_delta_direction=prefill_delta_direction,
+            prefill_delta_scale=prefill_delta_scale,
+            prefill_delta_debug=prefill_delta_debug,
+            prefill_delta_selection_mode=prefill_delta_selection_mode,
+            prefill_delta_selection_scale=prefill_delta_selection_scale,
+            prefill_selection_dense_outputs=prefill_selection_dense_outputs,
+        )
+        return self.decode_from_pd_record(
+            record,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+        )
+
+    @torch.inference_mode()
     def generate_token_ids(
         self,
         prompt_ids: Sequence[int],
@@ -1489,6 +2268,17 @@ class FastDLLMDreamEngine:
         decode_delta_left: int = 3,
         decode_delta_scale: float = 1.0,
         decode_delta_debug: bool = False,
+        prefill_sparse_mode: str = "none",
+        prefill_delta_mode: str = "none",
+        prefill_delta_stride: int = 8,
+        prefill_delta_left: int = 7,
+        prefill_delta_right: int = 0,
+        prefill_delta_direction: str = "left",
+        prefill_delta_scale: float = 1.0,
+        prefill_delta_debug: bool = False,
+        prefill_delta_selection_mode: str = "none",
+        prefill_delta_selection_scale: float = 1.0,
+        prefill_selection_dense_outputs: Optional[dict] = None,
         stop_token_ids: Optional[Iterable[int]] = None,
     ) -> FastDLLMEngineOutput:
         if max_new_tokens <= 0:
@@ -1512,6 +2302,15 @@ class FastDLLMDreamEngine:
 
         per_head_keep_indices: Optional[List[torch.Tensor]] = None
         per_head_active_len: Optional[int] = None
+        prefill_sparse_mode = (prefill_sparse_mode or "none").lower()
+        prefill_delta_mode = (prefill_delta_mode or "none").lower()
+        prefill_delta_selection_mode = (prefill_delta_selection_mode or "none").lower()
+        prefill_delta_direction = (prefill_delta_direction or "left").lower()
+        use_prefill_sparse = prefill_sparse_mode not in {"none", "off", "0", ""}
+        if use_prefill_sparse and prefill_sparse_mode != "eviction_mask":
+            raise ValueError(f"Unsupported prefill_sparse_mode: {prefill_sparse_mode}")
+        if use_prefill_sparse and prompt_keep_indices_per_layer_per_head is None:
+            raise ValueError("prefill_sparse_mode=eviction_mask requires prompt_keep_indices_per_layer_per_head.")
         if prompt_keep_indices_per_layer_per_head is not None:
             per_head_keep_indices, per_head_active_len = self._normalize_per_head_keep_indices(
                 prompt_keep_indices_per_layer_per_head,
@@ -1530,7 +2329,7 @@ class FastDLLMDreamEngine:
 
         prefill_suffix_pos_start = (max(prompt_positions) + 1) if prompt_positions else 0
         prefill_suffix_positions = list(range(prefill_suffix_pos_start, prefill_suffix_pos_start + decode_len))
-        if per_head_keep_indices is not None:
+        if per_head_keep_indices is not None and not use_prefill_sparse:
             suffix_pos_start = (max(active_prompt_positions) + 1) if active_prompt_positions else 0
             suffix_positions = list(range(suffix_pos_start, suffix_pos_start + decode_len))
             prompt_len = int(per_head_active_len or 0)
@@ -1581,10 +2380,59 @@ class FastDLLMDreamEngine:
 
             full_ids = prompt_ids + [self.mask_token_id] * decode_len
             full_positions = list(prompt_positions) + prefill_suffix_positions
+            prefill_sparse_state = None
+            if use_prefill_sparse:
+                if prefill_delta_mode not in {"none", "off", "0", "", "s4_left3", "delta_s4_left3", "sampled_delta_s4_left3"}:
+                    raise ValueError(f"Unsupported prefill_delta_mode: {prefill_delta_mode}")
+                if prefill_delta_selection_mode not in {"none", "off", "0", "", "selection_dense_replace", "selection_dense_add"}:
+                    raise ValueError(f"Unsupported prefill_delta_selection_mode: {prefill_delta_selection_mode}")
+                if prefill_delta_direction not in {"left", "right", "both"}:
+                    raise ValueError(f"Unsupported prefill_delta_direction: {prefill_delta_direction}")
+                prefill_delta_stride = max(1, int(prefill_delta_stride or 1))
+                prefill_delta_anchor_offset = 0 if prefill_delta_direction == "right" else prefill_delta_stride - 1
+                prefill_sparse_state = {
+                    "enabled": True,
+                    "mode": "eviction_mask",
+                    "keep_indices": per_head_keep_indices,
+                    "full_prompt_len": full_prompt_len,
+                    "delta_mode": prefill_delta_mode,
+                    "stride": prefill_delta_stride,
+                    "left": max(0, int(prefill_delta_left)),
+                    "right": max(0, int(prefill_delta_right)),
+                    "direction": prefill_delta_direction,
+                    "anchor_offset": prefill_delta_anchor_offset,
+                    "scale": float(prefill_delta_scale),
+                    "debug": bool(prefill_delta_debug),
+                    "selection_mode": prefill_delta_selection_mode,
+                    "selection_scale": float(prefill_delta_selection_scale),
+                    "selection_dense": prefill_selection_dense_outputs,
+                }
             prefill_logits = self._forward_prefill_paged(
-                full_ids, full_positions, prompt_page_ids, block_page_ids, full_prompt_len
+                full_ids,
+                full_positions,
+                prompt_page_ids,
+                block_page_ids,
+                full_prompt_len,
+                prefill_sparse_state=prefill_sparse_state,
             )
-            if per_head_keep_indices is not None:
+            if use_prefill_sparse and prefill_sparse_state is not None and prefill_sparse_state.get("debug", False):
+                print(
+                    "[prefill-sparse] "
+                    f"mode={prefill_sparse_state.get('mode')} "
+                    f"delta={prefill_sparse_state.get('delta_mode')} "
+                    f"direction={prefill_sparse_state.get('direction')} "
+                    f"right={prefill_sparse_state.get('right')} "
+                    f"selection={prefill_sparse_state.get('selection_mode')} "
+                    f"calls={prefill_sparse_state.get('calls', 0)} "
+                    f"nonzero_calls={prefill_sparse_state.get('nonzero_calls', 0)} "
+                    f"selection_used_calls={prefill_sparse_state.get('selection_used_calls', 0)} "
+                    f"anchor_count={prefill_sparse_state.get('anchor_count', 0)} "
+                    f"union_min={prefill_sparse_state.get('union_min', 'na')} "
+                    f"union_max={prefill_sparse_state.get('union_max', 'na')} "
+                    f"max_abs={float(prefill_sparse_state.get('max_abs', 0.0)):.6e}",
+                    flush=True,
+                )
+            if per_head_keep_indices is not None and not use_prefill_sparse:
                 if decode_delta_mode in {"s4_left3", "delta_s4_left3", "sampled_delta_s4_left3"}:
                     full_k, full_v = self._snapshot_prompt_cache_per_layer(prompt_page_ids, full_prompt_len)
                     stride = max(1, int(decode_delta_stride or 4))

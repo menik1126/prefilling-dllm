@@ -3,6 +3,7 @@ from transformers import AutoModel, AutoTokenizer
 from peft import LoraConfig,get_peft_model
 from model.modeling_llada import LLaDAModelLM
 from model.configuration_llada import LLaDAConfig
+from utils.sparse_dream import install_sparse_prefill_patch
 
 def get_model_by_config(config):
     """Select different models based on config file"""
@@ -10,8 +11,15 @@ def get_model_by_config(config):
     
     if training_mode == 'llada':
         return get_llada(config)
-    elif training_mode == 'dream':
-        return get_model(config)
+    elif training_mode in {'dream', 'dream_full_long'}:
+        model, tokenizer = get_model(config)
+        if training_mode == 'dream_full_long':
+            install_sparse_prefill_patch(model)
+            model.gradient_checkpointing_enable()
+            if hasattr(model, 'enable_input_require_grads'):
+                model.enable_input_require_grads()
+            model.config.use_cache = False
+        return model, tokenizer
     else:
         raise ValueError(f"Unsupported training mode: {training_mode}")
 

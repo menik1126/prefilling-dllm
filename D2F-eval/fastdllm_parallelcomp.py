@@ -84,6 +84,7 @@ class FastDLLMParallelCompConfig:
     score_llada_shift_logits: bool = False
     score_attention_mask: str = "causal"
     score_context_mode: str = "single_chunk"
+    score_batch_size: int = 8
     attention_score_layers: int = 4
     attention_query_window: int = 0
 
@@ -1310,6 +1311,117 @@ class FastDLLMParallelComp:
             attention_mask=attention_mask,
         )
 
+    def score_chunks_self_information_batched(
+        self,
+        prefix_ids: Sequence[int],
+        candidate_chunks: Sequence[Sequence[int]],
+        query_ids: Sequence[int],
+        score_token_count: Optional[int] = None,
+        score_token_mask: Optional[Sequence[bool]] = None,
+    ) -> Dict[int, float]:
+        if self.model_backend == "llada" and not self.config.score_llada_shift_logits:
+            return {
+                idx: self.score_chunk_self_information(
+                    prefix_ids,
+                    chunk_ids,
+                    query_ids,
+                    score_token_count=score_token_count,
+                    score_token_mask=score_token_mask,
+                )
+                for idx, chunk_ids in enumerate(candidate_chunks)
+            }
+
+        if score_token_count is None and score_token_mask is None:
+            query_ids = self._window_query(query_ids, self.config.score_query_window)
+        else:
+            query_ids = list(query_ids)
+        prefix_ids = list(prefix_ids)
+        if not query_ids:
+            return {idx: float("-inf") for idx in range(len(candidate_chunks))}
+
+        prefix_len = len(prefix_ids)
+        query_len = len(query_ids)
+        scores: Dict[int, float] = {}
+        groups: Dict[int, List[Tuple[int, List[int]]]] = {}
+        for idx, chunk_ids in enumerate(candidate_chunks):
+            chunk_ids = list(chunk_ids)
+            if not chunk_ids:
+                scores[idx] = float("-inf")
+                continue
+            groups.setdefault(len(chunk_ids), []).append((idx, chunk_ids))
+
+        batch_size = max(1, int(self.config.score_batch_size or 1))
+        for chunk_len, group in groups.items():
+            joint_len = prefix_len + chunk_len + query_len
+            attention_mask = self._attention_mask(
+                self.config.score_attention_mask,
+                q_len=joint_len,
+                key_len=joint_len,
+                prefix_len=prefix_len,
+                chunk_len=chunk_len,
+                query_len=query_len,
+                current_only=False,
+            )
+            if score_token_mask is not None:
+                if len(score_token_mask) != query_len:
+                    for idx, _ in group:
+                        scores[idx] = float("-inf")
+                    continue
+                local_indices = [idx for idx, keep in enumerate(score_token_mask) if keep]
+                if not local_indices:
+                    for idx, _ in group:
+                        scores[idx] = float("-inf")
+                    continue
+                label_positions = [prefix_len + chunk_len + idx for idx in local_indices]
+                label_ids = [query_ids[idx] for idx in local_indices]
+            elif score_token_count is None:
+                window = min(query_len, self.config.score_query_window or query_len)
+                start = prefix_len + chunk_len + query_len - window
+                end = prefix_len + chunk_len + query_len
+                label_positions = list(range(start, end))
+                label_ids = query_ids[-window:]
+            else:
+                target_len = min(query_len, max(0, int(score_token_count)))
+                if target_len <= 0:
+                    for idx, _ in group:
+                        scores[idx] = float("-inf")
+                    continue
+                start = prefix_len + chunk_len
+                end = start + target_len
+                label_positions = list(range(start, end))
+                label_ids = query_ids[:target_len]
+
+            positions = torch.tensor(label_positions, device=self.device, dtype=torch.long)
+            if int(positions.min().item()) <= 0:
+                for idx, _ in group:
+                    scores[idx] = float("-inf")
+                continue
+            labels = torch.tensor(label_ids, device=self.device, dtype=torch.long)
+            for offset in range(0, len(group), batch_size):
+                batch = group[offset:offset + batch_size]
+                rows = [prefix_ids + chunk_ids + list(query_ids) for _, chunk_ids in batch]
+                with torch.inference_mode():
+                    outputs = self._model_forward(
+                        self._ids_batch_tensor(rows),
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                logits = outputs.logits
+                if int(positions.max().item()) - 1 >= logits.shape[1]:
+                    for idx, _ in batch:
+                        scores[idx] = float("-inf")
+                    continue
+                query_logits = logits.index_select(1, positions - 1)
+                log_probs = F.log_softmax(query_logits.float(), dim=-1)
+                label_tensor = labels.view(1, -1, 1).expand(log_probs.shape[0], -1, 1)
+                token_nll = -log_probs.gather(dim=-1, index=label_tensor).squeeze(-1)
+                batch_scores = -token_nll.mean(dim=-1)
+                for (idx, _), score in zip(batch, batch_scores):
+                    value = float(score.item())
+                    scores[idx] = value if math.isfinite(value) else float("-inf")
+        return scores
+
     def score_chunk_self_information_joint_chunks(
         self,
         prefix_ids: Sequence[int],
@@ -1762,7 +1874,23 @@ class FastDLLMParallelComp:
             return selected, {}, selection_query_ids, score_token_mask
 
         scores: Dict[int, float] = {}
+        if (
+            self.config.score_mode in {"self_information", "draft_self_information"}
+            and self.config.score_context_mode == "single_chunk"
+            and int(self.config.score_batch_size or 1) > 1
+        ):
+            scores.update(
+                self.score_chunks_self_information_batched(
+                    prefix_ids,
+                    candidate_chunks,
+                    selection_query_ids,
+                    score_token_count=score_token_count,
+                    score_token_mask=score_token_mask,
+                )
+            )
         for idx, chunk_ids in enumerate(candidate_chunks):
+            if idx in scores:
+                continue
             if self.config.score_mode in {"self_information", "draft_self_information"}:
                 if self.config.score_context_mode == "single_chunk":
                     score = self.score_chunk_self_information(

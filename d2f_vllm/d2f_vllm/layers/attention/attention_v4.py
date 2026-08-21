@@ -110,6 +110,8 @@ class Attention(nn.Module):
         _, num_heads, seq_len, _ = q_t.shape
         stride = max(1, int(state.get("stride", 4)))
         left = max(0, int(state.get("left", stride - 1)))
+        right = max(0, int(state.get("right", 0)))
+        direction = (state.get("direction") or "left").lower()
         anchor_offset = int(state.get("anchor_offset", stride - 1))
         if seq_len <= 0:
             return o
@@ -146,10 +148,149 @@ class Attention(nn.Module):
 
         correction = torch.zeros_like(o)
         for delta_idx, anchor in enumerate(anchors.tolist()):
-            start = max(0, int(anchor) - left)
-            rows = torch.arange(start, int(anchor) + 1, device=q_t.device, dtype=torch.long)
+            if direction == "right":
+                end = min(seq_len - 1, int(anchor) + right)
+                rows = torch.arange(int(anchor), end + 1, device=q_t.device, dtype=torch.long)
+            elif direction == "both":
+                start = max(0, int(anchor) - left)
+                end = min(seq_len - 1, int(anchor) + right)
+                rows = torch.arange(start, end + 1, device=q_t.device, dtype=torch.long)
+            else:
+                start = max(0, int(anchor) - left)
+                rows = torch.arange(start, int(anchor) + 1, device=q_t.device, dtype=torch.long)
             correction[:, :, rows, :] += delta[:, :, delta_idx:delta_idx + 1, :]
         return o + correction
+
+    def _maybe_prefill_sparse_attention(
+        self,
+        q_t: torch.Tensor,
+        k_t: torch.Tensor,
+        v_t: torch.Tensor,
+        context: ContextForDiffusionLM,
+    ) -> torch.Tensor | None:
+        state = getattr(context, "prefill_sparse_state", None)
+        if not state or not state.get("enabled", False):
+            return None
+        if self.model_type != "diffusion_lm" or self.layer_idx < 0:
+            return None
+        keep_by_layer = state.get("keep_indices")
+        if keep_by_layer is None or self.layer_idx >= len(keep_by_layer):
+            return None
+        base_mask = context.block_mask
+        if base_mask is None:
+            return None
+
+        _, num_heads, seq_len, _ = q_t.shape
+        layer_keep = keep_by_layer[self.layer_idx]
+        if layer_keep is None or layer_keep.numel() == 0:
+            return None
+        layer_keep = layer_keep.to(device=q_t.device, dtype=torch.long)
+        key_mask = torch.zeros(seq_len, dtype=torch.bool, device=q_t.device)
+        valid_keep = layer_keep.reshape(-1)
+        valid_keep = valid_keep[(valid_keep >= 0) & (valid_keep < seq_len)]
+        if valid_keep.numel() == 0:
+            return None
+        key_mask[valid_keep] = True
+        full_prompt_len = int(state.get("full_prompt_len", seq_len))
+        if 0 <= full_prompt_len < seq_len:
+            key_mask[full_prompt_len:] = True
+        if state.get("debug", False):
+            active_keys = int(key_mask.sum().item())
+            state["union_min"] = min(int(state.get("union_min", active_keys)), active_keys)
+            state["union_max"] = max(int(state.get("union_max", active_keys)), active_keys)
+
+        sparse_dense_mask = base_mask.to(device=q_t.device, dtype=torch.bool) & key_mask.unsqueeze(0)
+        block_mask = self.dllm_block_mask(sparse_dense_mask, 1, num_heads, seq_len, seq_len, str(q_t.device))
+        o_sparse = self._attention_forward(q_t, k_t, v_t, block_mask=block_mask, dense_mask=sparse_dense_mask)
+
+        delta_mode = (state.get("delta_mode") or "none").lower()
+        if delta_mode in {"none", "off", "0", ""}:
+            return o_sparse
+        if delta_mode not in {"s4_left3", "delta_s4_left3", "sampled_delta_s4_left3"}:
+            raise ValueError(f"Unsupported prefill_delta_mode: {delta_mode}")
+
+        stride = max(1, int(state.get("stride", 4)))
+        left = max(0, int(state.get("left", stride - 1)))
+        right = max(0, int(state.get("right", 0)))
+        direction = (state.get("direction") or "left").lower()
+        anchor_offset = int(state.get("anchor_offset", stride - 1))
+        if anchor_offset < 0:
+            anchor_offset = stride - 1
+        anchor_offset = min(anchor_offset, stride - 1)
+        anchors = torch.arange(anchor_offset, seq_len, stride, device=q_t.device, dtype=torch.long)
+        if anchors.numel() == 0:
+            return o_sparse
+
+        sparse_anchor = o_sparse.index_select(2, anchors)
+        selection_mode = (state.get("selection_mode") or "none").lower()
+        selection_dense = state.get("selection_dense")
+        selection_anchor = None
+        selection_valid = None
+        if selection_mode in {"selection_dense_replace", "selection_dense_add"} and selection_dense:
+            outputs_by_layer = selection_dense.get("outputs") if isinstance(selection_dense, dict) else None
+            counts_by_layer = selection_dense.get("counts") if isinstance(selection_dense, dict) else None
+            if outputs_by_layer is not None and self.layer_idx < len(outputs_by_layer):
+                layer_outputs = outputs_by_layer[self.layer_idx]
+                layer_counts = counts_by_layer[self.layer_idx] if counts_by_layer is not None and self.layer_idx < len(counts_by_layer) else None
+                if layer_outputs is not None:
+                    layer_outputs = layer_outputs.to(device=q_t.device, dtype=o_sparse.dtype)
+                    if layer_outputs.shape[0] > 0 and layer_outputs.shape[1] == num_heads:
+                        in_range = anchors < int(layer_outputs.shape[0])
+                        safe_anchors = anchors.clamp_max(int(layer_outputs.shape[0]) - 1)
+                        selection_anchor = torch.zeros_like(sparse_anchor)
+                        selected_rows = layer_outputs.index_select(0, safe_anchors)
+                        selected_rows = rearrange(selected_rows, 's h d -> 1 h s d').contiguous()
+                        selection_anchor[:, :, in_range, :] = selected_rows[:, :, in_range, :]
+                        if layer_counts is not None:
+                            safe_counts = layer_counts.to(device=q_t.device).index_select(0, safe_anchors)
+                            selection_valid = (safe_counts > 0) & in_range
+                        else:
+                            selection_valid = in_range
+
+        need_dense_anchor = selection_mode != "selection_dense_replace"
+        dense_anchor = None
+        if need_dense_anchor:
+            q_anchor = q_t.index_select(2, anchors)
+            dense_mask = base_mask.to(device=q_t.device, dtype=torch.bool).index_select(0, anchors)
+            dense_block_mask = self.dllm_block_mask(
+                dense_mask, 1, num_heads, int(anchors.numel()), seq_len, str(q_t.device)
+            )
+            dense_anchor = self._attention_forward(q_anchor, k_t, v_t, block_mask=dense_block_mask, dense_mask=dense_mask)
+
+        if selection_mode == "selection_dense_replace":
+            if selection_anchor is None or selection_valid is None or not bool(selection_valid.any().item()):
+                return o_sparse
+            delta = (selection_anchor - sparse_anchor) * float(state.get("scale", 1.0))
+            delta = delta * selection_valid.view(1, 1, -1, 1).to(dtype=delta.dtype)
+            state["selection_used_calls"] = int(state.get("selection_used_calls", 0)) + 1
+        else:
+            delta = (dense_anchor - sparse_anchor) * float(state.get("scale", 1.0))
+            if selection_mode == "selection_dense_add" and selection_anchor is not None and selection_valid is not None:
+                selection_delta = (selection_anchor - dense_anchor) * float(state.get("selection_scale", 1.0))
+                selection_delta = selection_delta * selection_valid.view(1, 1, -1, 1).to(dtype=selection_delta.dtype)
+                delta = delta + selection_delta
+                state["selection_used_calls"] = int(state.get("selection_used_calls", 0)) + 1
+        if state.get("debug", False):
+            delta_abs_max = float(delta.abs().max().item()) if delta.numel() else 0.0
+            state["calls"] = int(state.get("calls", 0)) + 1
+            state["nonzero_calls"] = int(state.get("nonzero_calls", 0)) + int(delta_abs_max > 0.0)
+            state["max_abs"] = max(float(state.get("max_abs", 0.0)), delta_abs_max)
+            state["anchor_count"] = int(state.get("anchor_count", 0)) + int(anchors.numel())
+
+        correction = torch.zeros_like(o_sparse)
+        for delta_idx, anchor in enumerate(anchors.tolist()):
+            if direction == "right":
+                end = min(seq_len - 1, int(anchor) + right)
+                rows = torch.arange(int(anchor), end + 1, device=q_t.device, dtype=torch.long)
+            elif direction == "both":
+                start = max(0, int(anchor) - left)
+                end = min(seq_len - 1, int(anchor) + right)
+                rows = torch.arange(start, end + 1, device=q_t.device, dtype=torch.long)
+            else:
+                start = max(0, int(anchor) - left)
+                rows = torch.arange(start, int(anchor) + 1, device=q_t.device, dtype=torch.long)
+            correction[:, :, rows, :] += delta[:, :, delta_idx:delta_idx + 1, :]
+        return o_sparse + correction
     
     @lru_cache(maxsize=32)
     def causal_lm_block_mask(self, cum_seq_lens: torch.Tensor, B: int, H: int, Q_LEN: int, KV_LEN: int, device: str):
@@ -221,7 +362,9 @@ class Attention(nn.Module):
                 block_mask_fn = self.causal_lm_block_mask if self.model_type == 'causal_lm' else self.dllm_block_mask
                 input_obj = context.cu_seqlens_q if self.model_type == 'causal_lm' else context.block_mask
                 block_mask = block_mask_fn(input_obj, B, H, S, S, str(q.device))
-                o = self._attention_forward(q_t, k_t, v_t, block_mask=block_mask, dense_mask=input_obj)
+                o = self._maybe_prefill_sparse_attention(q_t, k_t, v_t, context)
+                if o is None:
+                    o = self._attention_forward(q_t, k_t, v_t, block_mask=block_mask, dense_mask=input_obj)
         else:
             if self.model_type == 'causal_lm':
                 o = causal_lm_flash_decoding(

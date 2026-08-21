@@ -5,6 +5,124 @@ from peft import PeftModel, PeftConfig, get_peft_model
 import torch
 import json
 import re
+
+
+ROLE_ALIASES = {
+    "human": "user",
+    "gpt": "assistant",
+}
+
+
+def _normalise_messages(messages):
+    """Convert LongAlign's conversational records to tokenizer chat roles."""
+    normalised = []
+    for message in messages:
+        role = ROLE_ALIASES.get(message["role"], message["role"])
+        content = message.get("content", "")
+        if role in {"system", "user", "assistant"} and content:
+            normalised.append({"role": role, "content": content})
+    return normalised
+
+
+class LongAlignCollator:
+    """Create dynamically padded full-diffusion SFT batches from LongAlign messages."""
+
+    def __init__(self, tokenizer, max_length, max_answer_tokens):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.max_answer_tokens = max_answer_tokens
+
+    def _tokenize_example(self, example):
+        messages = _normalise_messages(example["messages"])
+        answer_index = next(
+            (index for index in range(len(messages) - 1, -1, -1)
+             if messages[index]["role"] == "assistant"),
+            None,
+        )
+        if answer_index is None:
+            raise ValueError("LongAlign example has no assistant response.")
+
+        prompt_messages = messages[:answer_index]
+        answer = messages[answer_index]["content"]
+        prompt_ids = self.tokenizer.apply_chat_template(
+            prompt_messages,
+            return_tensors="pt",
+            return_dict=True,
+            add_generation_prompt=True,
+        ).input_ids[0]
+        answer_ids = self.tokenizer(
+            answer, add_special_tokens=False, return_tensors="pt"
+        ).input_ids[0]
+
+        answer_limit = min(self.max_answer_tokens, self.max_length)
+        answer_ids = answer_ids[:answer_limit]
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None:
+            raise ValueError("tokenizer does not define eos_token_id")
+        if answer_ids.numel() == 0 or answer_ids[-1].item() != eos_token_id:
+            if answer_ids.numel() == answer_limit:
+                answer_ids[-1] = eos_token_id
+            else:
+                answer_ids = torch.cat(
+                    [answer_ids, torch.tensor([eos_token_id], dtype=answer_ids.dtype)]
+                )
+
+        prompt_budget = self.max_length - answer_ids.numel()
+        if prompt_budget <= 0:
+            prompt_ids = prompt_ids[:0]
+        else:
+            # Preserve the query at the end of a long prompt.
+            prompt_ids = prompt_ids[-prompt_budget:]
+        input_ids = torch.cat([prompt_ids, answer_ids])
+        return input_ids, prompt_ids.numel()
+
+    def __call__(self, batch):
+        encoded_examples = [self._tokenize_example(example) for example in batch]
+        sequence_lengths = torch.tensor(
+            [input_ids.numel() for input_ids, _ in encoded_examples], dtype=torch.long
+        )
+        question_lengths = torch.tensor(
+            [prompt_length for _, prompt_length in encoded_examples], dtype=torch.long
+        )
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+
+        batch_width = sequence_lengths.max().item()
+        padded = torch.full(
+            (len(encoded_examples), batch_width),
+            pad_token_id,
+            dtype=torch.long,
+        )
+        for row, (input_ids, _) in enumerate(encoded_examples):
+            padded[row, :input_ids.numel()] = input_ids
+        return {
+            "data": padded,
+            "question_length": question_lengths,
+            "sequence_length": sequence_lengths,
+        }
+
+
+def get_longalign_dataloader(tokenizer, config, max_length):
+    """Load LongAlign's public conversational SFT data lazily."""
+    global_config = getattr(config, "_parent", config)
+    dataset_path = global_config.paths.data.longalign
+    split = global_config.paths.data.get("longalign_split", "train")
+    dataset = load_dataset(dataset_path, split=split)
+    max_answer_tokens = config.get("max_answer_tokens", max_length)
+
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        collate_fn=LongAlignCollator(
+            tokenizer=tokenizer,
+            max_length=max_length,
+            max_answer_tokens=max_answer_tokens,
+        ),
+        num_workers=config.get("num_workers", 0),
+        shuffle=True,
+        pin_memory=True,
+    )
 def extract_answer(text):
     pattern = r"<\|begin_of_solution\|>(.*?)<\|end_of_solution\|>"
     match = re.search(pattern, text, re.DOTALL)
@@ -309,5 +427,7 @@ def get_dataloader_by_config(tokenizer, config, global_config=None, max_length=1
         return get_llada_bs17k_dataloader(tokenizer, config, max_length)
     elif training_mode == 'dream':
         return get_bs17k_dataloader(tokenizer, config, max_length)
+    elif training_mode == 'dream_full_long':
+        return get_longalign_dataloader(tokenizer, config, max_length)
     else:
         raise ValueError(f"Unsupported training mode: {training_mode}")
