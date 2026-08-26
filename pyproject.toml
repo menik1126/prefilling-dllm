@@ -1,0 +1,24 @@
+[project]
+name = "prefilling-dllm"
+version = "0.1.0"
+description = "Predictive prefilling and prefill-decode disaggregation for diffusion language models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.9.1",
+    "transformers==4.49.0",
+    "accelerate==0.34.2",
+    "peft==0.18.1",
+    "omegaconf==2.3.0",
+    "lm_eval==0.4.8",
+    "datasets==4.8.4",
+    "numpy==2.2.6",
+    "tqdm==4.67.3",
+    "packaging==26.0",
+    "antlr4-python3-runtime==4.11.0",
+    "math_verify==0.9.0",
+    "sympy==1.14.0",
+    "hf_xet==1.4.3",
+    "pydantic==2.10.6",
+    "gradio==6.11.0",
+]

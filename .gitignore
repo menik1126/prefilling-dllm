@@ -1,0 +1,30 @@
+evals_*
+*.pyc
+
+# Python / OS artifacts
+__pycache__/
+*.py[cod]
+.DS_Store
+._*
+D2F-eval/._*
+
+# Local model/data artifacts
+D2F-eval/model_weights/
+D2F-eval/model_cache/
+D2F-eval/data_*/
+D2F-eval/tasks/
+D2F-eval/tmp_*/
+D2F-eval/logs/
+D2F-eval/results*/
+D2F-eval/evals_*/
+d2f_vllm/log/
+d2f_vllm/model_weights/
+results*/
+logs/
+backups*/
+nano-vllm
+
+# Local external checkouts and generated artifacts
+DeepSeek-V3/
+SeerAttention/
+Sparse-LaViDa/

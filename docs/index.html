@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Prefilling-dLLM is the first dLLM inference engine with native prefill-decode disaggregation.">
+  <meta property="og:title" content="Prefilling-dLLM: Predictive Prefilling for Long-Context Inference in Diffusion Language Models">
+  <meta property="og:description" content="Predictive prefilling and native PD disaggregation for fast long-context dLLM inference.">
+  <title>Prefilling-dLLM</title>
+  <style>
+    :root { color-scheme: light dark; --accent: #6c63ff; --width: 900px; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 17px/1.65 system-ui, sans-serif; }
+    main { max-width: var(--width); margin: 0 auto; padding: 72px 24px; }
+    header { text-align: center; margin-bottom: 64px; }
+    h1 { font-size: clamp(2rem, 6vw, 4rem); line-height: 1.08; margin: 0 0 20px; }
+    h2 { margin-top: 48px; }
+    .venue, .first { font-weight: 700; color: var(--accent); }
+    .authors { margin: 18px auto; max-width: 760px; }
+    .links { display: flex; justify-content: center; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+    .links a { color: white; background: var(--accent); padding: 10px 18px; border-radius: 9px; text-decoration: none; font-weight: 700; }
+    .card { border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 14px; padding: 22px; margin: 20px 0; }
+    code { white-space: pre-wrap; }
+    footer { margin-top: 64px; text-align: center; opacity: .72; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="venue">Accepted to EMNLP 2026</div>
+    <h1>Prefilling-dLLM</h1>
+    <p>Predictive Prefilling for Long-Context Inference in Diffusion Language Models</p>
+    <p class="first">The first dLLM inference engine with native prefill–decode disaggregation.</p>
+    <p class="authors">Jing Xiong · Qi Han · Shansan Gong · Yunta Hsieh · Chengyue Wu · Chaofan Tao · Chenyang Zhao · Ngai Wong</p>
+    <nav class="links">
+      <a href="https://arxiv.org/abs/2606.10537">Paper</a>
+      <a href="https://arxiv.org/pdf/2606.10537">PDF</a>
+      <a href="https://github.com/menik1126/prefilling-dllm">Code</a>
+    </nav>
+  </header>
+
+  <section>
+    <h2>Native PD disaggregation for dLLMs</h2>
+    <p>Prefilling-dLLM separates prefix computation from iterative denoising. Prefill workers partition and encode long contexts once, then expose transferable KV snapshots. Decode workers reuse the selected sparse prefix KV throughout generation instead of re-encoding the full prefix at every step.</p>
+    <div class="card">
+      <strong>Prefill</strong> → chunk the prefix, build KV once, score relevance, select top-K chunks and tokens.<br>
+      <strong>Transfer</strong> → move stable paged-KV snapshots across the explicit PD boundary.<br>
+      <strong>Decode</strong> → iteratively denoise the response against the selected non-contiguous prefix KV.
+    </div>
+  </section>
+
+  <section>
+    <h2>Highlights</h2>
+    <ul>
+      <li>Training-free integration with existing diffusion language models.</li>
+      <li>Native prefill and decode execution stages with transferable KV snapshots.</li>
+      <li>Predictive inter-chunk selection and optional intra-chunk token sparsity.</li>
+      <li>Non-contiguous paged-KV attention for sparse long-context decoding.</li>
+      <li>9.1–28.0× speedup at 8K–32K contexts in the paper's experiments.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Citation</h2>
+    <div class="card"><code>@article{xiong2026prefillingdllm,
+  title={Prefilling-dLLM: Predictive Prefilling for Long-Context Inference in Diffusion Language Models},
+  author={Xiong, Jing and Han, Qi and Gong, Shansan and Hsieh, Yunta and Wu, Chengyue and Tao, Chaofan and Zhao, Chenyang and Wong, Ngai},
+  journal={arXiv preprint arXiv:2606.10537},
+  year={2026}
+}</code></div>
+  </section>
+
+  <footer>Prefilling-dLLM · Long-context diffusion language model inference</footer>
+</main>
+</body>
+</html>

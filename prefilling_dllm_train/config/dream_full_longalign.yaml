@@ -1,0 +1,58 @@
+training_mode: 'dream_full_long'
+
+paths:
+  model: '/home/ma-user/work/prefilling-dllm/prefilling_dllm_eval/model_weights/Dream-v0-Base-7B'
+  experiment: 'ckpt_dream_sparse_prefill_longalign_16k'
+  data:
+    longalign: 'THUDM/LongAlign-10k'
+    longalign_split: 'train'
+
+denoiser:
+  encoder:
+    name: 'dream'
+    mask_id: 151666
+
+train:
+  decoder_resume_path:
+  head_resume_path:
+  skipped_keys:
+  global_step:
+  exp_name: &exp_name 'dream_sparse_prefill_longalign_16k_lora'
+  wandb_proj: *exp_name
+  output_dir: 'checkpoints'
+  logging_dir: 'logs'
+  mixed_precision: 'bf16'
+  gradient_accumulation_steps: 8
+  report_to: 'no'
+
+  # Dream natively supports 128K RoPE; 16K LongAlign training needs no RoPE extrapolation.
+  # Per-layer/per-KV-head prompt eviction, matching PREFILL_SPARSE_MODE semantics.
+  prefill_sparse_mode: 'eviction_mask'
+  sparse_token_capacity: 4096
+  sparse_sink_tokens: 128
+  sparse_block_size: 128
+  sparse_selection_mode: 'draft_self_information'
+  sparse_score_query_tokens: 64
+  sparse_score_draft_tokens: 4
+  sparse_score_draft_partial_rounds: 1
+  sparse_score_chunk_size: 1024
+  sparse_score_topk_chunks: 3
+  min_mask_ratio: 0.15
+  max_mask_ratio: 0.85
+  block_size: 32
+  lr: 1e-5
+  num_iters: 2500
+  eval_every: 100000
+  save_every: 250
+  enable_shift: true
+  share_steps: 2
+  self_align: false
+  feature_align: false
+  self_step: false
+
+data:
+  name: 'longalign'
+  batch_size: 1
+  max_length: 16384
+  max_answer_tokens: 1024
+  num_workers: 0
