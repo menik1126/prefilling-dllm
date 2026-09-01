@@ -6,13 +6,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.runtime_context import get_parallel
 
 
 class DreamModel(Qwen2ForCausalLM):
     def __init__(self, config, quant_config=None, prefix=""):
-        if get_parallel().tp_size != 1:
-            raise ValueError("DreamModel currently only supports TP=1")
         super().__init__(config, quant_config, prefix)
 
         if self.pp_group.world_size != 1:
