@@ -82,6 +82,51 @@ Its core features include:
 ## Benchmark and Performance
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
 
+### Experimental Dream Prefilling-dLLM alignment
+
+The `dllm` branch contains an experimental port of Prefilling-dLLM's Dream
+confidence-threshold decoder and dual KV cache. Later denoising rounds retain
+the prompt/context/query KV and overwrite only the 32-token generation block.
+
+FP16 Dream must use Hugging Face RMSNorm semantics: normalize in FP32, cast
+the normalized activation to FP16, and then multiply by the norm weight.
+Changing that order changes iterative decoding decisions. On the 12 largest
+historical error cases, this correction increased mean MultiFieldQA-en F1
+from 30.89 to 35.06.
+
+Use `PrefillingDream`, `benchmark/dllm/prefilling_dream_longbench.yaml`,
+`--dtype float16`, `--disable-radix-cache`, `--attention-backend flashinfer`,
+`--max-running-requests 1`, and `--mem-fraction-static 0.55`. The completed
+pre-alignment full run scored 46.46 versus the FP16 reference's 47.81 and was
+7.41x faster than full recomputation (265.49 versus 1968.10 seconds). After
+RMSNorm alignment, the interrupted run scored 48.80 at 94/150 examples; this
+is a partial score, not a final full-set result.
+
+#### GPU failure observed during alignment
+
+With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32
+full-logits allocation of about 2.37 GiB. PyTorch first reported an allocation
+failure; a later request reported `CUDA error: unspecified launch failure`.
+The error surfaced at `mask.any().item()`, but CUDA is asynchronous, so that
+line is not necessarily the failing kernel. GPU 2 then disappeared from NVML
+with `Unknown Error`, and CUDA initialization failed even when another GPU was
+selected through `CUDA_VISIBLE_DEVICES`. PCI sysfs also reported an unknown
+current link speed, consistent with a GPU/driver/PCIe-level hang.
+
+An ordinary OOM normally does not make a GPU disappear. Possible causes are
+an asynchronous FlashInfer/custom-kernel fault, a driver failure, or
+PCIe/power/hardware instability. Check the host Xid log with:
+
+```bash
+sudo dmesg -T | grep -iE 'NVRM|Xid|fallen off|pcie' | tail -100
+```
+
+Before another full run, use `--mem-fraction-static 0.55`, run index 94 in
+isolation, and confirm that the GPU remains visible. If a card enters
+`Unknown Error`, reset it from the host with
+`nvidia-smi --gpu-reset -i <index>` or PCI FLR. A container with read-only
+`/sys` cannot perform PCI reset; a host reboot may be required.
+
 ## Adoption and Sponsorship
 SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, NVIDIA, AMD, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, RunPod, InnoMatrix, Modal, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Baseten, Baidu, AntGroup, Alibaba, Tencent, and other major technology organizations.
 As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.

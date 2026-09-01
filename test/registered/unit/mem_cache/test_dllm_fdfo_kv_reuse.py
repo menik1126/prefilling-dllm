@@ -63,6 +63,7 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
         req_pool_idx=req_pool_idx,
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
+        dllm_kv_indices=None,
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
         kv=SimpleNamespace(
@@ -166,6 +167,27 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         self.assertEqual(allocator.alloc_calls, [])
         self.assertEqual(req_pool_indices_cpu.tolist(), [1, 2])
         self.assertEqual(out.tolist(), [300, 301, 302, 303, 400, 401, 402, 403])
+
+    def test_alloc_for_extend_prefers_explicit_retained_kv_slots(self):
+        allocator = _FakeAllocator(base=900)
+        reused = _make_req(
+            "reuse", [10, 11, 12, 13], self.block_size, req_pool_idx=1, reuse=True
+        )
+        _remove_allocated_req_slots(self.pool, reused)
+
+        # The request row may be updated asynchronously after the first pass.
+        # Dual-cache owns the physical generation slots returned by allocation
+        # directly, so it must not reconstruct them from this row.
+        _seed_retained_block(self.pool, reused, [700, 701, 702, 703])
+        reused.dllm_kv_indices = torch.tensor(
+            [300, 301, 302, 303], dtype=torch.int64
+        )
+
+        batch = _make_batch(self.pool, allocator, [reused], [4])
+        out, _, _ = alloc_for_extend(batch)
+
+        self.assertEqual(allocator.alloc_calls, [])
+        self.assertEqual(out.tolist(), [300, 301, 302, 303])
 
     def test_alloc_for_extend_paged_mixed_reuse_skips_reused_rows(self):
         allocator = _FakeAllocator(base=500, page_size=4)

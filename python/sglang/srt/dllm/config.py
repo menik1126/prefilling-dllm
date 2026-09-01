@@ -23,6 +23,10 @@ class DllmConfig:
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
         self.needs_full_prefill = needs_full_prefill
+        # Dream can keep the prompt/context/query KV from its initial
+        # bidirectional prefill and replace only the generation-block KV on
+        # later denoising rounds. This mirrors Prefilling-dLLM's dual cache.
+        self.dual_cache = bool(algorithm_config.get("dual_cache", False))
 
     @staticmethod
     def from_server_args(

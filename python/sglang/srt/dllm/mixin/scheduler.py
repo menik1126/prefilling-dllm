@@ -99,14 +99,32 @@ class SchedulerDllmMixin:
                 req = batch.reqs[idx]
 
                 if self.dllm_config.needs_full_prefill and fdfo_mode:
-                    canvas = result.next_token_ids[idx]
-                    if hasattr(canvas, "tolist"):
-                        canvas = canvas.tolist()
-                    canvas = array("q", canvas)
-                    req.full_untruncated_fill_ids = canvas
+                    round_tokens = result.next_token_ids[idx]
+                    if hasattr(round_tokens, "tolist"):
+                        round_tokens = round_tokens.tolist()
+                    round_tokens = array("q", round_tokens)
+
+                    # step() mutates the carried state in place, so the first
+                    # full-canvas pass already appears dual-cache-ready here.
+                    # The returned token span is the authoritative round type.
+                    dual_cache_round = bool(
+                        self.dllm_config.dual_cache
+                        and len(round_tokens) == self.dllm_config.block_size
+                    )
+                    if dual_cache_round:
+                        prompt_len = req.dllm_algo_state["prompt_len"]
+                        req.full_untruncated_fill_ids[
+                            prompt_len : prompt_len + len(round_tokens)
+                        ] = round_tokens
+                    else:
+                        req.full_untruncated_fill_ids = round_tokens
+                    canvas = req.full_untruncated_fill_ids
 
                     if result.dllm_done_per_req_cpu[idx]:
-                        req.output_ids = array("q", canvas[len(req.origin_input_ids) :])
+                        prompt_len = req.dllm_algo_state["prompt_len"]
+                        req.output_ids = array("q", canvas[prompt_len:])
+                        req.dllm_incomplete_ids = array("q")
+                        req.dllm_kv_indices = None
                         req.dllm_algo_state = None
                         self.metrics_reporter.num_generated_tokens += len(
                             req.output_ids
@@ -123,7 +141,30 @@ class SchedulerDllmMixin:
                             req.time_stats.set_completion_time()
                     else:
                         req.dllm_algo_state = algo_states[idx]
-                        release_kv_cache(req, self.tree_cache, is_insert=False)
+                        if self.dllm_config.dual_cache:
+                            prompt_len = req.dllm_algo_state["prompt_len"]
+                            req.dllm_incomplete_ids = array(
+                                "q", canvas[prompt_len:]
+                            )
+                            cache_offset = sum(batch.extend_lens[:idx])
+                            round_cache_loc = batch.out_cache_loc[
+                                cache_offset : cache_offset + batch.extend_lens[idx]
+                            ]
+                            if not dual_cache_round:
+                                # The first full bidirectional pass populated
+                                # the complete request row. Freeze its prompt
+                                # portion; alloc_for_extend will reuse and
+                                # overwrite the generation slots in place.
+                                if len(round_cache_loc) != len(round_tokens):
+                                    raise RuntimeError(
+                                        "Dream KV span does not match returned canvas: "
+                                        f"kv={len(round_cache_loc)}, "
+                                        f"tokens={len(round_tokens)}"
+                                    )
+                                req.prefix_indices = round_cache_loc[:prompt_len].clone()
+                                req.dllm_kv_indices = round_cache_loc[prompt_len:].clone()
+                        else:
+                            release_kv_cache(req, self.tree_cache, is_insert=False)
                     continue
 
                 if not fdfo_mode:
@@ -371,6 +412,25 @@ class SchedulerDllmMixin:
 
             # Prepare and add request
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.dllm_config.needs_full_prefill
+                and req.dllm_algo_state is not None
+            ):
+                # Req state can predate tokenization. Once Dream materializes
+                # its canvas, derive the authoritative prompt boundary from
+                # prompt + committed output + remaining-mask layout.
+                remaining = max(
+                    req.sampling_params.max_new_tokens - len(req.output_ids), 0
+                )
+                prompt_len = len(req.full_untruncated_fill_ids) - remaining
+                if not 0 <= prompt_len <= len(req.full_untruncated_fill_ids):
+                    raise RuntimeError(
+                        "Invalid Dream prompt boundary: "
+                        f"prompt_len={prompt_len}, "
+                        f"canvas_len={len(req.full_untruncated_fill_ids)}, "
+                        f"remaining={remaining}"
+                    )
+                req.dllm_algo_state["prompt_len"] = prompt_len
             res = adder.add_one_req(
                 req,
                 has_chunked_req=True,

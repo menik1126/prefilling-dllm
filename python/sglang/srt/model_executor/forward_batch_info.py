@@ -874,7 +874,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
             if batch.dllm_config.needs_full_prefill:
                 ret.positions = torch.tensor(
-                    [i for req in batch.reqs for i in range(req.extend_range.length)],
+                    [
+                        i
+                        for req in batch.reqs
+                        for i in range(req.extend_range.start, req.extend_range.end)
+                    ],
                     dtype=positions_dtype,
                 ).to(device, non_blocking=True)
             else:

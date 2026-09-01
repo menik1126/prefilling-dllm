@@ -1344,7 +1344,18 @@ class Req(ReqDllmMixin):
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
     ):
-        if self.is_dllm() and self.dllm_config.needs_full_prefill:
+        dual_cache_ready = bool(
+            self.is_dllm()
+            and self.dllm_config.needs_full_prefill
+            and self.dllm_config.dual_cache
+            and self.dllm_algo_state is not None
+            and self.dllm_algo_state.get("dual_cache_ready", False)
+        )
+        if (
+            self.is_dllm()
+            and self.dllm_config.needs_full_prefill
+            and not dual_cache_ready
+        ):
             # Bidirectional attention makes cached prefix K/V invalid: every
             # denoising pass must see prompt and all generated positions.
             tree_cache = None

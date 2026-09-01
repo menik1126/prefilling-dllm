@@ -16,7 +16,22 @@ class DreamModel(Qwen2ForCausalLM):
             raise ValueError("DreamModel currently only supports PP=1")
 
         self.logits_processor = LogitsProcessor(config, return_full_logits=True)
+        # Match DreamRMSNorm in the reference Hugging Face implementation:
+        # normalize in FP32, cast the normalized activation back to the model
+        # dtype, and only then multiply by the norm weight. Qwen2's default
+        # optimized path performs the weight multiplication before that cast,
+        # which changes Dream's iterative decoding decisions in FP16.
+        self.model.norm.cast_x_before_out_mul = True
+        self.model.norm._forward_method = self.model.norm.forward_native
         for layer in self.model.layers:
+            layer.input_layernorm.cast_x_before_out_mul = True
+            layer.post_attention_layernorm.cast_x_before_out_mul = True
+            layer.input_layernorm._forward_method = (
+                layer.input_layernorm.forward_native
+            )
+            layer.post_attention_layernorm._forward_method = (
+                layer.post_attention_layernorm.forward_native
+            )
             layer.self_attn.attn.attn_type = AttentionType.ENCODER_ONLY
 
     @torch.no_grad()

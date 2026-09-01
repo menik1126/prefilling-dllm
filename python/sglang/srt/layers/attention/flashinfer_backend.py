@@ -747,7 +747,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         elif forward_mode.is_dllm_extend():
             prefix_lens = (
-                torch.zeros_like(seq_lens)
+                forward_batch.extend_prefix_lens
                 if self.dllm_config.needs_full_prefill
                 else seq_lens - self.dllm_config.block_size
             )

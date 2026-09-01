@@ -409,8 +409,18 @@ def _alloc_extend_loc_with_kv_reuse(
         prefix_len = int(prefix_lens_cpu[i])
         extend_len = int(extend_lens_cpu[i])
         retained_len = len(req.dllm_incomplete_ids)
+        retained_kv = getattr(req, "dllm_kv_indices", None)
+        if retained_kv is not None and len(retained_kv) != retained_len:
+            raise RuntimeError(
+                "dLLM retained token/KV lengths differ: "
+                f"tokens={retained_len}, kv={len(retained_kv)}."
+            )
         if extend_len != retained_len:
-            raise RuntimeError("dLLM FDFO retained KV must be reused as a full block.")
+            raise RuntimeError(
+                "dLLM FDFO retained KV must be reused as a full block: "
+                f"extend_len={extend_len}, retained_len={retained_len}, "
+                f"prefix_len={prefix_len}, allocated_len={req.kv.kv_allocated_len}."
+            )
         if prefix_len + extend_len > req.kv.kv_allocated_len:
             raise RuntimeError("dLLM FDFO retained KV is missing.")
 
@@ -458,12 +468,16 @@ def _alloc_extend_loc_with_kv_reuse(
         prefix_len = int(prefix_lens_cpu[i])
         extend_len = int(extend_lens_cpu[i])
         if reuse_kv[i]:
-            req_idx = int(req_pool_indices_cpu[i])
-            parts.append(
-                req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
-                    reuse_dtype
+            retained_kv = getattr(batch.reqs[i], "dllm_kv_indices", None)
+            if retained_kv is not None:
+                parts.append(retained_kv.to(reuse_dtype))
+            else:
+                req_idx = int(req_pool_indices_cpu[i])
+                parts.append(
+                    req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
+                        reuse_dtype
+                    )
                 )
-            )
         else:
             parts.append(fresh_slots[fresh_ptr : fresh_ptr + extend_len])
             fresh_ptr += extend_len

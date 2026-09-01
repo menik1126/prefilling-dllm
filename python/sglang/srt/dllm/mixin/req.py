@@ -21,6 +21,8 @@ class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
+        # Physical generation KV slots retained by dual-cache rounds.
+        self.dllm_kv_indices = None
         self.dllm_algo_state = (
             {"prompt_len": len(self.origin_input_ids), "step": 0}
             if dllm_config is not None and dllm_config.needs_full_prefill
@@ -75,6 +77,16 @@ class ReqDllmMixin:
 
     def _init_fill_ids_for_dllm(self: Req):
         if self.dllm_config.needs_full_prefill:
+            if (
+                self.dllm_algo_state is not None
+                and self.dllm_algo_state.get("prompt_len", 0) == 0
+                and len(self.origin_input_ids) > 0
+            ):
+                # Req initializes its dLLM fields before tokenization has
+                # necessarily populated origin_input_ids. Capture the real
+                # prompt boundary when the Dream canvas is first materialized.
+                self.dllm_algo_state["prompt_len"] = len(self.origin_input_ids)
+
             if (
                 self.dllm_initialized
                 and len(self.output_ids) == self.dllm_canvas_output_len
