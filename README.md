@@ -102,6 +102,43 @@ pre-alignment full run scored 46.46 versus the FP16 reference's 47.81 and was
 RMSNorm alignment, the interrupted run scored 48.80 at 94/150 examples; this
 is a partial score, not a final full-set result.
 
+The follow-up alignment removed another long-prompt failure mode: Dream now
+projects only the trailing 32-token generation canvas through the vocabulary
+head instead of materializing prompt-length FP32 logits that are immediately
+discarded. A synthetic 12,000-token request completed in 2.04 seconds without
+an OOM or a measurable sampled-memory increase from that temporary. The real
+MultiFieldQA-en index 94 case (12,872 context tokens) also completed without a
+CUDA or NVML failure.
+
+For a selector-controlled full evaluation, the FP16 Fast-dLLM reference first
+produced the four selected chunk indices for every example, and SGLang decoded
+the same compressed token IDs. The initial comparison scored 48.03 for the
+reference and 46.01 for SGLang over all 150 examples. Although all chunk
+selections and input IDs matched, a first-forward trace found that the query
+and generation RoPE positions did not. Fast-dLLM places the query after the
+selected chunks' fixed 1024-token position slots, preserving a gap after a
+short final chunk; SGLang had placed it immediately after the real compressed
+tokens. MultiFieldQA-en index 54, for example, requires an offset of 813.
+With contiguous positions both HF and SGLang select token 576 first, while the
+reference sparse positions select token 220 and produce the correct `30,223`.
+
+The evaluator can now request this layout with
+`--query-position-mode after_selected_chunks`. It passes the query boundary
+and non-negative offset through `sampling_params.custom_params`; Dream applies
+the offset to the query and generation canvas without adding dummy KV tokens.
+The default contiguous-position path is unchanged. The corrected raw SGLang
+run scored **48.46**, versus **48.03** for Fast-dLLM, an absolute gap of 0.43.
+It matched 93 predictions exactly and 107 per-example F1 values; SGLang was
+better on 21 examples and the reference on 22. The eager verification run
+took 148.74 seconds of generation time with CUDA graphs disabled.
+
+For the short-answer LongBench setting, enabling the evaluator's answer-boundary
+stop and a 20-word prediction cap raised the earlier contiguous-position
+SGLang outputs from 46.01 to 47.07 while retaining each unmodified response as
+`raw_prediction`. That experiment is retained for history, but it is not the
+alignment fix: the corrected sparse-position raw score is 48.46 without output
+truncation or post-processing.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

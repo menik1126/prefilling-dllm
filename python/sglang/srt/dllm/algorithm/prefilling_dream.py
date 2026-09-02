@@ -44,7 +44,22 @@ class PrefillingDream(DllmAlgorithm):
             raise RuntimeError("PrefillingDream requires CPU sequence lengths")
 
         input_parts = forward_batch.input_ids.split(lengths)
-        logits_parts = full_logits.split(lengths)
+        logits_pruned_to_generation = full_logits.shape[0] != sum(lengths)
+        if logits_pruned_to_generation:
+            block_size = getattr(forward_batch, "dllm_block_size", None)
+            if block_size is None:
+                raise RuntimeError(
+                    "PrefillingDream received pruned logits without a dLLM block size"
+                )
+            logits_lengths = [min(length, block_size) for length in lengths]
+            if sum(logits_lengths) != full_logits.shape[0]:
+                raise RuntimeError(
+                    "PrefillingDream pruned-logits rows do not match generation blocks: "
+                    f"{full_logits.shape[0]} != {sum(logits_lengths)}"
+                )
+        else:
+            logits_lengths = lengths
+        logits_parts = full_logits.split(logits_lengths)
         done: List[bool] = []
 
         for ids, logits, state in zip(input_parts, logits_parts, states):
@@ -61,7 +76,11 @@ class PrefillingDream(DllmAlgorithm):
             # DreamModel.forward already right-shifts each request's hidden
             # states before its lm_head. This is equivalent to the reference
             # sampler's _shift_logits and must not be repeated here.
-            generation_logits = logits if dual_cache_round else logits[prompt_len:]
+            generation_logits = (
+                logits
+                if logits_pruned_to_generation or dual_cache_round
+                else logits[prompt_len:]
+            )
             token_logits = generation_logits[mask]
             probs = F.softmax(token_logits, dim=-1)
             confidence, sampled_tokens = probs.max(dim=-1)

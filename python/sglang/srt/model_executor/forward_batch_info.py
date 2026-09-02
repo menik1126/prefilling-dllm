@@ -516,6 +516,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_start_loc: Optional[torch.Tensor] = None
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
+    # Number of trailing generation-canvas rows needed by a dLLM model's LM
+    # head.  Dream uses this to avoid materializing prompt-length full logits.
+    dllm_block_size: Optional[int] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
@@ -870,15 +873,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
+            ret.dllm_block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
             if batch.dllm_config.needs_full_prefill:
+                position_values = [
+                    position
+                    for req in batch.reqs
+                    for position in _compute_dllm_positions(req)
+                ]
                 ret.positions = torch.tensor(
-                    [
-                        i
-                        for req in batch.reqs
-                        for i in range(req.extend_range.start, req.extend_range.end)
-                    ],
+                    position_values,
                     dtype=positions_dtype,
                 ).to(device, non_blocking=True)
             else:
@@ -1806,6 +1811,45 @@ class PPProxyTensors:
 
     def __repr__(self) -> str:
         return f"PPProxyTensors(tensors={self.tensors})"
+
+
+def _compute_dllm_positions(req) -> List[int]:
+    """Return request positions, optionally preserving a sparse query RoPE gap.
+
+    Long-context selectors can compact a short final chunk in token/KV storage
+    while placing the following query after the selected chunks' fixed-size
+    RoPE slots. The optional metadata travels through SamplingParams so the
+    generic request schema and default contiguous position path stay unchanged.
+    """
+
+    custom_params = getattr(req.sampling_params, "custom_params", None)
+    if not isinstance(custom_params, dict):
+        return list(range(req.extend_range.start, req.extend_range.end))
+
+    position_start = custom_params.get("dllm_position_start")
+    position_offset = custom_params.get("dllm_position_offset")
+    if position_start is None and position_offset is None:
+        return list(range(req.extend_range.start, req.extend_range.end))
+    if (
+        not isinstance(position_start, int)
+        or isinstance(position_start, bool)
+        or not isinstance(position_offset, int)
+        or isinstance(position_offset, bool)
+    ):
+        raise ValueError("Dream sparse position start and offset must be integers")
+    if not 0 <= position_start <= len(req.origin_input_ids):
+        raise ValueError(
+            f"Dream sparse position start is outside the prompt: {position_start}"
+        )
+    if position_offset < 0:
+        raise ValueError(
+            f"Dream sparse position offset must be non-negative: {position_offset}"
+        )
+
+    return [
+        position + position_offset if position >= position_start else position
+        for position in range(req.extend_range.start, req.extend_range.end)
+    ]
 
 
 def compute_position(

@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.algorithm.dream import Dream, sample_tokens
+from sglang.srt.dllm.algorithm.prefilling_dream import PrefillingDream
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
@@ -91,12 +92,13 @@ class TestDreamRequestCanvas(CustomTestCase):
 
 
 class TestDreamAlgorithm(CustomTestCase):
-    def _forward_batch(self, input_ids, lengths, *, top_k=None):
+    def _forward_batch(self, input_ids, lengths, *, top_k=None, block_size=None):
         batch_size = len(lengths)
         return SimpleNamespace(
             input_ids=input_ids,
             extend_seq_lens_cpu=lengths,
             batch_size=batch_size,
+            dllm_block_size=block_size,
             sampling_info=SimpleNamespace(
                 original_temperatures=torch.ones(batch_size),
                 original_top_ks=torch.tensor(
@@ -129,6 +131,44 @@ class TestDreamAlgorithm(CustomTestCase):
         self.assertEqual(done, [True, True])
         self.assertEqual(forward_batch.input_ids.tolist(), [10, 11, 2, 2, 20, 2, 2])
         self.assertEqual([state["step"] for state in states], [1, 1])
+
+    def test_dream_accepts_logits_pruned_to_generation_blocks(self):
+        dream = Dream(_config())
+        input_ids = torch.tensor([10, 11, 99, 99, 20, 99, 99])
+        forward_batch = self._forward_batch(
+            input_ids, [4, 3], top_k=1, block_size=2
+        )
+        logits = torch.zeros((4, 5))
+        logits[:, 3] = 5.0
+        states = [
+            {"prompt_len": 2, "step": 0},
+            {"prompt_len": 1, "step": 0},
+        ]
+
+        done = dream.step(forward_batch, logits, states)
+
+        self.assertEqual(done, [True, True])
+        self.assertEqual(forward_batch.input_ids.tolist(), [10, 11, 3, 3, 20, 3, 3])
+
+    def test_prefilling_dream_accepts_pruned_initial_logits(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={"threshold": 0.9, "dual_cache": True},
+                block_size=2,
+            )
+        )
+        input_ids = torch.tensor([10, 11, 99, 99])
+        forward_batch = self._forward_batch(input_ids, [4], block_size=2)
+        logits = torch.zeros((2, 5))
+        logits[:, 4] = 5.0
+        states = [{"prompt_len": 2, "is_prefill": True}]
+
+        done = algorithm.step(forward_batch, logits, states)
+
+        self.assertEqual(done, [False])
+        self.assertEqual(forward_batch.input_ids.tolist(), [10, 11, 4, 99])
+        self.assertTrue(states[0]["dual_cache_ready"])
 
     def test_dream_fdfo_carries_each_request_until_done(self):
         dream = Dream(_config(algorithm_config={"steps": 2, "alg": "origin"}))
@@ -223,7 +263,9 @@ class TestDreamAlgorithm(CustomTestCase):
 
 
 class TestDreamCudaGraphPath(CustomTestCase):
-    def _dream_forward_with_hidden_states(self, hidden_states, seq_lens):
+    def _dream_forward_with_hidden_states(
+        self, hidden_states, seq_lens, block_size=None
+    ):
         def model(*args, **kwargs):
             del args, kwargs
             return hidden_states
@@ -241,6 +283,7 @@ class TestDreamCudaGraphPath(CustomTestCase):
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DLLM_EXTEND,
             extend_seq_lens_cpu=seq_lens,
+            dllm_block_size=block_size,
         )
         return DreamModel.forward(
             dream_model,
@@ -266,6 +309,33 @@ class TestDreamCudaGraphPath(CustomTestCase):
     def test_dream_forward_rejects_lengths_larger_than_hidden_states(self):
         with self.assertRaisesRegex(RuntimeError, "sequence lengths exceed"):
             self._dream_forward_with_hidden_states(torch.zeros((4, 1)), [5])
+
+    def test_dream_forward_projects_only_generation_blocks(self):
+        hidden_states = torch.arange(7, dtype=torch.float32).view(7, 1)
+
+        output = self._dream_forward_with_hidden_states(
+            hidden_states, [4, 3], block_size=2
+        )
+
+        self.assertEqual(output.full_logits.shape, (4, 1))
+        self.assertTrue(
+            torch.equal(
+                output.full_logits[:, 0],
+                torch.tensor([1.0, 2.0, 4.0, 5.0]),
+            )
+        )
+
+    def test_dream_forward_keeps_short_internal_batches(self):
+        hidden_states = torch.arange(2, dtype=torch.float32).view(2, 1)
+
+        output = self._dream_forward_with_hidden_states(
+            hidden_states, [2], block_size=32
+        )
+
+        self.assertEqual(output.full_logits.shape, (2, 1))
+        self.assertTrue(
+            torch.equal(output.full_logits[:, 0], torch.tensor([0.0, 0.0]))
+        )
 
     def test_prefill_bcg_trims_full_logits_to_raw_tokens(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)

@@ -38,6 +38,17 @@ def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
                 yield json.loads(line)
 
 
+def load_selection_manifest(path: Path) -> dict[int, list[int]]:
+    selections = {}
+    for record in iter_jsonl(path):
+        parallelcomp = record.get("parallelcomp", record)
+        selected = parallelcomp.get("selected_chunk_indices")
+        if selected is None:
+            raise ValueError(f"Manifest record has no selected chunks: {record}")
+        selections[int(record["index"])] = [int(index) for index in selected]
+    return selections
+
+
 def normalize_answer(text: str) -> str:
     def remove_articles(value: str) -> str:
         return re.sub(r"\b(a|an|the)\b", " ", value)
@@ -63,6 +74,18 @@ def qa_f1_score(prediction: str, ground_truth: str) -> float:
 
 def score_prediction(prediction: str, answers: Sequence[str]) -> float:
     return max((qa_f1_score(prediction, answer) for answer in answers), default=0.0)
+
+
+def postprocess_prediction(
+    prediction: str,
+    max_words: int = 0,
+    stop_at_answer_boundary: bool = False,
+) -> str:
+    if stop_at_answer_boundary:
+        prediction = re.split(r"[;\n]", prediction, maxsplit=1)[0]
+    if max_words > 0:
+        prediction = " ".join(prediction.split()[:max_words])
+    return prediction
 
 
 def render_prompt_parts(template: str, example: dict[str, Any]) -> dict[str, str]:
@@ -141,26 +164,44 @@ class SGLangClient:
         rows = result if isinstance(result, list) else [result]
         return [row["meta_info"]["input_token_logprobs"] for row in rows]
 
-    def generate(self, input_ids: Sequence[int], max_new_tokens: int) -> dict[str, Any]:
+    def generate(
+        self,
+        input_ids: Sequence[int],
+        max_new_tokens: int,
+        position_start: int | None = None,
+        position_offset: int = 0,
+    ) -> dict[str, Any]:
+        sampling_params: dict[str, Any] = {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+        }
+        if position_start is not None and position_offset:
+            sampling_params["custom_params"] = {
+                "dllm_position_start": position_start,
+                "dllm_position_offset": position_offset,
+            }
         return self.post(
             {
                 "input_ids": list(input_ids),
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": max_new_tokens,
-                },
+                "sampling_params": sampling_params,
             }
         )
 
-    def draft_ids(self, input_ids: Sequence[int], max_new_tokens: int) -> list[int]:
+    def draft_ids(
+        self,
+        input_ids: Sequence[int],
+        max_new_tokens: int,
+        generation_block_size: int,
+    ) -> list[int]:
         if max_new_tokens <= 0:
             return []
+        request_tokens = max(max_new_tokens, generation_block_size)
         result = self.post(
             {
                 "input_ids": list(input_ids),
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": max_new_tokens,
+                    "max_new_tokens": request_tokens,
                     "ignore_eos": True,
                 },
                 "return_logprob": True,
@@ -168,7 +209,11 @@ class SGLangClient:
             }
         )
         values = result["meta_info"].get("output_token_logprobs", [])
-        return [int(value[1]) for value in values if len(value) > 1 and value[1] is not None]
+        return [
+            int(value[1])
+            for value in values[:max_new_tokens]
+            if len(value) > 1 and value[1] is not None
+        ]
 
 
 def mean_query_logprob(values: Sequence[Any], expected_tokens: int) -> float:
@@ -225,14 +270,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-path", required=True, type=Path)
     parser.add_argument("--prompt-config", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--selection-mode", choices=["head", "query_logprob", "full"], default="query_logprob")
+    parser.add_argument(
+        "--selection-mode",
+        choices=["head", "query_logprob", "fixed", "manifest", "full"],
+        default="query_logprob",
+    )
+    parser.add_argument(
+        "--fixed-chunk-indices",
+        default="",
+        help="Comma-separated chunk indices used by --selection-mode=fixed.",
+    )
+    parser.add_argument(
+        "--selection-manifest",
+        type=Path,
+        help="JSONL reference records containing index and selected_chunk_indices.",
+    )
     parser.add_argument("--position-mode", choices=["continuous"], default="continuous")
+    parser.add_argument(
+        "--query-position-mode",
+        choices=["after_compressed_context", "after_selected_chunks"],
+        default="after_compressed_context",
+        help="Place query RoPE positions after real compressed tokens or fixed-size selected chunk slots.",
+    )
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--chunk-bos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--score-batch-size", type=int, default=4)
     parser.add_argument("--draft-tokens", type=int, default=0)
+    parser.add_argument("--generation-block-size", type=int, default=32)
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--prediction-max-words", type=int, default=0)
+    parser.add_argument("--stop-at-answer-boundary", action="store_true")
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--num-examples", type=int, default=20)
     parser.add_argument("--timeout", type=float, default=600.0)
@@ -244,6 +312,18 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.score_batch_size <= 0:
         raise ValueError("score_batch_size must be positive")
+    fixed_chunk_indices = [
+        int(value) for value in args.fixed_chunk_indices.split(",") if value.strip()
+    ]
+    if args.selection_mode == "fixed" and not fixed_chunk_indices:
+        raise ValueError("--selection-mode=fixed requires --fixed-chunk-indices")
+    if args.selection_mode == "manifest" and args.selection_manifest is None:
+        raise ValueError("--selection-mode=manifest requires --selection-manifest")
+    selection_manifest = (
+        load_selection_manifest(args.selection_manifest)
+        if args.selection_manifest is not None
+        else {}
+    )
 
     with args.prompt_config.open("r", encoding="utf-8") as file:
         template = json.load(file)[TASK]
@@ -280,7 +360,11 @@ def main() -> None:
         score_seconds = 0.0
         if args.selection_mode == "query_logprob" and client is not None:
             score_start = time.perf_counter()
-            draft_ids = client.draft_ids(prefix_ids + query_ids, args.draft_tokens)
+            draft_ids = client.draft_ids(
+                prefix_ids + query_ids,
+                args.draft_tokens,
+                args.generation_block_size,
+            )
             scoring_query_ids.extend(draft_ids)
             chunk_scores = score_chunks(
                 client,
@@ -291,33 +375,69 @@ def main() -> None:
             )
             score_seconds = time.perf_counter() - score_start
 
-        selected = select_chunk_indices(
-            args.selection_mode,
-            len(chunks),
-            args.top_k,
-            chunk_scores,
-        )
+        if args.selection_mode in {"fixed", "manifest"}:
+            requested_indices = (
+                fixed_chunk_indices
+                if args.selection_mode == "fixed"
+                else selection_manifest.get(index)
+            )
+            if requested_indices is None:
+                raise ValueError(f"Selection manifest has no entry for index {index}")
+            invalid = [value for value in requested_indices if value >= len(chunks)]
+            if invalid:
+                raise ValueError(
+                    f"Fixed chunk indices {invalid} exceed chunk count {len(chunks)}"
+                )
+            selected = sorted(set(requested_indices))
+        else:
+            selected = select_chunk_indices(
+                args.selection_mode,
+                len(chunks),
+                args.top_k,
+                chunk_scores,
+            )
         selected_context_ids = [token_id for chunk_index in selected for token_id in chunks[chunk_index]]
         compressed_ids = prefix_ids + selected_context_ids + query_ids
 
         generation = None
+        raw_prediction = ""
         prediction = ""
         generation_seconds = 0.0
         if client is not None:
+            query_start = len(prefix_ids) + len(selected_context_ids)
+            position_offset = 0
+            if args.query_position_mode == "after_selected_chunks":
+                query_rope_start = len(prefix_ids) + len(selected) * args.chunk_size
+                position_offset = query_rope_start - query_start
+                if position_offset < 0:
+                    raise RuntimeError("Selected chunk slots end before the compressed query")
             generation_start = time.perf_counter()
-            generation = client.generate(compressed_ids, args.max_new_tokens)
+            generation = client.generate(
+                compressed_ids,
+                args.max_new_tokens,
+                position_start=query_start,
+                position_offset=position_offset,
+            )
             generation_seconds = time.perf_counter() - generation_start
-            prediction = generation.get("text", "")
+            raw_prediction = generation.get("text", "")
+            prediction = postprocess_prediction(
+                raw_prediction,
+                max_words=args.prediction_max_words,
+                stop_at_answer_boundary=args.stop_at_answer_boundary,
+            )
 
         record = {
             "task": TASK,
             "example_id": example.get("_id", index),
             "index": index,
             "prediction": prediction,
+            "raw_prediction": raw_prediction,
             "answers": example.get("answers", []),
             "score": score_prediction(prediction, example.get("answers", [])) if client else None,
             "selection_mode": args.selection_mode,
             "position_mode": args.position_mode,
+            "query_position_mode": args.query_position_mode,
+            "query_position_offset": position_offset if client is not None else None,
             "chunk_size": args.chunk_size,
             "top_k": args.top_k,
             "chunk_bos": args.chunk_bos,
@@ -353,9 +473,12 @@ def main() -> None:
         "score": round(100 * sum(scores) / len(scores), 2) if scores else None,
         "selection_mode": args.selection_mode,
         "position_mode": args.position_mode,
+        "query_position_mode": args.query_position_mode,
         "chunk_size": args.chunk_size,
         "top_k": args.top_k,
         "draft_tokens": args.draft_tokens,
+        "prediction_max_words": args.prediction_max_words,
+        "stop_at_answer_boundary": args.stop_at_answer_boundary,
         "average_raw_context_tokens": sum(record["raw_context_tokens"] for record in records) / len(records),
         "average_compressed_prompt_tokens": sum(record["compressed_prompt_tokens"] for record in records) / len(records),
         "total_score_seconds": sum(record["score_seconds"] for record in records),

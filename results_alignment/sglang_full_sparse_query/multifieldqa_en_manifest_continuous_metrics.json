@@ -1,0 +1,17 @@
+{
+  "task": "multifieldqa_en",
+  "n": 150,
+  "score": 48.46,
+  "selection_mode": "manifest",
+  "position_mode": "continuous",
+  "query_position_mode": "after_selected_chunks",
+  "chunk_size": 1024,
+  "top_k": 4,
+  "draft_tokens": 0,
+  "prediction_max_words": 0,
+  "stop_at_answer_boundary": false,
+  "average_raw_context_tokens": 7118.906666666667,
+  "average_compressed_prompt_tokens": 3621.1466666666665,
+  "total_score_seconds": 0.0,
+  "total_generation_seconds": 148.73817372974008
+}

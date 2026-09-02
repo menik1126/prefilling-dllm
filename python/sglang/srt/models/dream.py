@@ -74,17 +74,24 @@ class DreamModel(Qwen2ForCausalLM):
                 hidden_states = hidden_states[:raw_num_tokens]
 
                 parts = hidden_states.split(seq_lens)
+                shifted_parts = [
+                    torch.cat([part[:1], part[:-1]], dim=0) for part in parts
+                ]
 
-                hidden_states = torch.cat(
-                    [
-                        torch.cat(
-                            [part[:1], part[:-1]],
-                            dim=0,
+                # Dream only consumes logits for its trailing generation
+                # canvas.  Projecting every prompt row through the FP32
+                # vocabulary head creates a prompt-length x vocab temporary
+                # (multiple GiB for long LongBench examples) that is discarded
+                # immediately by the denoising algorithm.
+                block_size = getattr(forward_batch, "dllm_block_size", None)
+                if block_size is not None:
+                    if block_size <= 0:
+                        raise RuntimeError(
+                            f"Dream dLLM block size must be positive: {block_size}"
                         )
-                        for part in parts
-                    ],
-                    dim=0,
-                )
+                    shifted_parts = [part[-block_size:] for part in shifted_parts]
+
+                hidden_states = torch.cat(shifted_parts, dim=0)
             return self.logits_processor(
                 input_ids,
                 hidden_states,

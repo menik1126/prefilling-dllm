@@ -87,7 +87,22 @@ class Dream(DllmAlgorithm):
         if lengths is None:
             raise RuntimeError("Dream requires CPU sequence lengths")
         input_parts = forward_batch.input_ids.split(lengths)
-        logits_parts = full_logits.split(lengths)
+        logits_pruned_to_generation = full_logits.shape[0] != sum(lengths)
+        if logits_pruned_to_generation:
+            block_size = getattr(forward_batch, "dllm_block_size", None)
+            if block_size is None:
+                raise RuntimeError(
+                    "Dream received pruned logits without a dLLM block size"
+                )
+            logits_lengths = [min(length, block_size) for length in lengths]
+            if sum(logits_lengths) != full_logits.shape[0]:
+                raise RuntimeError(
+                    "Dream pruned-logits rows do not match generation blocks: "
+                    f"{full_logits.shape[0]} != {sum(logits_lengths)}"
+                )
+        else:
+            logits_lengths = lengths
+        logits_parts = full_logits.split(logits_lengths)
         sampling = forward_batch.sampling_info
         timesteps = torch.linspace(
             1.0,
@@ -107,7 +122,10 @@ class Dream(DllmAlgorithm):
                 continue
 
             step = states[i]["step"]
-            token_logits = logits[prompt_len:][mask]
+            generation_logits = (
+                logits if logits_pruned_to_generation else logits[prompt_len:]
+            )
+            token_logits = generation_logits[mask]
             temperature = float(sampling.original_temperatures[i].item())
             top_k = int(sampling.original_top_ks[i].item())
             top_p = float(sampling.top_ps[i].item())
