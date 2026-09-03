@@ -187,6 +187,19 @@ to 13.12 seconds. The end-to-end gain is intentionally modest because Dream's
 later denoising rounds dominate runtime; the chunk-build phase itself now uses
 one item-aware forward instead of up to four scheduler/model forwards.
 
+The FlashInfer path now goes beyond an item-aware mask: it exposes the packed
+items as an ordinary virtual request batch. Every virtual request repeats the
+same physical prefix page indices and appends only its own `chunk + temporary
+query` page indices, so the model tensor remains packed while FlashInfer plans
+a real batch dimension. Unsupported page, wrapper, and dequantization layouts
+retain the item-aware-mask fallback. On a strict same-code 150-example A/B,
+batch size 1 scored 30.40 in 165.39 seconds and batch size 4 scored 30.41 in
+161.36 seconds, with no request errors. The chunk-build phase fell from 63.12
+to 59.07 seconds (6.42% less time, about 6.87% higher effective throughput),
+while the later denoising phase remained flat at about 98.9 seconds. The real
+FlashInfer batch therefore improves the complete run by 2.44%; the unchanged
+denoising majority remains the limiting factor.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

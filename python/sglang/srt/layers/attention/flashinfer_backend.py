@@ -147,6 +147,23 @@ class MultiItemScoringParams:
 
 
 @dataclass
+class ParallelCompVirtualBatch:
+    """FlashInfer batch view for independent ``chunk + query`` items.
+
+    The model still receives one flat token tensor, while attention sees every
+    item as an ordinary causal sequence with a shared physical prefix.
+    """
+
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    prefix_lens: torch.Tensor
+    prefix_lens_cpu: List[int]
+    seq_lens_sum: int
+    kv_indices: torch.Tensor
+
+
+@dataclass
 class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
     # full->SWA translated out_cache_loc (SWA KV-store write target)
@@ -759,6 +776,95 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
+    def _build_parallelcomp_virtual_batch(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[ParallelCompVirtualBatch]:
+        """Expose packed ParallelComp items as a real FlashInfer batch.
+
+        Each virtual sequence reads the same physical common-prefix pages and
+        only its own current-token pages.  Repeated page indices are safe here:
+        FlashInfer's paged prefill run explicitly supports shared page indices.
+        Unsupported layouts retain the existing multi-item-mask fallback.
+        """
+        item_groups = forward_batch.dllm_parallelcomp_item_lens
+        if item_groups is None:
+            return None
+        if (
+            self.page_size != 1
+            or self.dispatch_reason is not None
+            or self.prefill_uses_dequant_workspace
+            or any(
+                not items or any(item_len <= 0 for item_len in items)
+                for items in item_groups
+            )
+        ):
+            return None
+
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if prefix_lens is None or extend_lens is None:
+            raise RuntimeError(
+                "ParallelComp virtual batching requires host sequence lengths"
+            )
+        if not (len(item_groups) == len(prefix_lens) == len(extend_lens)):
+            raise RuntimeError(
+                "ParallelComp virtual batch metadata does not match request batch"
+            )
+
+        req_rows = self.req_to_token_pool.req_to_token.index_select(
+            0, forward_batch.req_pool_indices
+        )
+        virtual_req_indices = []
+        virtual_seq_lens = []
+        virtual_prefix_lens = []
+        virtual_kv_indices = []
+        for request_index, (items, prefix_len, extend_len) in enumerate(
+            zip(item_groups, prefix_lens, extend_lens)
+        ):
+            assert items is not None
+            if sum(items) != extend_len:
+                raise RuntimeError(
+                    "ParallelComp virtual items do not cover the extend span: "
+                    f"items={items}, extend={extend_len}"
+                )
+            row = req_rows[request_index]
+            prefix_indices = row[:prefix_len]
+            item_offset = 0
+            for item_len in items:
+                item_end = item_offset + item_len
+                virtual_req_indices.append(
+                    forward_batch.req_pool_indices[request_index : request_index + 1]
+                )
+                virtual_seq_lens.append(prefix_len + item_len)
+                virtual_prefix_lens.append(prefix_len)
+                virtual_kv_indices.extend(
+                    [
+                        prefix_indices,
+                        row[prefix_len + item_offset : prefix_len + item_end],
+                    ]
+                )
+                item_offset = item_end
+
+        device = forward_batch.input_ids.device
+        seq_lens_cpu = torch.tensor(virtual_seq_lens, dtype=torch.int32)
+        return ParallelCompVirtualBatch(
+            req_pool_indices=torch.cat(virtual_req_indices),
+            seq_lens=torch.tensor(
+                virtual_seq_lens,
+                dtype=forward_batch.seq_lens.dtype,
+                device=device,
+            ),
+            seq_lens_cpu=seq_lens_cpu,
+            prefix_lens=torch.tensor(
+                virtual_prefix_lens,
+                dtype=forward_batch.seq_lens.dtype,
+                device=device,
+            ),
+            prefix_lens_cpu=virtual_prefix_lens,
+            seq_lens_sum=sum(virtual_seq_lens),
+            kv_indices=torch.cat(virtual_kv_indices),
+        )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1048,6 +1154,11 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
             parallelcomp_items = forward_batch.dllm_parallelcomp_item_lens is not None
+            parallelcomp_virtual_batch = (
+                self._build_parallelcomp_virtual_batch(forward_batch)
+                if parallelcomp_items
+                else None
+            )
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
             if self.is_multimodal or self.enable_mis or parallelcomp_items:
@@ -1069,9 +1180,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
             # Process multi-item scoring in attention backend instead of ForwardBatch
             multi_item_params = MultiItemScoringParams()
-            if parallelcomp_items:
+            if parallelcomp_items and parallelcomp_virtual_batch is None:
                 multi_item_params = self._process_parallelcomp_items(forward_batch)
-            elif self.enable_mis:
+            elif not parallelcomp_items and self.enable_mis:
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
@@ -1079,12 +1190,28 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch, use_ragged
             )
 
+            plan_req_pool_indices = forward_batch.req_pool_indices
+            plan_seq_lens = forward_batch.seq_lens
+            plan_seq_lens_cpu = forward_batch.seq_lens_cpu
+            plan_seq_lens_sum = forward_batch.seq_lens_sum
+            plan_prefix_lens = prefix_lens
+            plan_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+            plan_kv_indices = self.dq_page_table
+            if parallelcomp_virtual_batch is not None:
+                plan_req_pool_indices = parallelcomp_virtual_batch.req_pool_indices
+                plan_seq_lens = parallelcomp_virtual_batch.seq_lens
+                plan_seq_lens_cpu = parallelcomp_virtual_batch.seq_lens_cpu
+                plan_seq_lens_sum = parallelcomp_virtual_batch.seq_lens_sum
+                plan_prefix_lens = parallelcomp_virtual_batch.prefix_lens
+                plan_prefix_lens_cpu = parallelcomp_virtual_batch.prefix_lens_cpu
+                plan_kv_indices = parallelcomp_virtual_batch.kv_indices
+
             self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                prefix_lens,
+                plan_req_pool_indices,
+                plan_seq_lens,
+                plan_seq_lens_cpu,
+                plan_seq_lens_sum,
+                plan_prefix_lens,
                 prefill_wrappers=self.prefill_wrappers_paged,
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
@@ -1092,8 +1219,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
-                extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
-                custom_kv_indices=self.dq_page_table,
+                extend_prefix_lens_cpu=plan_prefix_lens_cpu,
+                custom_kv_indices=plan_kv_indices,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -1892,6 +2019,9 @@ class FlashInferIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self._oversized_kv_indptr = None
+        self._oversized_qo_indptr = None
+        self._oversized_kv_last_page_len = None
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1951,6 +2081,27 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
 
+        kv_indptr = self.kv_indptr[0]
+        qo_indptr = self.qo_indptr[0]
+        required_indptr_len = len(seq_lens) + 1
+        if len(kv_indptr) < required_indptr_len:
+            if (
+                self._oversized_kv_indptr is None
+                or len(self._oversized_kv_indptr) < required_indptr_len
+            ):
+                self._oversized_kv_indptr = torch.zeros(
+                    required_indptr_len,
+                    dtype=self.kv_indptr[0].dtype,
+                    device=self.kv_indptr[0].device,
+                )
+                self._oversized_qo_indptr = torch.zeros(
+                    required_indptr_len,
+                    dtype=self.qo_indptr[0].dtype,
+                    device=self.qo_indptr[0].device,
+                )
+            kv_indptr = self._oversized_kv_indptr
+            qo_indptr = self._oversized_qo_indptr
+
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrappers[0],
@@ -1960,8 +2111,8 @@ class FlashInferIndicesUpdaterPrefill:
             seq_lens,
             prefix_lens,
             None,
-            self.kv_indptr[0],
-            self.qo_indptr[0],
+            kv_indptr,
+            qo_indptr,
             use_ragged,
             spec_info,
             fixed_split_size=fixed_split_size,
@@ -2320,11 +2471,24 @@ class FlashInferIndicesUpdaterPrefill:
             # selects the module with the per-element window mask compiled in
             paged_plan_kwargs["window_left"] = window_left
 
+        kv_last_page_len = self.kv_last_page_len[:bs]
+        if len(kv_last_page_len) < bs:
+            if (
+                self._oversized_kv_last_page_len is None
+                or len(self._oversized_kv_last_page_len) < bs
+            ):
+                self._oversized_kv_last_page_len = torch.ones(
+                    bs,
+                    dtype=self.kv_last_page_len.dtype,
+                    device=self.kv_last_page_len.device,
+                )
+            kv_last_page_len = self._oversized_kv_last_page_len[:bs]
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            kv_last_page_len,
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
