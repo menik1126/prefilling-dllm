@@ -2,21 +2,25 @@
 """Evaluate external query-aware chunk selection for Dream on MultiFieldQA-en.
 
 The data format, prompt template, and QA F1 metric match the Prefilling-dLLM
-LongBench evaluator. Chunk scoring is intentionally performed through an
-already-running SGLang ``/generate`` endpoint, so the selector and generator
-share one Dream model instance.
+LongBench evaluator. Chunk scoring is performed through a causal Dream
+``/generate`` endpoint and can batch independent candidates. Generation may
+use a separate PrefillingDream endpoint so its compressed prompt keeps the
+reference engine's full-attention prefill semantics.
 
 The evaluator supports both continuous and reused chunk positions. With
 ``--server-chunk-prefill``, it also sends exact chunk boundaries and RoPE starts
 so SGLang can build every retained chunk independently from the common prefix.
 Multiple isolated chunks can share one model forward without seeing each
-other, controlled by ``--server-chunk-prefill-batch-size``.
+other, controlled by ``--server-chunk-prefill-batch-size``. This experimental
+causal construction is not equivalent to the reference ``full_prompt_mask``
+mode; omit ``--server-chunk-prefill`` for accuracy-aligned evaluation.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import string
@@ -127,12 +131,19 @@ def add_chunk_bos(
 
 
 class SGLangClient:
-    def __init__(self, base_url: str, timeout: float):
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float,
+        *,
+        causal_prompt_logprobs: bool = False,
+    ):
         base_url = base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         self.generate_url = f"{base_url}/generate"
         self.timeout = timeout
+        self.causal_prompt_logprobs = causal_prompt_logprobs
 
     def post(self, payload: dict[str, Any]) -> Any:
         request = urllib.request.Request(
@@ -153,10 +164,18 @@ class SGLangClient:
         input_ids: Sequence[Sequence[int]],
         logprob_start_lens: Sequence[int],
     ) -> list[list[Any]]:
+        sampling_params: dict[str, Any] = {
+            "temperature": 0,
+            "max_new_tokens": 0,
+        }
+        if self.causal_prompt_logprobs:
+            sampling_params["custom_params"] = {
+                "dream_causal_prompt_logprob": True,
+            }
         result = self.post(
             {
                 "input_ids": [list(ids) for ids in input_ids],
-                "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+                "sampling_params": sampling_params,
                 "return_logprob": True,
                 "return_text_in_logprobs": False,
                 "logprob_start_len": list(logprob_start_lens),
@@ -216,11 +235,26 @@ class SGLangClient:
             }
         )
         values = result["meta_info"].get("output_token_logprobs", [])
-        return [
+        token_ids = [
             int(value[1])
             for value in values[:max_new_tokens]
             if len(value) > 1 and value[1] is not None
         ]
+        if not token_ids:
+            # Diffusion generation returns the sampled ids at the top level but
+            # currently leaves output_token_logprobs empty.  Falling back to
+            # output_ids keeps draft-self-information scoring equivalent to
+            # the reference engine instead of silently scoring without drafts.
+            output_ids = result.get("output_ids", [])
+            if output_ids and isinstance(output_ids[0], list):
+                output_ids = output_ids[0]
+            token_ids = [int(token_id) for token_id in output_ids[:max_new_tokens]]
+        if len(token_ids) != max_new_tokens:
+            raise RuntimeError(
+                "Dream draft generation returned "
+                f"{len(token_ids)} tokens, expected {max_new_tokens}"
+            )
+        return token_ids
 
 
 def mean_query_logprob(values: Sequence[Any], expected_tokens: int) -> float:
@@ -252,6 +286,13 @@ def score_chunks(
             mean_query_logprob(values, len(scoring_query_ids))
             for values in logprob_rows
         )
+    invalid = [index for index, score in enumerate(scores) if not math.isfinite(score)]
+    if invalid:
+        raise RuntimeError(
+            "Chunk selector received non-finite prompt logprobs for candidate "
+            f"indices {invalid}; Dream scoring requires a causal prompt-logprob "
+            "server passed through --score-base-url."
+        )
     return scores
 
 
@@ -276,6 +317,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Evaluate external query-aware chunk selection on LongBench multifieldqa_en"
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:30000")
+    parser.add_argument(
+        "--score-base-url",
+        help=(
+            "Optional separate SGLang endpoint for causal Dream prompt logprobs. "
+            "The generation endpoint remains --base-url."
+        ),
+    )
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--data-path", required=True, type=Path)
     parser.add_argument("--prompt-config", required=True, type=Path)
@@ -333,7 +381,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Build each selected chunk KV independently in SGLang, sharing only "
-            "the template prefix and discarding temporary query KV."
+            "the template prefix and discarding temporary query KV. This causal "
+            "experimental path is not equivalent to full_prompt_mask."
         ),
     )
     parser.add_argument(
@@ -377,6 +426,15 @@ def main() -> None:
         trust_remote_code=True,
     )
     client = None if args.dry_run else SGLangClient(args.base_url, args.timeout)
+    score_client = (
+        None
+        if args.dry_run
+        else SGLangClient(
+            args.score_base_url or args.base_url,
+            args.timeout,
+            causal_prompt_logprobs=args.score_base_url is not None,
+        )
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_path = (
         args.output_dir / f"{TASK}_{args.selection_mode}_{args.position_mode}.jsonl"
@@ -412,7 +470,7 @@ def main() -> None:
             )
             scoring_query_ids.extend(draft_ids)
             chunk_scores = score_chunks(
-                client,
+                score_client,
                 prefix_ids,
                 chunks,
                 scoring_query_ids,
@@ -530,6 +588,7 @@ def main() -> None:
             "query_position_offset": position_offset if client is not None else None,
             "chunk_size": args.chunk_size,
             "top_k": args.top_k,
+            "score_batch_size": args.score_batch_size,
             "chunk_bos": args.chunk_bos,
             "server_chunk_prefill": args.server_chunk_prefill,
             "server_chunk_prefill_batch_size": args.server_chunk_prefill_batch_size,
@@ -577,6 +636,7 @@ def main() -> None:
         "chunk_query_position_mode": args.chunk_query_position_mode,
         "chunk_size": args.chunk_size,
         "top_k": args.top_k,
+        "score_batch_size": args.score_batch_size,
         "server_chunk_prefill": args.server_chunk_prefill,
         "server_chunk_prefill_batch_size": args.server_chunk_prefill_batch_size,
         "draft_tokens": args.draft_tokens,
@@ -584,6 +644,10 @@ def main() -> None:
         "stop_at_answer_boundary": args.stop_at_answer_boundary,
         "average_raw_context_tokens": sum(
             record["raw_context_tokens"] for record in records
+        )
+        / len(records),
+        "average_candidate_chunks": sum(
+            record["candidate_chunks"] for record in records
         )
         / len(records),
         "average_compressed_prompt_tokens": sum(

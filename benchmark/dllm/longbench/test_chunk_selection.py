@@ -36,3 +36,28 @@ def test_query_selection_preserves_document_order():
 def test_qa_f1():
     assert MODULE.qa_f1_score("The blue whale", "blue whale") == 1.0
     assert MODULE.qa_f1_score("red fox", "blue whale") == 0.0
+
+
+def test_causal_prompt_logprob_marker():
+    client = MODULE.SGLangClient(
+        "http://example.invalid",
+        timeout=1,
+        causal_prompt_logprobs=True,
+    )
+    payloads = []
+    client.post = lambda payload: payloads.append(payload) or {
+        "meta_info": {"input_token_logprobs": [[-1.0, 7, None]]}
+    }
+    assert client.prompt_logprobs([[1, 7]], [1]) == [[[-1.0, 7, None]]]
+    assert payloads[0]["sampling_params"]["custom_params"] == {
+        "dream_causal_prompt_logprob": True,
+    }
+
+
+def test_draft_ids_fall_back_to_diffusion_output_ids():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    client.post = lambda payload: {
+        "output_ids": [10, 11, 12, 13],
+        "meta_info": {"output_token_logprobs": []},
+    }
+    assert client.draft_ids([1, 2], 4, 32) == [10, 11, 12, 13]

@@ -200,6 +200,39 @@ while the later denoising phase remained flat at about 98.9 seconds. The real
 FlashInfer batch therefore improves the complete run by 2.44%; the unchanged
 denoising majority remains the limiting factor.
 
+End-to-end selection from the original long text is now available through a
+separate causal Dream prompt-logprob endpoint. Candidate chunks are sent in
+request batches controlled by `--score-batch-size`; the selected top-four
+chunks are then passed to the ordinary PrefillingDream endpoint as one
+compressed prompt. The scoring endpoint must use
+`--enable-deterministic-inference` for batch-invariant rankings. Dream dLLM
+responses expose draft tokens through `output_ids` while leaving
+`output_token_logprobs` empty, so the evaluator falls back to `output_ids` and
+fails rather than silently dropping a requested draft.
+
+This distinction is important for quality: the 48.03-F1 Fast-dLLM reference
+uses `full_prompt_mask`, where the selected compressed prompt receives Dream's
+full-attention prefill. The causal `--server-chunk-prefill` path above instead
+implements the separate `chunk_query` experiment and is not an equivalent
+replacement. For accuracy-aligned selector evaluation, omit
+`--server-chunk-prefill`, use continuous chunk positions, and place the query
+after the selected 1024-token slots.
+
+On two H20s, two independent model replicas evaluated 75 examples each with
+four draft tokens, 1024-token chunks, top-k four, and 32 generated tokens. The
+150-example raw F1 was **47.373** for score batch sizes 1, 4, and 8, only 0.657
+below the 48.03 reference. All 150 selected chunk sets and all 150 predictions
+were identical across the three batch sizes, with no request errors. Average
+candidate count was 7.453 chunks. The selector critical path fell from 127.31
+seconds at batch size 1 to 115.32 seconds at batch size 4 (1.104x) and 113.44
+seconds at batch size 8 (1.122x). Generation stayed flat at about 76.2 seconds.
+Dual-replica wall time fell from 210 to 202 and 196 seconds, respectively,
+raising throughput from 0.714 to 0.743 and 0.765 examples/s. On a longer
+16-candidate example, the pure chunk-scoring phase fell from 3.69 to 1.90
+seconds at batch size 4 (1.95x); the full-set gain is smaller because draft
+generation, final denoising, and examples with four or fewer chunks cannot
+benefit from candidate batching.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

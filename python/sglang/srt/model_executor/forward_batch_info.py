@@ -1848,12 +1848,24 @@ def _parallelcomp_force_causal(reqs) -> bool:
         )
         for req in reqs
     ]
-    if any(chunk_flags) and not all(chunk_flags):
-        raise RuntimeError(
-            "ParallelComp causal chunk prefill cannot share a batch with "
-            "ordinary Dream forwards"
+    score_flags = []
+    for req in reqs:
+        sampling_params = getattr(req, "sampling_params", None)
+        custom_params = getattr(sampling_params, "custom_params", None)
+        score_flags.append(
+            isinstance(custom_params, dict)
+            and custom_params.get("dream_causal_prompt_logprob") is True
         )
-    return bool(chunk_flags) and all(chunk_flags)
+    causal_flags = [
+        chunk_flag or score_flag
+        for chunk_flag, score_flag in zip(chunk_flags, score_flags)
+    ]
+    if any(causal_flags) and not all(causal_flags):
+        raise RuntimeError(
+            "Causal Dream scoring or ParallelComp chunk prefill cannot share "
+            "a batch with ordinary Dream forwards"
+        )
+    return bool(causal_flags) and all(causal_flags)
 
 
 def _compute_dllm_positions(req) -> List[int]:

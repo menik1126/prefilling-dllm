@@ -101,16 +101,25 @@ def test_parallelcomp_retraction_restarts_from_common_prefix():
     assert "assembled_prefix_indices" not in state
 
 
-def test_parallelcomp_causal_override_is_chunk_stage_only():
+def test_causal_override_covers_chunk_stage_and_prompt_scoring():
     chunk_req = SimpleNamespace(dllm_parallelcomp_state={"stage": "chunk"})
     prefix_req = SimpleNamespace(dllm_parallelcomp_state={"stage": "prefix"})
     ordinary_req = SimpleNamespace(dllm_parallelcomp_state=None)
+    score_req = SimpleNamespace(
+        dllm_parallelcomp_state=None,
+        sampling_params=SimpleNamespace(
+            custom_params={"dream_causal_prompt_logprob": True}
+        ),
+    )
 
     assert _parallelcomp_force_causal([chunk_req])
+    assert _parallelcomp_force_causal([score_req])
     assert not _parallelcomp_force_causal([prefix_req])
     assert not _parallelcomp_force_causal([ordinary_req])
     with pytest.raises(RuntimeError, match="cannot share a batch"):
         _parallelcomp_force_causal([chunk_req, ordinary_req])
+    with pytest.raises(RuntimeError, match="cannot share a batch"):
+        _parallelcomp_force_causal([score_req, ordinary_req])
 
 
 def test_parallelcomp_chunk_batch_has_independent_items_and_positions():
