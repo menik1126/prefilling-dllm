@@ -519,6 +519,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Number of trailing generation-canvas rows needed by a dLLM model's LM
     # head.  Dream uses this to avoid materializing prompt-length full logits.
     dllm_block_size: Optional[int] = None
+    # ParallelComp retains causal chunk KV even though Dream's generation
+    # canvas itself uses bidirectional attention.
+    dllm_force_causal: bool = False
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
@@ -778,6 +781,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        parallelcomp_states = [
+            getattr(req, "dllm_parallelcomp_state", None) for req in batch.reqs
+        ]
+        dllm_force_causal = _parallelcomp_force_causal(batch.reqs)
+
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -805,11 +813,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
-            can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
+            # The same DLLM_EXTEND graph cannot switch between Dream's full
+            # generation attention and causal chunk construction. Keep this
+            # experimental multi-stage request on the eager path.
+            can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph
+            and not any(state is not None for state in parallelcomp_states),
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
+            dllm_force_causal=dllm_force_causal,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
@@ -1813,6 +1826,22 @@ class PPProxyTensors:
         return f"PPProxyTensors(tensors={self.tensors})"
 
 
+def _parallelcomp_force_causal(reqs) -> bool:
+    chunk_flags = [
+        (
+            getattr(req, "dllm_parallelcomp_state", None) is not None
+            and req.dllm_parallelcomp_state["stage"] == "chunk"
+        )
+        for req in reqs
+    ]
+    if any(chunk_flags) and not all(chunk_flags):
+        raise RuntimeError(
+            "ParallelComp causal chunk prefill cannot share a batch with "
+            "ordinary Dream forwards"
+        )
+    return bool(chunk_flags) and all(chunk_flags)
+
+
 def _compute_dllm_positions(req) -> List[int]:
     """Return request positions, optionally preserving a sparse query RoPE gap.
 
@@ -1821,6 +1850,13 @@ def _compute_dllm_positions(req) -> List[int]:
     RoPE slots. The optional metadata travels through SamplingParams so the
     generic request schema and default contiguous position path stay unchanged.
     """
+
+    get_parallelcomp_positions = getattr(req, "parallelcomp_position_values", None)
+    parallelcomp_positions = (
+        get_parallelcomp_positions() if callable(get_parallelcomp_positions) else None
+    )
+    if parallelcomp_positions is not None:
+        return parallelcomp_positions
 
     custom_params = getattr(req.sampling_params, "custom_params", None)
     if not isinstance(custom_params, dict):

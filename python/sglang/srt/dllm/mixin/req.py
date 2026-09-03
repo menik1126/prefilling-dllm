@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 from array import array
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.dllm.config import DllmConfig
 
@@ -31,9 +31,12 @@ class ReqDllmMixin:
         self.dllm_block_offset = 0
         self.dllm_canvas_output_len = 0
         self.dllm_config = dllm_config
+        self.dllm_parallelcomp_state = self._parse_parallelcomp_state()
 
         if self.dllm_config is not None:
-            if self.dllm_config.needs_full_prefill:
+            if self.dllm_parallelcomp_state is not None:
+                self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+            elif self.dllm_config.needs_full_prefill:
                 # Dream denoises a masked generation canvas, so it is a decode
                 # request even though each round uses a full-attention prefill.
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
@@ -51,7 +54,160 @@ class ReqDllmMixin:
             DllmReqPhase.INCOMING_PREFILL,
         ]
 
+    def _parse_parallelcomp_state(self: Req) -> Optional[dict[str, Any]]:
+        if self.dllm_config is None or not self.dllm_config.needs_full_prefill:
+            return None
+        custom_params = getattr(self.sampling_params, "custom_params", None)
+        if not isinstance(custom_params, dict):
+            return None
+        config = custom_params.get("dllm_parallelcomp")
+        if not isinstance(config, dict):
+            return None
+        if not self.dllm_config.dual_cache:
+            raise ValueError("dllm_parallelcomp requires Dream dual_cache")
+        if not self.dllm_config.first_done_first_out_mode:
+            raise ValueError("dllm_parallelcomp requires --dllm-fdfo")
+
+        prefix_len = config.get("prefix_len")
+        query_len = config.get("query_len")
+        chunk_lens = config.get("chunk_lens")
+        if (
+            not isinstance(prefix_len, int)
+            or isinstance(prefix_len, bool)
+            or prefix_len < 0
+            or not isinstance(query_len, int)
+            or isinstance(query_len, bool)
+            or query_len < 0
+            or not isinstance(chunk_lens, list)
+            or not chunk_lens
+            or any(
+                not isinstance(length, int) or isinstance(length, bool) or length <= 0
+                for length in chunk_lens
+            )
+        ):
+            raise ValueError(
+                "dllm_parallelcomp requires non-negative prefix_len/query_len "
+                "and a non-empty list of positive chunk_lens"
+            )
+        if prefix_len + sum(chunk_lens) + query_len != len(self.origin_input_ids):
+            raise ValueError(
+                "dllm_parallelcomp boundaries do not cover the input: "
+                f"prefix={prefix_len}, chunks={sum(chunk_lens)}, "
+                f"query={query_len}, input={len(self.origin_input_ids)}"
+            )
+
+        chunk_position_starts = config.get(
+            "chunk_position_starts", [prefix_len] * len(chunk_lens)
+        )
+        chunk_query_position_starts = config.get(
+            "chunk_query_position_starts",
+            [
+                start + length
+                for start, length in zip(chunk_position_starts, chunk_lens)
+            ],
+        )
+        query_position_start = config.get(
+            "query_position_start", prefix_len + sum(chunk_lens)
+        )
+        if (
+            not isinstance(chunk_position_starts, list)
+            or len(chunk_position_starts) != len(chunk_lens)
+            or not isinstance(chunk_query_position_starts, list)
+            or len(chunk_query_position_starts) != len(chunk_lens)
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in chunk_position_starts + chunk_query_position_starts
+            )
+            or not isinstance(query_position_start, int)
+            or isinstance(query_position_start, bool)
+            or query_position_start < 0
+        ):
+            raise ValueError(
+                "dllm_parallelcomp position starts must be non-negative integers"
+            )
+
+        return {
+            "stage": "prefix" if prefix_len else "chunk",
+            "prefix_len": prefix_len,
+            "query_len": query_len,
+            "chunk_lens": list(chunk_lens),
+            "chunk_offsets": [
+                prefix_len + sum(chunk_lens[:index]) for index in range(len(chunk_lens))
+            ],
+            "chunk_position_starts": list(chunk_position_starts),
+            "chunk_query_position_starts": list(chunk_query_position_starts),
+            "query_position_start": query_position_start,
+            "chunk_cursor": 0,
+            "common_prefix_indices": None,
+            "chunk_kv_indices": [],
+        }
+
+    def has_parallelcomp_prefill_cache(self: Req) -> bool:
+        return self.dllm_parallelcomp_state is not None
+
+    def take_parallelcomp_retained_kv_indices(self: Req) -> list:
+        """Return retained chunk pages for page-table-aware abort cleanup."""
+        state = self.dllm_parallelcomp_state
+        if state is None or state["stage"] != "chunk":
+            return []
+        chunk_kv_indices = state["chunk_kv_indices"]
+        state["chunk_kv_indices"] = []
+        return chunk_kv_indices
+
+    def reset_parallelcomp_prefill_state(self: Req) -> None:
+        state = self.dllm_parallelcomp_state
+        if state is None:
+            return
+        state["stage"] = "prefix" if state["prefix_len"] else "chunk"
+        state["chunk_cursor"] = 0
+        state["common_prefix_indices"] = None
+        state["chunk_kv_indices"] = []
+        state.pop("assembled_prefix_indices", None)
+
+    def parallelcomp_position_values(self: Req) -> Optional[list[int]]:
+        state = self.dllm_parallelcomp_state
+        if state is None:
+            return None
+        stage = state["stage"]
+        if stage == "prefix":
+            values = list(range(state["prefix_len"]))
+        elif stage == "chunk":
+            cursor = state["chunk_cursor"]
+            chunk_start = state["chunk_position_starts"][cursor]
+            chunk_len = state["chunk_lens"][cursor]
+            query_start = state["chunk_query_position_starts"][cursor]
+            values = list(range(state["prefix_len"]))
+            values.extend(range(chunk_start, chunk_start + chunk_len))
+            values.extend(range(query_start, query_start + state["query_len"]))
+        else:
+            values = list(range(state["prefix_len"]))
+            for chunk_start, chunk_len in zip(
+                state["chunk_position_starts"], state["chunk_lens"]
+            ):
+                values.extend(range(chunk_start, chunk_start + chunk_len))
+            query_start = state["query_position_start"]
+            values.extend(range(query_start, query_start + state["query_len"]))
+            generation_start = query_start + state["query_len"]
+            values.extend(
+                range(
+                    generation_start,
+                    generation_start + self.sampling_params.max_new_tokens,
+                )
+            )
+        return values[self.extend_range.start : self.extend_range.end]
+
     def determine_dllm_phase(self: Req):
+        if (
+            self.dllm_parallelcomp_state is not None
+            and self.dllm_parallelcomp_state["stage"] != "decode"
+        ):
+            if self.dllm_phase not in (
+                DllmReqPhase.INCOMING_PREFILL,
+                DllmReqPhase.STAGING_PREFILL,
+            ):
+                self.dllm_phase = DllmReqPhase.STAGING_PREFILL
+            return
+
         if self.dllm_config.needs_full_prefill:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
             return
@@ -77,6 +233,35 @@ class ReqDllmMixin:
 
     def _init_fill_ids_for_dllm(self: Req):
         if self.dllm_config.needs_full_prefill:
+            parallelcomp = self.dllm_parallelcomp_state
+            if parallelcomp is not None and parallelcomp["stage"] != "decode":
+                if parallelcomp["stage"] == "prefix":
+                    self.prefix_indices = self.prefix_indices[:0]
+                    self.full_untruncated_fill_ids = array(
+                        "q", self.origin_input_ids[: parallelcomp["prefix_len"]]
+                    )
+                else:
+                    cursor = parallelcomp["chunk_cursor"]
+                    chunk_start = parallelcomp["chunk_offsets"][cursor]
+                    chunk_end = chunk_start + parallelcomp["chunk_lens"][cursor]
+                    query_start = len(self.origin_input_ids) - parallelcomp["query_len"]
+                    common_prefix_indices = parallelcomp["common_prefix_indices"]
+                    self.prefix_indices = (
+                        common_prefix_indices
+                        if common_prefix_indices is not None
+                        else self.prefix_indices[:0]
+                    )
+                    self.full_untruncated_fill_ids = (
+                        array("q", self.origin_input_ids[: parallelcomp["prefix_len"]])
+                        + array("q", self.origin_input_ids[chunk_start:chunk_end])
+                        + array("q", self.origin_input_ids[query_start:])
+                    )
+                # A mask-free intermediate stage makes DllmAlgorithm perform
+                # exactly one model forward without entering denoising.
+                self.dllm_algo_state["prompt_len"] = len(self.full_untruncated_fill_ids)
+                self.dllm_initialized = True
+                return
+
             if (
                 self.dllm_algo_state is not None
                 and self.dllm_algo_state.get("prompt_len", 0) == 0

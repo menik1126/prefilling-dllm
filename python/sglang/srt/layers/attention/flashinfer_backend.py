@@ -160,6 +160,7 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    force_causal: bool = False
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -1032,6 +1033,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
+                force_causal=forward_batch.dllm_force_causal,
             )
 
     def init_cuda_graph_state(
@@ -1351,6 +1353,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            causal = causal or self.forward_metadata.force_causal
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 kv_cache,
@@ -1392,6 +1395,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 or layer.attn_type == AttentionType.ENCODER_ONLY
             ):
                 causal = False
+            if not layer.is_cross_attention and self.forward_metadata.force_causal:
+                causal = True
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 

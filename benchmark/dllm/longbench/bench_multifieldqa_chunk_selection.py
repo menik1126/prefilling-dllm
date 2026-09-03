@@ -6,9 +6,9 @@ LongBench evaluator. Chunk scoring is intentionally performed through an
 already-running SGLang ``/generate`` endpoint, so the selector and generator
 share one Dream model instance.
 
-This first integration uses compressed continuous positions.  Original chunk
-positions are recorded in the output, but sparse absolute position IDs are not
-sent because the public generation API does not currently accept them.
+The evaluator supports both continuous and reused chunk positions. With
+``--server-chunk-prefill``, it also sends exact chunk boundaries and RoPE starts
+so SGLang can build every retained chunk independently from the common prefix.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from transformers import AutoTokenizer
-
 
 TASK = "multifieldqa_en"
 
@@ -170,16 +169,22 @@ class SGLangClient:
         max_new_tokens: int,
         position_start: int | None = None,
         position_offset: int = 0,
+        custom_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         sampling_params: dict[str, Any] = {
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         }
+        request_custom_params = dict(custom_params or {})
         if position_start is not None and position_offset:
-            sampling_params["custom_params"] = {
-                "dllm_position_start": position_start,
-                "dllm_position_offset": position_offset,
-            }
+            request_custom_params.update(
+                {
+                    "dllm_position_start": position_start,
+                    "dllm_position_offset": position_offset,
+                }
+            )
+        if request_custom_params:
+            sampling_params["custom_params"] = request_custom_params
         return self.post(
             {
                 "input_ids": list(input_ids),
@@ -236,11 +241,14 @@ def score_chunks(
     scores: list[float] = []
     for start in range(0, len(chunks), batch_size):
         batch = chunks[start : start + batch_size]
-        rows = [list(prefix_ids) + list(chunk) + list(scoring_query_ids) for chunk in batch]
+        rows = [
+            list(prefix_ids) + list(chunk) + list(scoring_query_ids) for chunk in batch
+        ]
         starts = [len(prefix_ids) + len(chunk) for chunk in batch]
         logprob_rows = client.prompt_logprobs(rows, starts)
         scores.extend(
-            mean_query_logprob(values, len(scoring_query_ids)) for values in logprob_rows
+            mean_query_logprob(values, len(scoring_query_ids))
+            for values in logprob_rows
         )
     return scores
 
@@ -285,16 +293,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="JSONL reference records containing index and selected_chunk_indices.",
     )
-    parser.add_argument("--position-mode", choices=["continuous"], default="continuous")
+    parser.add_argument(
+        "--position-mode", choices=["continuous", "reuse"], default="continuous"
+    )
     parser.add_argument(
         "--query-position-mode",
-        choices=["after_compressed_context", "after_selected_chunks"],
+        choices=[
+            "after_compressed_context",
+            "after_selected_chunks",
+            "after_reused_window",
+        ],
         default="after_compressed_context",
         help="Place query RoPE positions after real compressed tokens or fixed-size selected chunk slots.",
     )
+    parser.add_argument(
+        "--chunk-query-position-mode",
+        choices=["after_reused_window", "after_chunk"],
+        default="after_reused_window",
+        help="Place each temporary chunk-conditioning query independently of the final query.",
+    )
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--top-k", type=int, default=4)
-    parser.add_argument("--chunk-bos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--chunk-bos", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--score-batch-size", type=int, default=4)
     parser.add_argument("--draft-tokens", type=int, default=0)
     parser.add_argument("--generation-block-size", type=int, default=32)
@@ -304,6 +326,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--num-examples", type=int, default=20)
     parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument(
+        "--server-chunk-prefill",
+        action="store_true",
+        help=(
+            "Build each selected chunk KV independently in SGLang, sharing only "
+            "the template prefix and discarding temporary query KV."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -338,8 +368,13 @@ def main() -> None:
     )
     client = None if args.dry_run else SGLangClient(args.base_url, args.timeout)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = args.output_dir / f"{TASK}_{args.selection_mode}_{args.position_mode}.jsonl"
-    metrics_path = args.output_dir / f"{TASK}_{args.selection_mode}_{args.position_mode}_metrics.json"
+    output_path = (
+        args.output_dir / f"{TASK}_{args.selection_mode}_{args.position_mode}.jsonl"
+    )
+    metrics_path = (
+        args.output_dir
+        / f"{TASK}_{args.selection_mode}_{args.position_mode}_metrics.json"
+    )
 
     records = []
     for local_index, example in enumerate(examples):
@@ -396,7 +431,9 @@ def main() -> None:
                 args.top_k,
                 chunk_scores,
             )
-        selected_context_ids = [token_id for chunk_index in selected for token_id in chunks[chunk_index]]
+        selected_context_ids = [
+            token_id for chunk_index in selected for token_id in chunks[chunk_index]
+        ]
         compressed_ids = prefix_ids + selected_context_ids + query_ids
 
         generation = None
@@ -410,13 +447,50 @@ def main() -> None:
                 query_rope_start = len(prefix_ids) + len(selected) * args.chunk_size
                 position_offset = query_rope_start - query_start
                 if position_offset < 0:
-                    raise RuntimeError("Selected chunk slots end before the compressed query")
+                    raise RuntimeError(
+                        "Selected chunk slots end before the compressed query"
+                    )
+            elif args.query_position_mode == "after_reused_window":
+                query_rope_start = len(prefix_ids) + args.chunk_size
+                position_offset = query_rope_start - query_start
+            else:
+                query_rope_start = query_start
+
+            custom_params = None
+            if args.server_chunk_prefill:
+                if args.position_mode == "reuse":
+                    chunk_position_starts = [len(prefix_ids)] * len(selected)
+                else:
+                    chunk_position_starts = [
+                        len(prefix_ids) + order * args.chunk_size
+                        for order in range(len(selected))
+                    ]
+                if args.chunk_query_position_mode == "after_reused_window":
+                    chunk_query_position_starts = [
+                        len(prefix_ids) + args.chunk_size
+                    ] * len(selected)
+                else:
+                    chunk_query_position_starts = [
+                        start + len(chunks[index])
+                        for start, index in zip(chunk_position_starts, selected)
+                    ]
+                custom_params = {
+                    "dllm_parallelcomp": {
+                        "prefix_len": len(prefix_ids),
+                        "chunk_lens": [len(chunks[index]) for index in selected],
+                        "query_len": len(query_ids),
+                        "chunk_position_starts": chunk_position_starts,
+                        "chunk_query_position_starts": chunk_query_position_starts,
+                        "query_position_start": query_rope_start,
+                    }
+                }
             generation_start = time.perf_counter()
             generation = client.generate(
                 compressed_ids,
                 args.max_new_tokens,
-                position_start=query_start,
-                position_offset=position_offset,
+                position_start=None if args.server_chunk_prefill else query_start,
+                position_offset=0 if args.server_chunk_prefill else position_offset,
+                custom_params=custom_params,
             )
             generation_seconds = time.perf_counter() - generation_start
             raw_prediction = generation.get("text", "")
@@ -433,19 +507,29 @@ def main() -> None:
             "prediction": prediction,
             "raw_prediction": raw_prediction,
             "answers": example.get("answers", []),
-            "score": score_prediction(prediction, example.get("answers", [])) if client else None,
+            "score": (
+                score_prediction(prediction, example.get("answers", []))
+                if client
+                else None
+            ),
             "selection_mode": args.selection_mode,
             "position_mode": args.position_mode,
             "query_position_mode": args.query_position_mode,
+            "chunk_query_position_mode": args.chunk_query_position_mode,
             "query_position_offset": position_offset if client is not None else None,
             "chunk_size": args.chunk_size,
             "top_k": args.top_k,
             "chunk_bos": args.chunk_bos,
+            "server_chunk_prefill": args.server_chunk_prefill,
             "raw_context_tokens": len(context_ids),
             "candidate_chunks": len(chunks),
             "selected_chunk_indices": selected,
-            "selected_original_position_starts": [index * args.chunk_size for index in selected],
-            "selected_continuous_position_starts": [order * args.chunk_size for order in range(len(selected))],
+            "selected_original_position_starts": [
+                index * args.chunk_size for index in selected
+            ],
+            "selected_continuous_position_starts": [
+                order * args.chunk_size for order in range(len(selected))
+            ],
             "chunk_scores": chunk_scores,
             "draft_ids": draft_ids,
             "prefix_tokens": len(prefix_ids),
@@ -458,8 +542,12 @@ def main() -> None:
         records.append(record)
         with output_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
-        running_scores = [item["score"] for item in records if item["score"] is not None]
-        running = 100 * sum(running_scores) / len(running_scores) if running_scores else 0.0
+        running_scores = [
+            item["score"] for item in records if item["score"] is not None
+        ]
+        running = (
+            100 * sum(running_scores) / len(running_scores) if running_scores else 0.0
+        )
         print(
             f"[{local_index + 1}/{len(examples)}] index={index} "
             f"chunks={len(chunks)} selected={selected} score={running:.2f}",
@@ -474,15 +562,25 @@ def main() -> None:
         "selection_mode": args.selection_mode,
         "position_mode": args.position_mode,
         "query_position_mode": args.query_position_mode,
+        "chunk_query_position_mode": args.chunk_query_position_mode,
         "chunk_size": args.chunk_size,
         "top_k": args.top_k,
+        "server_chunk_prefill": args.server_chunk_prefill,
         "draft_tokens": args.draft_tokens,
         "prediction_max_words": args.prediction_max_words,
         "stop_at_answer_boundary": args.stop_at_answer_boundary,
-        "average_raw_context_tokens": sum(record["raw_context_tokens"] for record in records) / len(records),
-        "average_compressed_prompt_tokens": sum(record["compressed_prompt_tokens"] for record in records) / len(records),
+        "average_raw_context_tokens": sum(
+            record["raw_context_tokens"] for record in records
+        )
+        / len(records),
+        "average_compressed_prompt_tokens": sum(
+            record["compressed_prompt_tokens"] for record in records
+        )
+        / len(records),
         "total_score_seconds": sum(record["score_seconds"] for record in records),
-        "total_generation_seconds": sum(record["generation_seconds"] for record in records),
+        "total_generation_seconds": sum(
+            record["generation_seconds"] for record in records
+        ),
     }
     with metrics_path.open("w", encoding="utf-8") as file:
         json.dump(metrics, file, indent=2, ensure_ascii=False)

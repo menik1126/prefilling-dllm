@@ -214,6 +214,19 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    take_retained = getattr(req, "take_parallelcomp_retained_kv_indices", None)
+    if callable(take_retained):
+        request_row = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+            : req.kv.kv_allocated_len
+        ]
+        for kv_indices in take_retained():
+            # A cancellation may arrive on either side of the next page-table
+            # rewrite. Free only retained chunk slots no longer owned by the
+            # ordinary request row; the normal cleanup below releases the rest.
+            detached = kv_indices[~torch.isin(kv_indices, request_row)]
+            if detached.numel():
+                tree_cache.token_to_kv_pool_allocator.free(detached)
+
     effective_kv_committed_len = req.effective_kv_committed_len()
     tree_cache.cache_finished_req(
         req,

@@ -139,6 +139,36 @@ SGLang outputs from 46.01 to 47.07 while retaining each unmodified response as
 alignment fix: the corrected sparse-position raw score is 48.46 without output
 truncation or post-processing.
 
+The runtime now also supports the original per-chunk `chunk_query` cache build
+through `--server-chunk-prefill`. This is a multi-stage SGLang request: compute
+the common template prefix once; run each selected `chunk + temporary query`
+against only that common prefix; retain only the causal chunk KV and free the
+temporary query KV; concatenate `prefix + retained chunks`; then append the
+official query and run the normal Dream generation canvas. Selected chunks
+never read one another's KV. Chunk and query RoPE layouts are controlled
+independently by `--position-mode`, `--chunk-query-position-mode`, and
+`--query-position-mode`.
+
+The retained chunks use SGLang's request page table and KV allocator instead of
+copying dense caches between runtimes. Cancellation and retraction explicitly
+release retained pages that are temporarily outside the request row, and the
+assembled prefix is written back to that row before generation. The current
+experimental path requires KV page size 1, does not mix a causal chunk build
+with other Dream requests in the same batch, and keeps this multi-stage request
+off CUDA Graph because one `DLLM_EXTEND` graph cannot switch between causal
+chunk construction and bidirectional Dream generation.
+
+On the complete 150-example MultiFieldQA-en run, all prefix/query/context token
+boundaries and all 150 selected chunk sets matched the Fast-dLLM `chunk_query`
+reference. With reused 1024-token chunk positions and a 32-token generation
+block, the reference raw F1 was 28.67. SGLang scored 29.85 with
+`torch_native` attention (a +1.18 point gap) and 30.26 with FlashInfer (a +1.59
+point gap). `torch_native` matched 45 predictions exactly and 79 per-example
+F1 values. Its generation-only time was 374.20 seconds; FlashInfer took 165.37
+seconds, 2.26x faster. Under the separately reported 15-word/answer-boundary
+view, Fast-dLLM scored 29.77 and FlashInfer SGLang scored 30.09, a 0.32 point
+gap; the raw comparison above remains the primary alignment result.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

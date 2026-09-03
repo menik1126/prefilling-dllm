@@ -4,6 +4,8 @@ import logging
 from array import array
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
+import torch
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
@@ -74,6 +76,14 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        has_parallelcomp = any(
+            req.dllm_parallelcomp_state is not None for req in batch.reqs
+        )
+        if has_parallelcomp and self.token_to_kv_pool_allocator.page_size != 1:
+            raise RuntimeError(
+                "dllm_parallelcomp currently requires KV cache page size 1"
+            )
+
         fdfo_mode = self.dllm_config.first_done_first_out_mode
         if fdfo_mode:
             fdfo_signal = (
@@ -91,12 +101,99 @@ class SchedulerDllmMixin:
             ), f"FDFO dLLM result is missing {signal_name}."
 
         # FDFO also commits unresolved blocks so their KV can be reused.
-        if fdfo_mode or result.next_token_ids:
+        if fdfo_mode or result.next_token_ids or has_parallelcomp:
             algo_states = result.dllm_algo_state
 
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
+                parallelcomp = req.dllm_parallelcomp_state
+                if parallelcomp is not None and parallelcomp["stage"] != "decode":
+                    cache_offset = sum(batch.extend_lens[:idx])
+                    round_cache_loc = batch.out_cache_loc[
+                        cache_offset : cache_offset + batch.extend_lens[idx]
+                    ]
+                    stage = parallelcomp["stage"]
+                    if stage == "prefix":
+                        if len(round_cache_loc) != parallelcomp["prefix_len"]:
+                            raise RuntimeError(
+                                "ParallelComp prefix KV span mismatch: "
+                                f"kv={len(round_cache_loc)}, "
+                                f"tokens={parallelcomp['prefix_len']}"
+                            )
+                        parallelcomp["common_prefix_indices"] = round_cache_loc.clone()
+                        req.prefix_indices = round_cache_loc.clone()
+                        parallelcomp["stage"] = "chunk"
+                        req.dllm_phase = DllmReqPhase.STAGING_PREFILL
+                    else:
+                        cursor = parallelcomp["chunk_cursor"]
+                        chunk_len = parallelcomp["chunk_lens"][cursor]
+                        query_len = parallelcomp["query_len"]
+                        if len(round_cache_loc) != chunk_len + query_len:
+                            raise RuntimeError(
+                                "ParallelComp chunk KV span mismatch: "
+                                f"kv={len(round_cache_loc)}, "
+                                f"chunk={chunk_len}, query={query_len}"
+                            )
+                        parallelcomp["chunk_kv_indices"].append(
+                            round_cache_loc[:chunk_len].clone()
+                        )
+                        if query_len:
+                            self.token_to_kv_pool_allocator.free(
+                                round_cache_loc[chunk_len:]
+                            )
+                        parallelcomp["chunk_cursor"] += 1
+                        if parallelcomp["chunk_cursor"] == len(
+                            parallelcomp["chunk_lens"]
+                        ):
+                            parts = []
+                            common_prefix_indices = parallelcomp[
+                                "common_prefix_indices"
+                            ]
+                            if common_prefix_indices is not None:
+                                parts.append(common_prefix_indices)
+                            parts.extend(parallelcomp["chunk_kv_indices"])
+                            req.prefix_indices = (
+                                torch.cat(parts)
+                                if parts
+                                else round_cache_loc[:0].clone()
+                            )
+                            # Make every retained chunk immediately visible to
+                            # ordinary request cleanup. Before this write, only
+                            # the most recent chunk is present in the request
+                            # row and earlier chunks are intentionally detached.
+                            req_row = self.req_to_token_pool.req_to_token[
+                                req.req_pool_idx
+                            ]
+                            req_row[: len(req.prefix_indices)] = req.prefix_indices
+                            req.kv.kv_allocated_len = len(req.prefix_indices)
+                            req.kv_committed_len = len(req.prefix_indices)
+                            parallelcomp["assembled_prefix_indices"] = (
+                                req.prefix_indices.clone()
+                            )
+                            parallelcomp["chunk_kv_indices"] = []
+                            parallelcomp["stage"] = "decode"
+                            req.dllm_algo_state = {
+                                # The first decode forward contains only query
+                                # plus masks; cached chunks are in the page table.
+                                "prompt_len": query_len,
+                                "full_prompt_len": len(req.origin_input_ids),
+                                "step": 0,
+                            }
+                            req.dllm_initialized = False
+                            req.dllm_canvas_output_len = -1
+                            req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        else:
+                            common_prefix_indices = parallelcomp[
+                                "common_prefix_indices"
+                            ]
+                            req.prefix_indices = (
+                                common_prefix_indices
+                                if common_prefix_indices is not None
+                                else round_cache_loc[:0].clone()
+                            )
+                            req.dllm_phase = DllmReqPhase.STAGING_PREFILL
+                    continue
 
                 if self.dllm_config.needs_full_prefill and fdfo_mode:
                     round_tokens = result.next_token_ids[idx]
@@ -111,7 +208,28 @@ class SchedulerDllmMixin:
                         self.dllm_config.dual_cache
                         and len(round_tokens) == self.dllm_config.block_size
                     )
-                    if dual_cache_round:
+                    if parallelcomp is not None:
+                        full_prompt_len = len(req.origin_input_ids)
+                        query_len = parallelcomp["query_len"]
+                        if dual_cache_round:
+                            req.full_untruncated_fill_ids[
+                                full_prompt_len : full_prompt_len + len(round_tokens)
+                            ] = round_tokens
+                        else:
+                            if (
+                                len(round_tokens)
+                                != query_len + self.dllm_config.block_size
+                            ):
+                                raise RuntimeError(
+                                    "ParallelComp first decode span mismatch: "
+                                    f"tokens={len(round_tokens)}, "
+                                    f"query={query_len}, "
+                                    f"block={self.dllm_config.block_size}"
+                                )
+                            req.full_untruncated_fill_ids[full_prompt_len:] = (
+                                round_tokens[query_len:]
+                            )
+                    elif dual_cache_round:
                         prompt_len = req.dllm_algo_state["prompt_len"]
                         req.full_untruncated_fill_ids[
                             prompt_len : prompt_len + len(round_tokens)
@@ -121,7 +239,11 @@ class SchedulerDllmMixin:
                     canvas = req.full_untruncated_fill_ids
 
                     if result.dllm_done_per_req_cpu[idx]:
-                        prompt_len = req.dllm_algo_state["prompt_len"]
+                        prompt_len = (
+                            len(req.origin_input_ids)
+                            if parallelcomp is not None
+                            else req.dllm_algo_state["prompt_len"]
+                        )
                         req.output_ids = array("q", canvas[prompt_len:])
                         req.dllm_incomplete_ids = array("q")
                         req.dllm_kv_indices = None
@@ -142,10 +264,12 @@ class SchedulerDllmMixin:
                     else:
                         req.dllm_algo_state = algo_states[idx]
                         if self.dllm_config.dual_cache:
-                            prompt_len = req.dllm_algo_state["prompt_len"]
-                            req.dllm_incomplete_ids = array(
-                                "q", canvas[prompt_len:]
+                            prompt_len = (
+                                len(req.origin_input_ids)
+                                if parallelcomp is not None
+                                else req.dllm_algo_state["prompt_len"]
                             )
+                            req.dllm_incomplete_ids = array("q", canvas[prompt_len:])
                             cache_offset = sum(batch.extend_lens[:idx])
                             round_cache_loc = batch.out_cache_loc[
                                 cache_offset : cache_offset + batch.extend_lens[idx]
@@ -161,8 +285,22 @@ class SchedulerDllmMixin:
                                         f"kv={len(round_cache_loc)}, "
                                         f"tokens={len(round_tokens)}"
                                     )
-                                req.prefix_indices = round_cache_loc[:prompt_len].clone()
-                                req.dllm_kv_indices = round_cache_loc[prompt_len:].clone()
+                                if parallelcomp is not None:
+                                    query_len = parallelcomp["query_len"]
+                                    assembled = parallelcomp["assembled_prefix_indices"]
+                                    req.prefix_indices = torch.cat(
+                                        [assembled, round_cache_loc[:query_len]]
+                                    )
+                                    req.dllm_kv_indices = round_cache_loc[
+                                        query_len:
+                                    ].clone()
+                                else:
+                                    req.prefix_indices = round_cache_loc[
+                                        :prompt_len
+                                    ].clone()
+                                    req.dllm_kv_indices = round_cache_loc[
+                                        prompt_len:
+                                    ].clone()
                         else:
                             release_kv_cache(req, self.tree_cache, is_insert=False)
                     continue
@@ -412,10 +550,23 @@ class SchedulerDllmMixin:
 
             # Prepare and add request
             req.init_next_round_input(self.tree_cache)
-            if (
-                self.dllm_config.needs_full_prefill
-                and req.dllm_algo_state is not None
-            ):
+            if self.dllm_config.needs_full_prefill and req.dllm_algo_state is not None:
+                parallelcomp = req.dllm_parallelcomp_state
+                if parallelcomp is not None and parallelcomp["stage"] != "decode":
+                    req.dllm_algo_state["prompt_len"] = len(
+                        req.full_untruncated_fill_ids
+                    )
+                    res = adder.add_one_req(
+                        req,
+                        has_chunked_req=True,
+                        truncation_align_size=self.truncation_align_size,
+                    )
+                    if res != AddReqResult.CONTINUE:
+                        if res == AddReqResult.NO_TOKEN:
+                            running_batch.batch_is_full = True
+                        break
+                    continue
+
                 # Req state can predate tokenization. Once Dream materializes
                 # its canvas, derive the authoritative prompt boundary from
                 # prompt + committed output + remaining-mask layout.
@@ -430,7 +581,16 @@ class SchedulerDllmMixin:
                         f"canvas_len={len(req.full_untruncated_fill_ids)}, "
                         f"remaining={remaining}"
                     )
-                req.dllm_algo_state["prompt_len"] = prompt_len
+                parallelcomp = req.dllm_parallelcomp_state
+                if (
+                    parallelcomp is not None
+                    and parallelcomp["stage"] == "decode"
+                    and not req.dllm_algo_state.get("dual_cache_ready", False)
+                ):
+                    req.dllm_algo_state["prompt_len"] = parallelcomp["query_len"]
+                    req.dllm_algo_state["full_prompt_len"] = prompt_len
+                else:
+                    req.dllm_algo_state["prompt_len"] = prompt_len
             res = adder.add_one_req(
                 req,
                 has_chunked_req=True,

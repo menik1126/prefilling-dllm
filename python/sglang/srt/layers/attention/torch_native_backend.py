@@ -308,6 +308,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
+        if not layer.is_cross_attention and forward_batch.dllm_force_causal:
+            causal = True
 
         self._run_sdpa_forward_extend(
             q_,
