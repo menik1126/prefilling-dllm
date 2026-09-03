@@ -126,23 +126,33 @@ class SchedulerDllmMixin:
                         parallelcomp["stage"] = "chunk"
                         req.dllm_phase = DllmReqPhase.STAGING_PREFILL
                     else:
-                        cursor = parallelcomp["chunk_cursor"]
-                        chunk_len = parallelcomp["chunk_lens"][cursor]
                         query_len = parallelcomp["query_len"]
-                        if len(round_cache_loc) != chunk_len + query_len:
-                            raise RuntimeError(
-                                "ParallelComp chunk KV span mismatch: "
-                                f"kv={len(round_cache_loc)}, "
-                                f"chunk={chunk_len}, query={query_len}"
-                            )
-                        parallelcomp["chunk_kv_indices"].append(
-                            round_cache_loc[:chunk_len].clone()
+                        chunk_batch = list(req.parallelcomp_chunk_batch_range())
+                        expected_kv_len = sum(
+                            parallelcomp["chunk_lens"][cursor] + query_len
+                            for cursor in chunk_batch
                         )
-                        if query_len:
-                            self.token_to_kv_pool_allocator.free(
-                                round_cache_loc[chunk_len:]
+                        if len(round_cache_loc) != expected_kv_len:
+                            raise RuntimeError(
+                                "ParallelComp batched chunk KV span mismatch: "
+                                f"kv={len(round_cache_loc)}, "
+                                f"expected={expected_kv_len}, "
+                                f"chunks={chunk_batch}, query={query_len}"
                             )
-                        parallelcomp["chunk_cursor"] += 1
+                        cache_cursor = 0
+                        for cursor in chunk_batch:
+                            chunk_len = parallelcomp["chunk_lens"][cursor]
+                            chunk_end = cache_cursor + chunk_len
+                            query_end = chunk_end + query_len
+                            parallelcomp["chunk_kv_indices"].append(
+                                round_cache_loc[cache_cursor:chunk_end].clone()
+                            )
+                            if query_len:
+                                self.token_to_kv_pool_allocator.free(
+                                    round_cache_loc[chunk_end:query_end]
+                                )
+                            cache_cursor = query_end
+                        parallelcomp["chunk_cursor"] = chunk_batch[-1] + 1
                         if parallelcomp["chunk_cursor"] == len(
                             parallelcomp["chunk_lens"]
                         ):

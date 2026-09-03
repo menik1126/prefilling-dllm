@@ -522,6 +522,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # ParallelComp retains causal chunk KV even though Dream's generation
     # canvas itself uses bidirectional attention.
     dllm_force_causal: bool = False
+    # Per request, lengths of independently masked ``chunk + query`` items
+    # packed into the current ParallelComp chunk forward.
+    dllm_parallelcomp_item_lens: Optional[List[Optional[List[int]]]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
@@ -785,6 +788,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             getattr(req, "dllm_parallelcomp_state", None) for req in batch.reqs
         ]
         dllm_force_causal = _parallelcomp_force_causal(batch.reqs)
+        dllm_parallelcomp_item_lens = [
+            (
+                req.parallelcomp_item_lens()
+                if callable(getattr(req, "parallelcomp_item_lens", None))
+                else None
+            )
+            for req in batch.reqs
+        ]
+        if not any(items is not None for items in dllm_parallelcomp_item_lens):
+            dllm_parallelcomp_item_lens = None
 
         ret = cls(
             # Required core inputs
@@ -823,6 +836,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             dllm_force_causal=dllm_force_causal,
+            dllm_parallelcomp_item_lens=dllm_parallelcomp_item_lens,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,

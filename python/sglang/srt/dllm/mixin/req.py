@@ -71,6 +71,7 @@ class ReqDllmMixin:
         prefix_len = config.get("prefix_len")
         query_len = config.get("query_len")
         chunk_lens = config.get("chunk_lens")
+        chunk_batch_size = config.get("chunk_batch_size", 1)
         if (
             not isinstance(prefix_len, int)
             or isinstance(prefix_len, bool)
@@ -80,6 +81,9 @@ class ReqDllmMixin:
             or query_len < 0
             or not isinstance(chunk_lens, list)
             or not chunk_lens
+            or not isinstance(chunk_batch_size, int)
+            or isinstance(chunk_batch_size, bool)
+            or chunk_batch_size <= 0
             or any(
                 not isinstance(length, int) or isinstance(length, bool) or length <= 0
                 for length in chunk_lens
@@ -87,7 +91,8 @@ class ReqDllmMixin:
         ):
             raise ValueError(
                 "dllm_parallelcomp requires non-negative prefix_len/query_len "
-                "and a non-empty list of positive chunk_lens"
+                "and a non-empty list of positive chunk_lens plus a positive "
+                "chunk_batch_size"
             )
         if prefix_len + sum(chunk_lens) + query_len != len(self.origin_input_ids):
             raise ValueError(
@@ -131,6 +136,7 @@ class ReqDllmMixin:
             "prefix_len": prefix_len,
             "query_len": query_len,
             "chunk_lens": list(chunk_lens),
+            "chunk_batch_size": chunk_batch_size,
             "chunk_offsets": [
                 prefix_len + sum(chunk_lens[:index]) for index in range(len(chunk_lens))
             ],
@@ -141,6 +147,24 @@ class ReqDllmMixin:
             "common_prefix_indices": None,
             "chunk_kv_indices": [],
         }
+
+    def parallelcomp_chunk_batch_range(self: Req) -> range:
+        state = self.dllm_parallelcomp_state
+        if state is None or state["stage"] != "chunk":
+            return range(0)
+        start = state["chunk_cursor"]
+        end = min(start + state["chunk_batch_size"], len(state["chunk_lens"]))
+        return range(start, end)
+
+    def parallelcomp_item_lens(self: Req) -> Optional[list[int]]:
+        state = self.dllm_parallelcomp_state
+        if state is None or state["stage"] != "chunk":
+            return None
+        query_len = state["query_len"]
+        return [
+            state["chunk_lens"][cursor] + query_len
+            for cursor in self.parallelcomp_chunk_batch_range()
+        ]
 
     def has_parallelcomp_prefill_cache(self: Req) -> bool:
         return self.dllm_parallelcomp_state is not None
@@ -172,13 +196,13 @@ class ReqDllmMixin:
         if stage == "prefix":
             values = list(range(state["prefix_len"]))
         elif stage == "chunk":
-            cursor = state["chunk_cursor"]
-            chunk_start = state["chunk_position_starts"][cursor]
-            chunk_len = state["chunk_lens"][cursor]
-            query_start = state["chunk_query_position_starts"][cursor]
             values = list(range(state["prefix_len"]))
-            values.extend(range(chunk_start, chunk_start + chunk_len))
-            values.extend(range(query_start, query_start + state["query_len"]))
+            for cursor in self.parallelcomp_chunk_batch_range():
+                chunk_start = state["chunk_position_starts"][cursor]
+                chunk_len = state["chunk_lens"][cursor]
+                query_start = state["chunk_query_position_starts"][cursor]
+                values.extend(range(chunk_start, chunk_start + chunk_len))
+                values.extend(range(query_start, query_start + state["query_len"]))
         else:
             values = list(range(state["prefix_len"]))
             for chunk_start, chunk_len in zip(
@@ -241,9 +265,6 @@ class ReqDllmMixin:
                         "q", self.origin_input_ids[: parallelcomp["prefix_len"]]
                     )
                 else:
-                    cursor = parallelcomp["chunk_cursor"]
-                    chunk_start = parallelcomp["chunk_offsets"][cursor]
-                    chunk_end = chunk_start + parallelcomp["chunk_lens"][cursor]
                     query_start = len(self.origin_input_ids) - parallelcomp["query_len"]
                     common_prefix_indices = parallelcomp["common_prefix_indices"]
                     self.prefix_indices = (
@@ -251,11 +272,15 @@ class ReqDllmMixin:
                         if common_prefix_indices is not None
                         else self.prefix_indices[:0]
                     )
-                    self.full_untruncated_fill_ids = (
-                        array("q", self.origin_input_ids[: parallelcomp["prefix_len"]])
-                        + array("q", self.origin_input_ids[chunk_start:chunk_end])
-                        + array("q", self.origin_input_ids[query_start:])
+                    batch_ids = array(
+                        "q", self.origin_input_ids[: parallelcomp["prefix_len"]]
                     )
+                    for cursor in self.parallelcomp_chunk_batch_range():
+                        chunk_start = parallelcomp["chunk_offsets"][cursor]
+                        chunk_end = chunk_start + parallelcomp["chunk_lens"][cursor]
+                        batch_ids.extend(self.origin_input_ids[chunk_start:chunk_end])
+                        batch_ids.extend(self.origin_input_ids[query_start:])
+                    self.full_untruncated_fill_ids = batch_ids
                 # A mask-free intermediate stage makes DllmAlgorithm perform
                 # exactly one model forward without entering denoising.
                 self.dllm_algo_state["prompt_len"] = len(self.full_untruncated_fill_ids)

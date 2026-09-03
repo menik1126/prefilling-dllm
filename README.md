@@ -169,6 +169,24 @@ seconds, 2.26x faster. Under the separately reported 15-word/answer-boundary
 view, Fast-dLLM scored 29.77 and FlashInfer SGLang scored 30.09, a 0.32 point
 gap; the raw comparison above remains the primary alignment result.
 
+Selected chunks can now be packed into the same model forward with
+`--server-chunk-prefill-batch-size` (default 4 in the evaluator). FlashInfer
+uses its item-aware paged-prefill metadata, while `torch_native` uses an
+explicit block-diagonal causal mask. In both paths, every item is
+`chunk + temporary query`: it can read the common prefix and its own causal
+history, but no sibling chunk. The scheduler splits the resulting KV slots,
+frees every temporary-query span, and retains the chunk spans in their original
+order.
+
+The complete 150-example batch-size-4 FlashInfer run scored 30.04 raw F1,
+versus 28.67 for Fast-dLLM and 30.26 for the earlier one-chunk-per-forward
+SGLang run. It matched 81 of the earlier SGLang raw predictions exactly and
+took 163.54 seconds, down from 165.37 seconds. A same-code 12-example A/B
+matched all 12 raw predictions exactly and reduced generation time from 13.36
+to 13.12 seconds. The end-to-end gain is intentionally modest because Dream's
+later denoising rounds dominate runtime; the chunk-build phase itself now uses
+one item-aware forward instead of up to four scheduler/model forwards.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

@@ -694,6 +694,71 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
+    def _process_parallelcomp_items(
+        self, forward_batch: ForwardBatch
+    ) -> MultiItemScoringParams:
+        """Build FlashInfer item boundaries without changing Dream RoPE IDs."""
+        item_groups = forward_batch.dllm_parallelcomp_item_lens
+        if item_groups is None:
+            return MultiItemScoringParams()
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if prefix_lens is None or extend_lens is None:
+            raise RuntimeError(
+                "ParallelComp item batching requires host sequence lengths"
+            )
+        if not (len(item_groups) == len(prefix_lens) == len(extend_lens)):
+            raise RuntimeError("ParallelComp item metadata does not match batch size")
+
+        device = forward_batch.input_ids.device
+        item_positions = []
+        max_item_positions = []
+        for items, extend_len in zip(item_groups, extend_lens):
+            if not items or any(length <= 0 for length in items):
+                raise RuntimeError("ParallelComp item lengths must be positive")
+            if any(length > 65536 for length in items):
+                raise RuntimeError(
+                    "ParallelComp FlashInfer items cannot exceed uint16 positions"
+                )
+            if sum(items) != extend_len:
+                raise RuntimeError(
+                    "ParallelComp item lengths do not cover the extend span: "
+                    f"items={items}, extend={extend_len}"
+                )
+            positions = torch.cat(
+                [
+                    torch.arange(length, dtype=torch.int64, device=device).to(
+                        torch.uint16
+                    )
+                    for length in items
+                ]
+            )
+            item_positions.append(positions)
+            max_item_positions.append(max(items) - 1)
+
+        padded_len = max(positions.numel() for positions in item_positions)
+        item_positions = [
+            torch.cat(
+                [
+                    positions,
+                    torch.zeros(
+                        padded_len - positions.numel(),
+                        dtype=torch.uint16,
+                        device=device,
+                    ),
+                ]
+            )
+            for positions in item_positions
+        ]
+        return MultiItemScoringParams(
+            prefix_len_ptr=torch.tensor(prefix_lens, dtype=torch.uint32, device=device),
+            token_pos_in_items_ptr=torch.cat(item_positions),
+            token_pos_in_items_len=padded_len & 0xFFFFFFFF,
+            max_item_len_ptr=torch.tensor(
+                max_item_positions, dtype=torch.uint16, device=device
+            ),
+        )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -982,9 +1047,10 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
+            parallelcomp_items = forward_batch.dllm_parallelcomp_item_lens is not None
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
-            if self.is_multimodal or self.enable_mis:
+            if self.is_multimodal or self.enable_mis or parallelcomp_items:
                 # use_ragged = False: Multi-item scoring requires the paged wrapper because:
                 # 1. Ragged wrapper doesn't support the specialized multi-item parameters
                 #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
@@ -1003,7 +1069,9 @@ class FlashInferAttnBackend(AttentionBackend):
 
             # Process multi-item scoring in attention backend instead of ForwardBatch
             multi_item_params = MultiItemScoringParams()
-            if self.enable_mis:
+            if parallelcomp_items:
+                multi_item_params = self._process_parallelcomp_items(forward_batch)
+            elif self.enable_mis:
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 

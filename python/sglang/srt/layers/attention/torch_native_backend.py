@@ -31,6 +31,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         )
         # full->SWA translated out_cache_loc, computed once per forward
         self.swa_out_cache_loc = None
+        self.parallelcomp_masks = None
 
     @staticmethod
     def _make_sliding_window_mask(
@@ -47,6 +48,28 @@ class TorchNativeAttnBackend(AttentionBackend):
         k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
         return (k_pos <= q_pos) & (k_pos >= q_pos - sliding_window_size)
 
+    @staticmethod
+    def _make_parallelcomp_mask(
+        *, prefix_len: int, item_lens: list[int], device: torch.device
+    ) -> torch.Tensor:
+        """Let every causal item see the shared prefix, but not sibling items."""
+        total_len = prefix_len + sum(item_lens)
+        mask = torch.zeros((total_len, total_len), dtype=torch.bool, device=device)
+        if prefix_len:
+            mask[:prefix_len, :prefix_len] = torch.ones(
+                (prefix_len, prefix_len), dtype=torch.bool, device=device
+            ).tril()
+        item_start = prefix_len
+        for item_len in item_lens:
+            item_end = item_start + item_len
+            if prefix_len:
+                mask[item_start:item_end, :prefix_len] = True
+            mask[item_start:item_end, item_start:item_end] = torch.ones(
+                (item_len, item_len), dtype=torch.bool, device=device
+            ).tril()
+            item_start = item_end
+        return mask
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -57,6 +80,27 @@ class TorchNativeAttnBackend(AttentionBackend):
             )
         else:
             self.swa_out_cache_loc = None
+        item_groups = forward_batch.dllm_parallelcomp_item_lens
+        if item_groups is None:
+            self.parallelcomp_masks = None
+        else:
+            prefix_lens = forward_batch.extend_prefix_lens_cpu
+            if prefix_lens is None or len(prefix_lens) != len(item_groups):
+                raise RuntimeError(
+                    "ParallelComp torch item metadata does not match batch size"
+                )
+            if any(item_lens is None for item_lens in item_groups):
+                raise RuntimeError(
+                    "ParallelComp chunk batch cannot mix with an ordinary request"
+                )
+            self.parallelcomp_masks = [
+                self._make_parallelcomp_mask(
+                    prefix_len=prefix_len,
+                    item_lens=item_lens,
+                    device=forward_batch.input_ids.device,
+                )
+                for prefix_len, item_lens in zip(prefix_lens, item_groups)
+            ]
 
     def _run_sdpa_forward_extend(
         self,
@@ -75,6 +119,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         causal=False,
         is_cross_attn=False,
         sliding_window_size: Optional[int] = None,
+        parallelcomp_masks: Optional[list[torch.Tensor]] = None,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -154,6 +199,17 @@ class TorchNativeAttnBackend(AttentionBackend):
                     sliding_window_size=sliding_window_size,
                     device=per_req_query.device,
                 )
+                is_causal = False
+            if parallelcomp_masks is not None:
+                prefix_len = int(prefill_seq_len_q)
+                parallelcomp_mask = parallelcomp_masks[seq_idx]
+                if parallelcomp_mask.shape != (int(seq_len_kv), int(seq_len_kv)):
+                    raise RuntimeError(
+                        "ParallelComp torch attention layout mismatch: "
+                        f"prefix={prefix_len}, mask={parallelcomp_mask.shape}, "
+                        f"kv={int(seq_len_kv)}"
+                    )
+                attn_mask = parallelcomp_mask
                 is_causal = False
 
             per_req_out_redudant = (
@@ -334,6 +390,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 and layer.sliding_window_size > -1
                 else None
             ),
+            parallelcomp_masks=self.parallelcomp_masks,
         )
         return o
 

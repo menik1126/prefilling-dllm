@@ -9,6 +9,8 @@ share one Dream model instance.
 The evaluator supports both continuous and reused chunk positions. With
 ``--server-chunk-prefill``, it also sends exact chunk boundaries and RoPE starts
 so SGLang can build every retained chunk independently from the common prefix.
+Multiple isolated chunks can share one model forward without seeing each
+other, controlled by ``--server-chunk-prefill-batch-size``.
 """
 
 from __future__ import annotations
@@ -334,12 +336,20 @@ def build_parser() -> argparse.ArgumentParser:
             "the template prefix and discarding temporary query KV."
         ),
     )
+    parser.add_argument(
+        "--server-chunk-prefill-batch-size",
+        type=int,
+        default=4,
+        help="Number of independently masked chunks packed into one server forward.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.server_chunk_prefill_batch_size <= 0:
+        raise ValueError("--server-chunk-prefill-batch-size must be positive")
     if args.score_batch_size <= 0:
         raise ValueError("score_batch_size must be positive")
     fixed_chunk_indices = [
@@ -479,6 +489,7 @@ def main() -> None:
                         "prefix_len": len(prefix_ids),
                         "chunk_lens": [len(chunks[index]) for index in selected],
                         "query_len": len(query_ids),
+                        "chunk_batch_size": args.server_chunk_prefill_batch_size,
                         "chunk_position_starts": chunk_position_starts,
                         "chunk_query_position_starts": chunk_query_position_starts,
                         "query_position_start": query_rope_start,
@@ -521,6 +532,7 @@ def main() -> None:
             "top_k": args.top_k,
             "chunk_bos": args.chunk_bos,
             "server_chunk_prefill": args.server_chunk_prefill,
+            "server_chunk_prefill_batch_size": args.server_chunk_prefill_batch_size,
             "raw_context_tokens": len(context_ids),
             "candidate_chunks": len(chunks),
             "selected_chunk_indices": selected,
@@ -566,6 +578,7 @@ def main() -> None:
         "chunk_size": args.chunk_size,
         "top_k": args.top_k,
         "server_chunk_prefill": args.server_chunk_prefill,
+        "server_chunk_prefill_batch_size": args.server_chunk_prefill_batch_size,
         "draft_tokens": args.draft_tokens,
         "prediction_max_words": args.prediction_max_words,
         "stop_at_answer_boundary": args.stop_at_answer_boundary,
