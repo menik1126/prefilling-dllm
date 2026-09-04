@@ -233,6 +233,56 @@ seconds at batch size 4 (1.95x); the full-set gain is smaller because draft
 generation, final denoising, and examples with four or fewer chunks cannot
 benefit from candidate batching.
 
+The selector can now also microbatch across examples with
+`--selector-microbatch-size`. Within each window it submits at most one Dream
+draft request, batched when multiple active examples are present, flattens their
+variable number of candidate chunks into scorer batches, and scatters the score
+rows back without changing output order. An example with no more than `top_k`
+candidates skips both draft generation and scoring because every chunk must be
+selected. The default microbatch size is one and preserves the original scalar
+draft-request shape.
+
+A same-code two-H20 comparison used two independent replicas, 75 examples per
+GPU, `--score-batch-size 8`, and selector microbatch sizes one and eight. Of the
+150 examples, 110 required scoring and 40 took the exact-selection fast path.
+Times below are the slower replica's critical path; request counts are summed
+over both replicas.
+
+| Selector microbatch | Wall (s) | Selector (s) | Draft (s) | Chunk score (s) | Final generation (s) | Draft / score requests | Raw F1 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 179.785 | 96.535 | 37.798 | 58.737 | 76.372 | 110 / 171 | 47.373 |
+| 8 | 151.072 | 67.816 | 9.631 | 58.186 | 76.383 | 20 / 134 | 47.373 |
+
+Microbatching therefore made draft generation 3.925x faster, the complete
+selector 1.423x faster, and the measured evaluation 1.190x faster. Relative to
+the earlier score-batch-only run, wall time fell from 196 to 151 seconds
+(1.297x). All 150 selected chunk sets, raw predictions, and per-example scores
+matched the scalar run; the combined score remained 0.657 point below the
+48.03 reference. Without deterministic inference, three of the 110 active
+examples produced batch-shape-dependent draft IDs and score rows, but none
+changed a selected chunk or final prediction.
+
+`--enable-deterministic-inference` previously gave Dream a 4096-token
+`truncation_align_size` that the dLLM admission path rejected. Full-prefill
+dLLM requests (currently Dream) now accept that deterministic alignment because
+the complete canvas is admitted atomically and is never scheduler-truncated.
+Block-dLLM prefill still rejects it, and FlashInfer continues to use its fixed
+split for deterministic reductions. With normal EOS handling for final
+generation, an eight-example strict A/B produced identical draft IDs, chunk
+scores, selections, and final predictions: selector time fell from 16.441 to
+9.304 seconds (1.767x), and wall time from 34.939 to 27.754 seconds (1.259x).
+
+On the full deterministic microbatch-eight run, the 110 active examples' draft
+results and score rows exactly matched the canonical scalar selector, as did
+all 150 selections. Raw F1 was 47.325, 0.705 point below the reference, with no
+request or CUDA errors. This mode is for bitwise batch invariance rather than
+maximum throughput: its slower replica took 203.352 seconds because final
+generation rose to 122.674 seconds, versus 76.383 seconds on the
+non-deterministic performance path. For this MultiFieldQA performance run, the
+default recommendation is therefore selector microbatch eight without global
+deterministic inference; enable the latter when exact draft/score
+reproducibility is required.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

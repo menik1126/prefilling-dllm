@@ -1408,9 +1408,10 @@ class PrefillAdder:
                 if not is_dream_full_prefill and self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
+                if not self.dllm_config.needs_full_prefill:
+                    assert (
+                        truncation_align_size is None
+                    ), "truncation_align_size is not supported for block-dllm prefill"
 
                 if (
                     tile_stop := self._check_prefill_tile_budget(input_tokens)
@@ -1418,6 +1419,11 @@ class PrefillAdder:
                     return tile_stop
 
                 if self.dllm_config.needs_full_prefill:
+                    # Dream admits its complete canvas atomically, so the
+                    # deterministic prefill split alignment does not truncate
+                    # or otherwise alter scheduler admission here.  The value
+                    # is still consumed by the attention backend to keep its
+                    # reductions batch invariant.
                     result = self._add_dream_req(req, prefix_len)
                 else:
                     result = self._add_block_dllm_req(req, prefix_len)

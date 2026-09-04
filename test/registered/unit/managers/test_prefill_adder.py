@@ -185,6 +185,60 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertEqual(constrained_adder.can_run_list, [first])
 
+    def test_dream_full_prefill_accepts_deterministic_truncation_alignment(self):
+        self.mock_token_allocator.available_size.return_value = 32
+        config = DllmConfig(
+            algorithm="Dream",
+            algorithm_config={},
+            block_size=None,
+            mask_id=151666,
+            max_running_requests=1,
+            needs_full_prefill=True,
+        )
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=4,
+            dllm_config=config,
+        )
+        req = self._create_dream_req("deterministic-dream", canvas_len=4)
+
+        result = adder.add_one_req(
+            req,
+            has_chunked_req=False,
+            truncation_align_size=4096,
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.extend_range, Range(0, 4))
+
+    def test_block_dllm_rejects_deterministic_truncation_alignment(self):
+        self.mock_token_allocator.available_size.return_value = 32
+        config = DllmConfig(
+            algorithm="LLaDA",
+            algorithm_config={},
+            block_size=4,
+            mask_id=126336,
+            max_running_requests=1,
+            needs_full_prefill=False,
+        )
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=4,
+            dllm_config=config,
+        )
+        req = self._create_dream_req("deterministic-block-dllm", canvas_len=4)
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "truncation_align_size is not supported for block-dllm prefill",
+        ):
+            adder.add_one_req(
+                req,
+                has_chunked_req=False,
+                truncation_align_size=4096,
+            )
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),
