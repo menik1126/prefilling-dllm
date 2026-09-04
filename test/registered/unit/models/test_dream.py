@@ -632,6 +632,193 @@ class TestDreamAlgorithm(CustomTestCase):
         self.assertEqual(done, [False])
         self.assertEqual(batch.input_ids.tolist(), [3])
 
+    def test_prefilling_dream_vectorized_dual_cache_matches_per_row(self):
+        common_config = dict(
+            algorithm="PrefillingDream",
+            block_size=4,
+            mask_id=5,
+        )
+        reference = PrefillingDream(
+            _config(
+                **common_config,
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "finish_on_final_mutation": True,
+                },
+            )
+        )
+        vectorized = PrefillingDream(
+            _config(
+                **common_config,
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "finish_on_final_mutation": True,
+                    "vectorized_dual_cache": True,
+                    "batch_token_host_transfer": True,
+                },
+            )
+        )
+
+        ids = torch.tensor(
+            [
+                5,
+                5,
+                5,
+                5,
+                5,
+                1,
+                5,
+                2,
+                0,
+                1,
+                2,
+                3,
+            ]
+        )
+        logits = torch.zeros((12, 6))
+        # Request 0 accepts every slot. Request 1 has no value above the
+        # threshold and must force exactly its uniquely most-confident mask.
+        for position, token in enumerate((0, 1, 2, 3)):
+            logits[position, token] = 12.0
+        logits[4, 3] = 2.0
+        logits[6, 4] = 1.0
+
+        reference_batch = self._forward_batch(ids.clone(), [4, 4, 4], block_size=4)
+        vectorized_batch = self._forward_batch(ids.clone(), [4, 4, 4], block_size=4)
+        reference_states = [
+            {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True}
+            for _ in range(3)
+        ]
+        vectorized_states = [dict(state) for state in reference_states]
+
+        reference_done = reference.step(
+            reference_batch, logits.clone(), reference_states
+        )
+        vectorized_done = vectorized.step(
+            vectorized_batch, logits.clone(), vectorized_states
+        )
+
+        self.assertEqual(vectorized_done, reference_done)
+        self.assertEqual(
+            vectorized_batch.input_ids.tolist(),
+            reference_batch.input_ids.tolist(),
+        )
+        self.assertTrue(
+            all(state["last_round_was_dual_cache"] for state in vectorized_states)
+        )
+        self.assertEqual(
+            vectorized_batch.dllm_output_ids_cpu.tolist(),
+            vectorized_batch.input_ids.tolist(),
+        )
+
+    def test_prefilling_dream_vectorized_keeps_logprob_observer(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "finish_on_final_mutation": True,
+                    "vectorized_dual_cache": True,
+                    "batch_token_host_transfer": True,
+                },
+                block_size=2,
+            )
+        )
+        batch = self._forward_batch(torch.tensor([99, 99]), [2], block_size=2)
+        batch.return_logprob = True
+        logits = torch.zeros((2, 5))
+        logits[0, 1] = 8.0
+        logits[1, 2] = 8.0
+        state = {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True}
+
+        done = algorithm.step(batch, logits, [state])
+
+        self.assertEqual(done, [False])
+        self.assertEqual(batch.input_ids.tolist(), [1, 2])
+
+    def test_prefilling_dream_vectorized_falls_back_for_initial_prefill(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "vectorized_dual_cache": True,
+                },
+                block_size=2,
+            )
+        )
+        batch = self._forward_batch(torch.tensor([10, 11, 99, 99]), [4], block_size=2)
+        logits = torch.zeros((2, 5))
+        logits[:, 3] = 8.0
+        state = {"prompt_len": 2, "is_prefill": True}
+
+        done = algorithm.step(batch, logits, [state])
+
+        self.assertEqual(done, [False])
+        self.assertEqual(batch.input_ids.tolist(), [10, 11, 3, 99])
+        self.assertTrue(state["dual_cache_ready"])
+
+    def test_prefilling_dream_vectorized_rejects_unsafe_batch_layouts(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "dual_cache": True,
+                    "vectorized_dual_cache": True,
+                    "vectorized_dual_cache_max_batch_size": 1,
+                },
+                block_size=2,
+            )
+        )
+        states = [
+            {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True}
+            for _ in range(2)
+        ]
+        logits = torch.zeros((4, 5))
+        batch = self._forward_batch(torch.tensor([99, 99, 99, 99]), [2, 2])
+
+        self.assertFalse(
+            algorithm._can_vectorize_dual_cache(batch, logits, states, [2, 2])
+        )
+
+        algorithm.vectorized_dual_cache_max_batch_size = 2
+        batch.input_ids = torch.tensor([99, 0, 99, 0, 99, 0, 99, 0])[::2]
+        self.assertFalse(batch.input_ids.is_contiguous())
+        self.assertFalse(
+            algorithm._can_vectorize_dual_cache(batch, logits, states, [2, 2])
+        )
+
+    def test_prefilling_dream_fdfo_clears_stale_host_token_payload(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "dual_cache": True,
+                    "batch_token_host_transfer": True,
+                },
+                block_size=2,
+                first_done_first_out_mode=True,
+            )
+        )
+        batch = self._forward_batch(torch.tensor([4, 4]), [2], block_size=2)
+        batch.dllm_output_ids_cpu = torch.tensor([77, 78])
+        state = {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True}
+        model_runner = MagicMock()
+        model_runner.forward.return_value = SimpleNamespace(
+            logits_output=SimpleNamespace(full_logits=torch.zeros((2, 5))),
+            can_run_graph=True,
+        )
+
+        with patch.object(algorithm, "step", return_value=[False]):
+            result = algorithm._run_fdfo_full_prefill(model_runner, batch, [state])
+
+        self.assertIsNone(batch.dllm_output_ids_cpu)
+        self.assertEqual(result[1], [[4, 4]])
+
     def test_prefilling_dream_fdfo_carries_only_unfinished_requests(self):
         algorithm = PrefillingDream(
             _config(
@@ -640,6 +827,8 @@ class TestDreamAlgorithm(CustomTestCase):
                     "threshold": 0.9,
                     "dual_cache": True,
                     "finish_on_final_mutation": True,
+                    "vectorized_dual_cache": True,
+                    "batch_token_host_transfer": True,
                 },
                 block_size=2,
                 mask_id=4,

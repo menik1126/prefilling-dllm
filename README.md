@@ -474,6 +474,38 @@ critical paths of 41.746, 41.924, and 41.621 seconds. Raw artifacts are under
 `/results/dream_early_done_ab_20260904` and
 `/results/dream_early_done_20260904` in the fixed experiment container.
 
+The remaining per-request confidence sampling and token readback can also be
+batched across a steady-state dual-cache microbatch. Enable
+`vectorized_dual_cache: true` together with `batch_token_host_transfer: true`,
+or use `benchmark/dllm/prefilling_dream_longbench_vectorized.yaml`. The path is
+limited to contiguous, fixed-width, fully initialized dual-cache rounds and a
+configurable maximum batch size (eight in the validated config). Initial
+prompt forwards, partial drafts, dynamic layouts, unsupported devices, and
+larger batches fall back to the original per-request implementation.
+
+A two-phase cross-over A/B eliminated per-GPU bias: phase zero ran the control
+on GPU 0 and the vectorized path on GPU 1, while phase one swapped them. Both
+used the early-completion optimization, identical 75-example splits, eight
+warm-up examples per service, generation microbatch eight, and no unrelated
+GPU process:
+
+| Sampling path | Phase 0 generation (s) | Phase 1 generation (s) | 150-example sum (s) | B=8 graph round (ms) | Raw F1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Per-request control | 39.421 | 41.589 | 81.010 | 44.604 | 47.736176 |
+| Vectorized + shared D2H | 39.251 | 41.073 | 80.324 | 42.884 | 47.736176 |
+
+The B=8 denoising rounds improved 1.0401x and estimated graph time improved
+1.0365x, but complete generation improved only 1.0085x because long-prompt
+eager forwards and the transformer/FlashInfer work still dominate. Both paths
+ran the same 577 graph launches, 3,440 request-rounds, and 110,080 query tokens.
+All 150 input hashes, raw and processed predictions, per-example scores,
+completion tokens, and finish reasons matched exactly; there were no empty
+responses, retractions, or inference errors. The option remains disabled by
+default because its end-to-end gain is workload- and batch-shape-dependent.
+Raw artifacts and the machine-readable analysis are under
+`/results/dream_vectorized_hostmerge_ab_20260905` in the fixed experiment
+container.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

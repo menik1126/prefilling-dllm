@@ -27,6 +27,18 @@ class PrefillingDream(DllmAlgorithm):
         self.finish_on_final_mutation = bool(
             config.algorithm_config.get("finish_on_final_mutation", False)
         )
+        # The reference implementation processes every request independently.
+        # On CUDA that turns mask discovery and threshold selection into several
+        # device synchronizations per request. Keep the batched dual-cache path
+        # opt-in until it has been validated on each backend/model combination.
+        self.vectorized_dual_cache = bool(
+            config.algorithm_config.get("vectorized_dual_cache", False)
+        )
+        self.vectorized_dual_cache_max_batch_size = int(
+            config.algorithm_config.get("vectorized_dual_cache_max_batch_size", 8)
+        )
+        if self.vectorized_dual_cache_max_batch_size < 1:
+            raise ValueError("vectorized_dual_cache_max_batch_size must be positive")
 
     def max_steps(self, block_size: int) -> int:
         # One initial prefill transfer and at most one forced token per later
@@ -36,6 +48,123 @@ class PrefillingDream(DllmAlgorithm):
 
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
         return [{"is_prefill": True} for _ in range(forward_batch.batch_size)]
+
+    def _can_vectorize_dual_cache(
+        self,
+        forward_batch: ForwardBatch,
+        full_logits: torch.Tensor,
+        states: List[Any],
+        lengths: List[int],
+    ) -> bool:
+        """Return whether this is the fixed-width steady-state Dream path.
+
+        Initial prompt forwards and bounded partial drafts intentionally retain
+        the reference per-request implementation. Their layouts/state machines
+        differ from the stable ``[batch, block, ...]`` dual-cache rounds this
+        optimization targets.
+        """
+        batch_size = forward_batch.batch_size
+        return (
+            self.vectorized_dual_cache
+            and self.dual_cache
+            and forward_batch.input_ids.device.type in ("cpu", "cuda")
+            and batch_size <= self.vectorized_dual_cache_max_batch_size
+            and len(states) == batch_size
+            and len(lengths) == batch_size
+            and all(length == self.block_size for length in lengths)
+            and forward_batch.input_ids.ndim == 1
+            and forward_batch.input_ids.numel() == batch_size * self.block_size
+            and forward_batch.input_ids.is_contiguous()
+            and full_logits.ndim == 2
+            and full_logits.shape[0] == batch_size * self.block_size
+            and full_logits.shape[1] > 0
+            and full_logits.device == forward_batch.input_ids.device
+            and full_logits.is_contiguous()
+            and all(
+                isinstance(state, dict)
+                and state.get("partial_draft_stage") is None
+                and not state.get("partial_draft", False)
+                and not state.get("is_prefill", True)
+                and state.get("dual_cache_ready", False)
+                for state in states
+            )
+        )
+
+    def _step_vectorized_dual_cache(
+        self,
+        forward_batch: ForwardBatch,
+        full_logits: torch.Tensor,
+        states: List[Any],
+    ) -> List[bool]:
+        """Advance one steady-state dual-cache round as a single batch.
+
+        Masked rows from every request are compacted once, sampled together,
+        and scattered back into the fixed-width canvases. This preserves the
+        reference threshold/fallback rule while replacing O(batch) dynamic CUDA
+        readbacks with one compact-index discovery and one batched completion
+        readback. With batched host transfer enabled, the completion readback
+        also carries the tokens consumed by FDFO.
+        """
+        batch_size = forward_batch.batch_size
+        block_size = self.block_size
+        input_ids = forward_batch.input_ids.reshape(batch_size, block_size)
+        flat_input_ids = input_ids.reshape(-1)
+        flat_logits = full_logits.reshape(-1, full_logits.shape[-1])
+
+        for state in states:
+            state["last_round_was_dual_cache"] = True
+
+        mask = flat_input_ids.eq(self.mask_id)
+        mask_by_request = mask.reshape(batch_size, block_size)
+        has_mask = mask_by_request.any(dim=1)
+        mask_positions = mask.nonzero(as_tuple=False).flatten()
+
+        # A completed observer batch needs no vocabulary-sized sampling work.
+        if mask_positions.numel() == 0:
+            if self.batch_token_host_transfer:
+                forward_batch.dllm_output_ids_cpu = input_ids.cpu().reshape(-1)
+            return [True] * batch_size
+
+        token_logits = flat_logits.index_select(0, mask_positions)
+        probs = F.softmax(token_logits, dim=-1)
+        confidence, sampled_tokens = probs.max(dim=-1)
+
+        dense_confidence = torch.full(
+            (batch_size * block_size,),
+            float("-inf"),
+            dtype=confidence.dtype,
+            device=confidence.device,
+        )
+        dense_tokens = torch.zeros_like(flat_input_ids)
+        dense_confidence.index_copy_(0, mask_positions, confidence)
+        dense_tokens.index_copy_(0, mask_positions, sampled_tokens)
+        dense_confidence = dense_confidence.reshape(batch_size, block_size)
+        dense_tokens = dense_tokens.reshape(batch_size, block_size)
+
+        accepted = mask_by_request & (dense_confidence >= self.threshold)
+        accepted_any = accepted.any(dim=1)
+        needs_fallback = has_mask & ~accepted_any
+        fallback_positions = torch.topk(dense_confidence, k=1, dim=1).indices
+        fallback = torch.zeros_like(accepted)
+        fallback.scatter_(1, fallback_positions, needs_fallback.unsqueeze(1))
+        accepted |= fallback
+
+        input_ids.copy_(torch.where(accepted, dense_tokens, input_ids))
+
+        if self.finish_on_final_mutation and not getattr(
+            forward_batch, "return_logprob", False
+        ):
+            if self.batch_token_host_transfer:
+                host_input_ids = input_ids.cpu()
+                forward_batch.dllm_output_ids_cpu = host_input_ids.reshape(-1)
+                done = ~host_input_ids.eq(self.mask_id).any(dim=1)
+            else:
+                done = ~input_ids.eq(self.mask_id).any(dim=1)
+        else:
+            # Preserve the default final-observer round: a request that removed
+            # its last mask in this mutation is reported done next time.
+            done = ~has_mask
+        return done.tolist()
 
     def step(
         self,
@@ -76,6 +205,10 @@ class PrefillingDream(DllmAlgorithm):
         else:
             logits_lengths = lengths
         logits_parts = full_logits.split(logits_lengths)
+
+        if self._can_vectorize_dual_cache(forward_batch, full_logits, states, lengths):
+            return self._step_vectorized_dual_cache(forward_batch, full_logits, states)
+
         done: List[bool] = []
 
         for ids, logits, state in zip(input_parts, logits_parts, states):

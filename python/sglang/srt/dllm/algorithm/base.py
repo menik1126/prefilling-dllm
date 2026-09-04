@@ -34,6 +34,9 @@ class DllmAlgorithm:
         self.mask_id = config.mask_id
         self.fdfo = config.first_done_first_out_mode
         self.needs_full_prefill = config.needs_full_prefill
+        self.batch_token_host_transfer = bool(
+            config.algorithm_config.get("batch_token_host_transfer", False)
+        )
 
     @staticmethod
     def from_server_args(server_args: ServerArgs):
@@ -199,11 +202,32 @@ class DllmAlgorithm:
                 "Full-prefill dLLM FDFO execution requires sequence lengths"
             )
 
+        # ForwardBatch objects are normally per-round, but clear the optional
+        # algorithm-produced host payload defensively before every execution.
+        forward_batch.dllm_output_ids_cpu = None
         states = self._prepare_states(forward_batch, algo_states)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
-        next_token_ids = forward_batch.input_ids.split(sequence_lengths)
+        shared_host_ids = getattr(forward_batch, "dllm_output_ids_cpu", None)
+        if shared_host_ids is not None:
+            if (
+                not isinstance(shared_host_ids, torch.Tensor)
+                or shared_host_ids.device.type != "cpu"
+                or shared_host_ids.ndim != 1
+                or not shared_host_ids.is_contiguous()
+                or shared_host_ids.dtype != forward_batch.input_ids.dtype
+                or shared_host_ids.numel() != forward_batch.input_ids.numel()
+            ):
+                raise RuntimeError("Invalid batched dLLM host-token payload")
+            next_token_ids = shared_host_ids.split(sequence_lengths)
+        elif self.batch_token_host_transfer:
+            # Copy the packed batch to host once. Calling ``tolist()`` on each
+            # CUDA split separately creates one small device-to-host transfer
+            # per request on the latency-sensitive FDFO path.
+            next_token_ids = forward_batch.input_ids.cpu().split(sequence_lengths)
+        else:
+            next_token_ids = forward_batch.input_ids.split(sequence_lengths)
         next_token_ids_list = [tokens.tolist() for tokens in next_token_ids]
         states_out = [None if done[i] else states[i] for i in range(batch_size)]
 

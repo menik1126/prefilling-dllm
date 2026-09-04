@@ -546,6 +546,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Per request, lengths of independently masked ``chunk + query`` items
     # packed into the current ParallelComp chunk forward.
     dllm_parallelcomp_item_lens: Optional[List[Optional[List[int]]]] = None
+    # Optional packed CPU token result produced by a dLLM algorithm so the
+    # FDFO result path can reuse the same D2H transfer used for completion.
+    dllm_output_ids_cpu: Optional[torch.Tensor] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
