@@ -53,7 +53,7 @@ class DreamModel(Qwen2ForCausalLM):
         )
 
         if not get_embedding:
-            if forward_batch.forward_mode.is_dllm_extend():
+            if forward_batch.forward_mode.is_dllm_full_attention():
                 seq_lens = forward_batch.extend_seq_lens_cpu
 
                 if seq_lens is None:

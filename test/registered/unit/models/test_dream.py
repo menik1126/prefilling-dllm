@@ -17,7 +17,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -46,6 +46,181 @@ def _config(**kwargs):
     )
     values.update(kwargs)
     return DllmConfig(**values)
+
+
+class TestDreamDenoiseForwardMode(CustomTestCase):
+    def test_forward_mode_contract(self):
+        self.assertTrue(ForwardMode.DLLM_DENOISE.is_extend())
+        self.assertTrue(ForwardMode.DLLM_DENOISE.is_prefill())
+        self.assertTrue(ForwardMode.DLLM_DENOISE.is_cuda_graph())
+        self.assertTrue(ForwardMode.DLLM_DENOISE.is_dllm_denoise())
+        self.assertTrue(ForwardMode.DLLM_DENOISE.is_dllm_full_attention())
+        self.assertFalse(ForwardMode.DLLM_DENOISE.is_decode())
+        self.assertFalse(ForwardMode.DLLM_DENOISE.is_dllm_extend())
+
+        self.assertTrue(ForwardMode.DLLM_EXTEND.is_dllm_extend())
+        self.assertTrue(ForwardMode.DLLM_EXTEND.is_dllm_full_attention())
+        self.assertFalse(ForwardMode.DLLM_EXTEND.is_dllm_denoise())
+
+    def test_prepare_for_denoise_reuses_existing_slots_in_request_order(self):
+        block_size = 4
+        config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={"dual_cache": True, "denoise_fast_path": True},
+            block_size=block_size,
+            first_done_first_out_mode=True,
+        )
+
+        def make_req(prompt, canvas, prefix_indices, kv_indices, pool_idx):
+            fill_ids = array("q", prompt + canvas)
+            prefix_len = len(prompt)
+            seq_len = prefix_len + block_size
+            return SimpleNamespace(
+                dllm_algo_state={
+                    "prompt_len": prefix_len,
+                    "is_prefill": False,
+                    "dual_cache_ready": True,
+                },
+                dllm_partial_draft_state=None,
+                dllm_parallelcomp_state=None,
+                multimodal_inputs=None,
+                input_embeds=None,
+                positional_embed_overrides=None,
+                return_logprob=False,
+                grammar=None,
+                is_retracted=False,
+                retracted_stain=False,
+                session=None,
+                prefix_indices=torch.tensor(prefix_indices),
+                dllm_incomplete_ids=array("q", canvas),
+                dllm_kv_indices=torch.tensor(kv_indices),
+                req_pool_idx=pool_idx,
+                kv=SimpleNamespace(kv_allocated_len=seq_len),
+                sampling_params=SimpleNamespace(max_new_tokens=block_size),
+                extend_range=SimpleNamespace(
+                    start=prefix_len,
+                    end=seq_len,
+                    length=block_size,
+                ),
+                origin_input_ids=array("q", prompt),
+                full_untruncated_fill_ids=fill_ids,
+                extend_batch_idx=0,
+                kv_committed_len=seq_len,
+                logprob_start_len=-1,
+                get_fill_ids=lambda fill_ids=fill_ids: fill_ids,
+            )
+
+        req0 = make_req(
+            [10, 11],
+            [21, 22, 99, 99],
+            [101, 102],
+            [201, 202, 203, 204],
+            7,
+        )
+        req1 = make_req(
+            [12, 13, 14],
+            [31, 99, 33, 99],
+            [111, 112, 113],
+            [211, 212, 213, 214],
+            8,
+        )
+        batch = ScheduleBatch(
+            reqs=[req0, req1],
+            model_config=SimpleNamespace(
+                is_encoder_decoder=False,
+                vocab_size=1000,
+            ),
+            enable_overlap=False,
+            return_logprob=False,
+            device="cpu",
+            dllm_config=config,
+        )
+
+        self.assertTrue(batch.can_prepare_for_denoise())
+        config.denoise_fast_path = False
+        self.assertFalse(batch.can_prepare_for_denoise())
+        config.denoise_fast_path = True
+        req1.dllm_algo_state["partial_draft"] = True
+        self.assertFalse(batch.can_prepare_for_denoise())
+        req1.dllm_algo_state.pop("partial_draft")
+        self.assertTrue(batch.can_prepare_for_denoise())
+
+        sentinel_sampling_info = object()
+        with patch(
+            "sglang.srt.managers.schedule_batch.alloc_for_extend"
+        ) as alloc_for_extend, patch(
+            "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch",
+            return_value=sentinel_sampling_info,
+        ) as sampling_factory:
+            batch.prepare_for_denoise()
+
+        alloc_for_extend.assert_not_called()
+        sampling_factory.assert_called_once_with(batch, 1000)
+        self.assertEqual(batch.forward_mode, ForwardMode.DLLM_DENOISE)
+        self.assertEqual(batch.prefix_lens, [2, 3])
+        self.assertEqual(batch.extend_lens, [block_size, block_size])
+        self.assertEqual(batch.extend_num_tokens, 2 * block_size)
+        self.assertEqual(batch.seq_lens_cpu.tolist(), [6, 7])
+        self.assertEqual(batch.seq_lens_sum, 13)
+        self.assertEqual(batch.req_pool_indices_cpu.tolist(), [7, 8])
+        self.assertEqual(
+            batch.out_cache_loc.tolist(),
+            [201, 202, 203, 204, 211, 212, 213, 214],
+        )
+        self.assertEqual(
+            batch.prefill_input_ids_cpu.tolist(),
+            [21, 22, 99, 99, 31, 99, 33, 99],
+        )
+        self.assertIs(batch.sampling_info, sentinel_sampling_info)
+        self.assertEqual(req0.extend_batch_idx, 1)
+        self.assertEqual(req1.extend_batch_idx, 1)
+        self.assertEqual(req0.kv_committed_len, 6)
+        self.assertEqual(req1.kv_committed_len, 7)
+
+    def test_scheduler_routes_only_eligible_batches_to_denoise_prepare(self):
+        config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={"dual_cache": True, "denoise_fast_path": True},
+            block_size=32,
+            first_done_first_out_mode=True,
+        )
+        scheduler = SimpleNamespace(
+            req_to_token_pool=object(),
+            token_to_kv_pool_allocator=object(),
+            tree_cache=object(),
+            model_config=object(),
+            enable_overlap=False,
+            spec_algorithm=object(),
+            dllm_config=config,
+            enable_priority_scheduling=False,
+        )
+        adder = object()
+        running_batch = SimpleNamespace(reqs=[])
+
+        for eligible in (True, False):
+            prepared = MagicMock()
+            prepared.can_prepare_for_denoise.return_value = eligible
+            with patch.object(ScheduleBatch, "init_new", return_value=prepared), patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter."
+                "PrefillStats.from_adder",
+                return_value=object(),
+            ):
+                result = SchedulerDllmMixin._create_dllm_batch(
+                    scheduler,
+                    [object()],
+                    ForwardMode.DLLM_EXTEND,
+                    adder,
+                    running_batch,
+                )
+
+            self.assertIs(result, prepared)
+            if eligible:
+                prepared.prepare_for_denoise.assert_called_once_with()
+                prepared.prepare_for_extend.assert_not_called()
+            else:
+                prepared.prepare_for_extend.assert_called_once_with()
+                prepared.prepare_for_denoise.assert_not_called()
+                self.assertEqual(prepared.forward_mode, ForwardMode.DLLM_EXTEND)
 
 
 class TestDreamRequestCanvas(CustomTestCase):

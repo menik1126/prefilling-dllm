@@ -27,6 +27,10 @@ class DllmConfig:
         # bidirectional prefill and replace only the generation-block KV on
         # later denoising rounds. This mirrors Prefilling-dLLM's dual cache.
         self.dual_cache = bool(algorithm_config.get("dual_cache", False))
+        # Experimental scheduler fast path for fixed-width Dream denoising
+        # rounds. Keep it opt-in: exact outputs match the generic path, but the
+        # production benchmark has not shown a measurable end-to-end speedup.
+        self.denoise_fast_path = bool(algorithm_config.get("denoise_fast_path", False))
 
     @staticmethod
     def from_server_args(

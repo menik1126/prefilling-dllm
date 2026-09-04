@@ -659,7 +659,7 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
-        if forward_mode.is_dllm_extend():
+        if forward_mode.is_dllm_full_attention():
             extend_seq_lens_cpu_int = torch.tensor(
                 [self.dllm_block_size for i in range(bs)],
                 dtype=torch.int32,

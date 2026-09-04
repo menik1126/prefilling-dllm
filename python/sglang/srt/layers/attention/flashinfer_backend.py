@@ -917,7 +917,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
-        elif forward_mode.is_dllm_extend():
+        elif forward_mode.is_dllm_full_attention():
             prefix_lens = (
                 forward_batch.extend_prefix_lens
                 if self.dllm_config.needs_full_prefill
@@ -1457,7 +1457,7 @@ class FlashInferAttnBackend(AttentionBackend):
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
-        elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
+        elif forward_mode.is_target_verify() or forward_mode.is_dllm_full_attention():
             use_custom_mask = (
                 forward_mode.is_target_verify()
                 and spec_info is not None
@@ -1466,7 +1466,7 @@ class FlashInferAttnBackend(AttentionBackend):
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
-                prefill_wrappers, forward_mode.is_dllm_extend(), False
+                prefill_wrappers, forward_mode.is_dllm_full_attention(), False
             )
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).

@@ -126,6 +126,9 @@ class ForwardMode(IntEnum):
 
     # Used in dLLM
     DLLM_EXTEND = auto()
+    # A full-attention dLLM denoising round over an already materialized canvas.
+    # Unlike DLLM_EXTEND, the prompt/page table and canvas KV slots already exist.
+    DLLM_DENOISE = auto()
 
     def is_prefill(self, include_draft_extend_v2: bool = False):
         return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
@@ -138,6 +141,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
             or self == ForwardMode.DLLM_EXTEND
+            or self == ForwardMode.DLLM_DENOISE
         )
 
     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
@@ -184,6 +188,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
             or self == ForwardMode.DLLM_EXTEND
+            or self == ForwardMode.DLLM_DENOISE
         )
 
     def is_cpu_graph(self):
@@ -200,6 +205,12 @@ class ForwardMode(IntEnum):
 
     def is_dllm_extend(self):
         return self == ForwardMode.DLLM_EXTEND
+
+    def is_dllm_denoise(self):
+        return self == ForwardMode.DLLM_DENOISE
+
+    def is_dllm_full_attention(self):
+        return self in (ForwardMode.DLLM_EXTEND, ForwardMode.DLLM_DENOISE)
 
 
 @total_ordering

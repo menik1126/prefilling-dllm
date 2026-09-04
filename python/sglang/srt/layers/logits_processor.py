@@ -450,7 +450,7 @@ class LogitsProcessor(nn.Module):
             )
 
         # Diffusion LLM only.
-        if logits_metadata.forward_mode.is_dllm_extend():
+        if logits_metadata.forward_mode.is_dllm_full_attention():
             return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
 
         # Get the last hidden states and last logits for the next token prediction

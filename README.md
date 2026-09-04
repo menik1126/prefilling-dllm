@@ -400,6 +400,40 @@ path improved by a reproducible 1.015x. Peak observed generator-only memory was
 66.6 and 63.1 GB, with no request failures, empty outputs, retractions, CUDA
 errors, or OOMs.
 
+The steady-state dual-cache rounds also have an experimental dedicated
+`DLLM_DENOISE` preparation path. Enable it with `denoise_fast_path: true` in
+the Dream algorithm config; the ready-made config is
+`benchmark/dllm/prefilling_dream_longbench_denoise_fast.yaml`. The first long
+prompt remains `DLLM_EXTEND`. A later batch enters `DLLM_DENOISE` only when
+every request has a complete 32-token canvas, stable request/KV slots, and the
+supported PrefillingDream/FDFO/dual-cache configuration. Partial drafts,
+ParallelComp, mixed or dynamic canvas batches, logprob requests, overlap,
+sessions, encoder inputs, and other unsupported cases fall back to the generic
+extend path for the entire batch.
+
+`DLLM_DENOISE` preserves the same full-attention and prefill CUDA Graph
+semantics, but reuses the retained request slot, canvas KV allocation, and page
+table row rather than repeating `alloc_for_extend` and the same page-table
+write every denoising round. A strict same-source, flag-off A/B used the same
+two H20 replicas, 150 fixed-manifest examples, generation microbatch eight,
+and graph shapes as above:
+
+| Preparation path | GPU 0 generation (s) | GPU 1 generation (s) | Critical path (s) | Raw F1 |
+| --- | ---: | ---: | ---: | ---: |
+| Generic `DLLM_EXTEND` (flag off) | 39.675 | 41.864 | 41.864 | 47.736176 |
+| Dedicated `DLLM_DENOISE` | 39.757 | 41.980 | 41.980 | 47.736176 |
+| Dedicated `DLLM_DENOISE`, repeat | 39.831 | 41.959 | 41.959 | 47.736176 |
+
+All 150 input hashes, raw predictions, and per-example scores matched the
+flag-off control exactly. The fast path was 0.23--0.28% slower, so skipping
+this small host-side bookkeeping did not produce measurable end-to-end speedup
+and the option remains disabled by default. The full-attention transformer
+forward dominates each round, while input tensors, sampling metadata, and
+attention planning still need to be prepared. The next useful optimization
+should therefore target repeated model work or a larger part of metadata
+planning rather than only KV/page-table bookkeeping. Raw artifacts are under
+`/results/dllm_denoise_20260904` in the fixed experiment container.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

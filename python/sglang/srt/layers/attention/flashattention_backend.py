@@ -464,7 +464,7 @@ class FlashAttentionBackend(AttentionBackend):
         if forward_mode.is_extend() and not (
             forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
-            or forward_mode.is_dllm_extend()
+            or forward_mode.is_dllm_full_attention()
         ):
             self._init_full_cg_prefill_metadata(forward_batch, in_capture)
         else:

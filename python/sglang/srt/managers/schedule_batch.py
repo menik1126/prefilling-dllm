@@ -2734,6 +2734,203 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def can_prepare_for_denoise(self) -> bool:
+        """Return whether this whole batch can use the fixed Dream fast path.
+
+        This is intentionally an all-or-fallback gate. A mixed batch keeps the
+        generic DLLM_EXTEND preparation path so request ordering and allocation
+        semantics never differ within one forward.
+        """
+        config = self.dllm_config
+        if (
+            config is None
+            or not config.denoise_fast_path
+            or not self.reqs
+            or config.algorithm != "PrefillingDream"
+            or not config.needs_full_prefill
+            or not config.dual_cache
+            or not config.first_done_first_out_mode
+            or config.block_size is None
+            or config.block_size <= 0
+            or self.return_logprob
+            or self.enable_overlap
+            or self.model_config.is_encoder_decoder
+            or isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            or str(self.device).startswith("npu")
+        ):
+            return False
+
+        batch_device = torch.device(self.device)
+        for req in self.reqs:
+            state = req.dllm_algo_state
+            prefix_len = len(req.prefix_indices)
+            seq_len = prefix_len + config.block_size
+            fill_ids = req.get_fill_ids()[prefix_len:]
+            kv_indices = req.dllm_kv_indices
+            if (
+                not isinstance(state, dict)
+                or not state.get("dual_cache_ready", False)
+                or state.get("is_prefill", True)
+                or state.get("partial_draft", False)
+                or state.get("canvas_len", config.block_size) != config.block_size
+                or state.get("prompt_len") != prefix_len
+                or req.dllm_partial_draft_state is not None
+                or req.dllm_parallelcomp_state is not None
+                or req.multimodal_inputs is not None
+                or req.input_embeds is not None
+                or req.positional_embed_overrides is not None
+                or req.return_logprob
+                or req.grammar is not None
+                or req.is_retracted
+                or req.retracted_stain
+                or req.session is not None
+                or req.sampling_params.max_new_tokens != config.block_size
+                or req.extend_range.start != prefix_len
+                or req.extend_range.end != seq_len
+                or req.extend_range.length != config.block_size
+                or len(req.dllm_incomplete_ids) != config.block_size
+                or fill_ids != req.dllm_incomplete_ids
+                or not isinstance(kv_indices, torch.Tensor)
+                or len(kv_indices) != config.block_size
+                or kv_indices.device.type != batch_device.type
+                or (
+                    batch_device.index is not None
+                    and kv_indices.device.index != batch_device.index
+                )
+                or req.req_pool_idx is None
+                or req.kv.kv_allocated_len != seq_len
+            ):
+                return False
+        return True
+
+    def prepare_for_denoise(self):
+        """Prepare a fixed-width Dream dual-cache round without reallocating KV.
+
+        The first full prompt+canvas forward has already populated the request
+        row. Later rounds only replace the canvas tokens in their retained KV
+        slots, so rebuilding and rewriting the unchanged page table through
+        ``alloc_for_extend`` is unnecessary.
+        """
+        if not self.can_prepare_for_denoise():
+            raise RuntimeError("Batch is not eligible for DLLM_DENOISE")
+
+        block_size = self.dllm_config.block_size
+        reqs = self.reqs
+        input_ids = []
+        prefix_lens = []
+        seq_lens = []
+        orig_seq_lens = []
+        req_pool_indices = []
+        retained_kv = []
+
+        for req in reqs:
+            state = req.dllm_algo_state
+            prefix_len = len(req.prefix_indices)
+            seq_len = prefix_len + block_size
+            fill_ids = req.get_fill_ids()[prefix_len:]
+            kv_indices = req.dllm_kv_indices
+
+            if state.get("is_prefill", False):
+                raise RuntimeError("DLLM_DENOISE cannot execute an initial prefill")
+            if state.get("canvas_len", block_size) != block_size:
+                raise RuntimeError("DLLM_DENOISE requires the configured canvas width")
+            if state.get("prompt_len") != prefix_len:
+                raise RuntimeError(
+                    "DLLM_DENOISE prompt and retained-prefix lengths differ: "
+                    f"prompt={state.get('prompt_len')}, prefix={prefix_len}"
+                )
+            if req.sampling_params.max_new_tokens != block_size:
+                raise RuntimeError(
+                    "DLLM_DENOISE requires max_new_tokens == block_size: "
+                    f"{req.sampling_params.max_new_tokens} != {block_size}"
+                )
+            if (
+                req.extend_range.start != prefix_len
+                or req.extend_range.end != seq_len
+                or req.extend_range.length != block_size
+            ):
+                raise RuntimeError(
+                    "DLLM_DENOISE received an invalid extend range: "
+                    f"range={req.extend_range}, prefix={prefix_len}, "
+                    f"block={block_size}"
+                )
+            if (
+                len(req.dllm_incomplete_ids) != block_size
+                or fill_ids != req.dllm_incomplete_ids
+            ):
+                raise RuntimeError(
+                    "DLLM_DENOISE input is not the retained generation canvas"
+                )
+            if (
+                not isinstance(kv_indices, torch.Tensor)
+                or len(kv_indices) != block_size
+            ):
+                raise RuntimeError(
+                    "DLLM_DENOISE requires one retained KV slot per canvas token"
+                )
+            if req.req_pool_idx is None:
+                raise RuntimeError("DLLM_DENOISE request lost its request-pool slot")
+            if req.kv.kv_allocated_len != seq_len:
+                raise RuntimeError(
+                    "DLLM_DENOISE request row is not exactly prompt + canvas: "
+                    f"allocated={req.kv.kv_allocated_len}, required={seq_len}"
+                )
+
+            input_ids.append(fill_ids)
+            prefix_lens.append(prefix_len)
+            seq_lens.append(seq_len)
+            orig_seq_lens.append(max(seq_len, len(req.origin_input_ids)))
+            req_pool_indices.append(req.req_pool_idx)
+            retained_kv.append(kv_indices.to(dtype=torch.int64))
+
+            req.extend_batch_idx += 1
+            req.kv_committed_len = seq_len
+            req.is_retracted = False
+
+        extend_lens = [block_size] * len(reqs)
+        extend_num_tokens = len(reqs) * block_size
+        pin_memory = is_pin_memory_available(self.device)
+
+        self.forward_mode = ForwardMode.DLLM_DENOISE
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.seq_lens = torch.tensor(
+            seq_lens, dtype=torch.int64, pin_memory=pin_memory
+        ).to(self.device, non_blocking=True)
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.extend_num_tokens = extend_num_tokens
+        self.input_ids = None
+        self.prefill_input_ids_cpu = flatten_arrays_to_pinned_cpu(input_ids, pin_memory)
+        self.req_pool_indices_cpu = torch.tensor(
+            req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
+        )
+        self.req_pool_indices = self.req_pool_indices_cpu.to(
+            self.device, non_blocking=True
+        )
+        self.orig_seq_lens = torch.tensor(
+            orig_seq_lens, dtype=torch.int32, pin_memory=pin_memory
+        ).to(self.device, non_blocking=True)
+        self.out_cache_loc = torch.cat(retained_kv)
+        self.input_embeds = None
+        self.replace_embeds = None
+        self.replace_positions = None
+        self.multimodal_inputs = [None] * len(reqs)
+        self.seq_lens_sum = sum(seq_lens)
+        self.extend_logprob_start_lens = [
+            compute_extend_logprob_start_len(
+                logprob_start_len=req.logprob_start_len,
+                prefix_len=prefix_lens[i],
+                extend_len=block_size,
+                full_untruncated_fill_len=len(req.full_untruncated_fill_ids),
+            )
+            for i, req in enumerate(reqs)
+        ]
+        self.extend_input_logprob_token_ids = None
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
+
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
         req: Req,

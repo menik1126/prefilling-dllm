@@ -644,8 +644,18 @@ class SchedulerDllmMixin:
             self.spec_algorithm,
             dllm_config=self.dllm_config,
         )
-        new_batch.prepare_for_extend()
-        new_batch.forward_mode = forward_mode
+        if new_batch.can_prepare_for_denoise():
+            if not getattr(self, "_dllm_denoise_fast_path_logged", False):
+                logger.info(
+                    "Using DLLM_DENOISE fast path (batch_size=%d, block_size=%d)",
+                    len(can_run_list),
+                    self.dllm_config.block_size,
+                )
+                self._dllm_denoise_fast_path_logged = True
+            new_batch.prepare_for_denoise()
+        else:
+            new_batch.prepare_for_extend()
+            new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 
         # Record prefill stats for logging after forward
