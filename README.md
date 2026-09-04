@@ -283,6 +283,40 @@ default recommendation is therefore selector microbatch eight without global
 deterministic inference; enable the latter when exact draft/score
 reproducibility is required.
 
+The selector partial-draft path now matches Fast-dLLM's staged cache semantics.
+It first prefills the prompt alone, initializes a four-mask suffix from the
+retained prompt KV, confirms slot zero from the prompt's last-token logits, and,
+for one partial round, confirms exactly one further globally most-confident
+slot; unconfirmed slots remain mask tokens. With `torch_native` attention, 109
+of the 110 active MultiFieldQA-en examples matched the golden partial draft,
+versus 94 with FlashInfer. The remaining index 134 mismatch disappears at
+selector microbatch size one and does not change its selected chunks,
+identifying a batch-shape numerical tie rather than a staging error.
+
+The causal scorer also had a one-token shift: requesting input logprobs at the
+query start omitted the first query token because SGLang returns shifted
+input-token logprobs. Starting at `query_start - 1` includes every query label.
+No chunk, generation-length, or selection hyperparameter was changed. On 150
+examples (110 active and 990 scored candidate chunks), the corrected two-H20
+selection-only run matched all 110 reference top-four sets with zero regret.
+Raw and per-example-centered score MAE were 0.001164 and 0.001033, and mean
+per-example Spearman correlation was 0.999538. With score batches and selector
+microbatches of eight, wall time was 69 seconds; the slower replica attributed
+62.729 seconds to selection (2.199 seconds for draft generation and 60.530
+seconds for chunk scoring).
+
+The corresponding `torch_native` end-to-end run produced 150/150 valid results,
+matched the reference selection manifest for all 150 examples, and reproduced
+the manifest run's 150 predictions exactly. Raw F1 was **47.634**, versus
+**48.033** for Fast-dLLM, an absolute gap of **0.400** and within the one-point
+target; 140 predictions and 142 per-example F1 values matched the reference.
+Compared with the earlier FlashInfer selector run, raw F1 rose from 47.373 to
+47.634, active selection exactness rose from 64/110 to 110/110, and reference
+prediction exactness rose from 82/150 to 140/150. This fidelity path is slower:
+two-replica wall time was 237 seconds, and the slower replica spent 166.871
+seconds in final generation versus 76.383 seconds on the earlier FlashInfer
+path.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

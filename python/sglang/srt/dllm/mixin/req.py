@@ -32,9 +32,25 @@ class ReqDllmMixin:
         self.dllm_canvas_output_len = 0
         self.dllm_config = dllm_config
         self.dllm_parallelcomp_state = self._parse_parallelcomp_state()
+        self.dllm_partial_draft_state = self._parse_partial_draft_state()
+        if (
+            self.dllm_parallelcomp_state is not None
+            and self.dllm_partial_draft_state is not None
+        ):
+            raise ValueError(
+                "dllm_partial_draft cannot be combined with dllm_parallelcomp"
+            )
+        if self.dllm_partial_draft_state is not None:
+            # Keep request-specific algorithm controls in the state that FDFO
+            # already carries across denoising rounds.  The server-wide Dream
+            # block size remains unchanged for ordinary generation requests.
+            self.dllm_algo_state.update(self.dllm_partial_draft_state)
 
         if self.dllm_config is not None:
-            if self.dllm_parallelcomp_state is not None:
+            if (
+                self.dllm_parallelcomp_state is not None
+                or self.dllm_partial_draft_state is not None
+            ):
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
             elif self.dllm_config.needs_full_prefill:
                 # Dream denoises a masked generation canvas, so it is a decode
@@ -53,6 +69,87 @@ class ReqDllmMixin:
             DllmReqPhase.STAGING_PREFILL,
             DllmReqPhase.INCOMING_PREFILL,
         ]
+
+    def _parse_partial_draft_state(self: Req) -> Optional[dict[str, Any]]:
+        """Parse the selector-only bounded Dream draft mode.
+
+        The first Dream forward confirms slot 0. Each requested partial round
+        confirms exactly one additional highest-confidence slot, after which
+        the unresolved positions are returned as mask tokens.
+        """
+        custom_params = getattr(self.sampling_params, "custom_params", None)
+        if not isinstance(custom_params, dict):
+            return None
+        if "dllm_partial_draft" not in custom_params:
+            return None
+
+        config = custom_params["dllm_partial_draft"]
+        if not isinstance(config, dict):
+            raise ValueError("dllm_partial_draft must be an object")
+        if set(config) != {"rounds"}:
+            raise ValueError("dllm_partial_draft only accepts the 'rounds' field")
+
+        rounds = config.get("rounds")
+        if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds != 1:
+            raise ValueError("dllm_partial_draft currently requires rounds=1")
+        if self.dllm_config is None or self.dllm_config.algorithm != "PrefillingDream":
+            raise ValueError("dllm_partial_draft requires PrefillingDream")
+        if not self.dllm_config.needs_full_prefill:
+            raise ValueError("dllm_partial_draft requires Dream full-prefill mode")
+        if not self.dllm_config.dual_cache:
+            raise ValueError("dllm_partial_draft requires Dream dual_cache")
+        if not self.dllm_config.first_done_first_out_mode:
+            raise ValueError("dllm_partial_draft requires --dllm-fdfo")
+
+        canvas_len = self.sampling_params.max_new_tokens
+        if canvas_len != 4:
+            raise ValueError("dllm_partial_draft currently requires max_new_tokens=4")
+        if (
+            self.dllm_config.block_size is None
+            or canvas_len > self.dllm_config.block_size
+        ):
+            raise ValueError(
+                "dllm_partial_draft canvas must fit the configured Dream block size"
+            )
+
+        return {
+            "partial_draft": True,
+            "partial_draft_stage": "prompt",
+            "partial_draft_first_token": None,
+            "canvas_len": canvas_len,
+            "partial_draft_round_limit": rounds,
+            "partial_draft_rounds_done": 0,
+            "partial_draft_confirmed_mask": [False] * canvas_len,
+        }
+
+    def has_partial_draft_prompt_cache(self: Req) -> bool:
+        """Whether a clean prompt KV prefix must survive the next stage."""
+        state = self.dllm_algo_state
+        return bool(
+            isinstance(state, dict)
+            and state.get("partial_draft", False)
+            and state.get("partial_draft_stage") != "prompt"
+        )
+
+    def reset_partial_draft_state(self: Req) -> None:
+        """Restart a retracted partial draft from a fresh prompt prefill."""
+        state = self.dllm_algo_state
+        if not isinstance(state, dict) or not state.get("partial_draft", False):
+            return
+        canvas_len = state["canvas_len"]
+        state["partial_draft_stage"] = "prompt"
+        state["partial_draft_first_token"] = None
+        state["partial_draft_rounds_done"] = 0
+        state["partial_draft_confirmed_mask"] = [False] * canvas_len
+        for key in (
+            "dual_cache_ready",
+            "is_prefill",
+            "last_partial_draft_stage",
+            "last_round_was_dual_cache",
+        ):
+            state.pop(key, None)
+        self.dllm_incomplete_ids = array("q")
+        self.dllm_kv_indices = None
 
     def _parse_parallelcomp_state(self: Req) -> Optional[dict[str, Any]]:
         if self.dllm_config is None or not self.dllm_config.needs_full_prefill:
@@ -257,6 +354,38 @@ class ReqDllmMixin:
 
     def _init_fill_ids_for_dllm(self: Req):
         if self.dllm_config.needs_full_prefill:
+            partial_draft = self.dllm_algo_state
+            if isinstance(partial_draft, dict) and partial_draft.get(
+                "partial_draft", False
+            ):
+                stage = partial_draft["partial_draft_stage"]
+                if stage == "prompt":
+                    if not self.origin_input_ids:
+                        raise ValueError(
+                            "dllm_partial_draft requires a non-empty prompt"
+                        )
+                    self.prefix_indices = self.prefix_indices[:0]
+                    self.full_untruncated_fill_ids = array("q", self.origin_input_ids)
+                    partial_draft["prompt_len"] = len(self.origin_input_ids)
+                    self.dllm_block_offset = 0
+                    self.dllm_canvas_output_len = 0
+                    self.dllm_initialized = True
+                    return
+                if stage == "suffix_init":
+                    prompt_len = partial_draft["prompt_len"]
+                    if len(self.prefix_indices) != prompt_len:
+                        raise RuntimeError(
+                            "Partial draft suffix initialization lost its prompt KV: "
+                            f"prefix={len(self.prefix_indices)}, prompt={prompt_len}"
+                        )
+                    self.full_untruncated_fill_ids = self.origin_input_ids + array(
+                        "q", [self.dllm_config.mask_id] * partial_draft["canvas_len"]
+                    )
+                    self.dllm_block_offset = 0
+                    self.dllm_canvas_output_len = 0
+                    self.dllm_initialized = True
+                    return
+
             parallelcomp = self.dllm_parallelcomp_state
             if parallelcomp is not None and parallelcomp["stage"] != "decode":
                 if parallelcomp["stage"] == "prefix":

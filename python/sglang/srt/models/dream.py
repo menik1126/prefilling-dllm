@@ -26,9 +26,7 @@ class DreamModel(Qwen2ForCausalLM):
         for layer in self.model.layers:
             layer.input_layernorm.cast_x_before_out_mul = True
             layer.post_attention_layernorm.cast_x_before_out_mul = True
-            layer.input_layernorm._forward_method = (
-                layer.input_layernorm.forward_native
-            )
+            layer.input_layernorm._forward_method = layer.input_layernorm.forward_native
             layer.post_attention_layernorm._forward_method = (
                 layer.post_attention_layernorm.forward_native
             )
@@ -74,8 +72,30 @@ class DreamModel(Qwen2ForCausalLM):
                 hidden_states = hidden_states[:raw_num_tokens]
 
                 parts = hidden_states.split(seq_lens)
+                raw_last_logits = getattr(
+                    forward_batch, "dllm_raw_last_logits_cpu", None
+                )
+                if raw_last_logits is not None and len(raw_last_logits) != len(parts):
+                    raise RuntimeError(
+                        "Dream raw-logit modes do not match the request batch: "
+                        f"{len(raw_last_logits)} != {len(parts)}"
+                    )
+                if raw_last_logits is None:
+                    raw_last_logits = [False] * len(parts)
+                if any(
+                    use_raw_last and len(part) == 0
+                    for part, use_raw_last in zip(parts, raw_last_logits)
+                ):
+                    raise RuntimeError(
+                        "Dream raw final logits require a non-empty request"
+                    )
                 shifted_parts = [
-                    torch.cat([part[:1], part[:-1]], dim=0) for part in parts
+                    (
+                        part[-1:]
+                        if use_raw_last
+                        else torch.cat([part[:1], part[:-1]], dim=0)
+                    )
+                    for part, use_raw_last in zip(parts, raw_last_logits)
                 ]
 
                 # Dream only consumes logits for its trailing generation
@@ -84,7 +104,26 @@ class DreamModel(Qwen2ForCausalLM):
                 # (multiple GiB for long LongBench examples) that is discarded
                 # immediately by the denoising algorithm.
                 block_size = getattr(forward_batch, "dllm_block_size", None)
-                if block_size is not None:
+                canvas_lens = getattr(forward_batch, "dllm_canvas_lens_cpu", None)
+                if canvas_lens is not None:
+                    if len(canvas_lens) != len(shifted_parts):
+                        raise RuntimeError(
+                            "Dream canvas lengths do not match the request batch: "
+                            f"{len(canvas_lens)} != {len(shifted_parts)}"
+                        )
+                    if any(
+                        canvas_len <= 0 or canvas_len > len(part)
+                        for part, canvas_len in zip(shifted_parts, canvas_lens)
+                    ):
+                        raise RuntimeError(
+                            "Dream canvas lengths must be positive and fit their "
+                            "request token spans"
+                        )
+                    shifted_parts = [
+                        part[-canvas_len:]
+                        for part, canvas_len in zip(shifted_parts, canvas_lens)
+                    ]
+                elif block_size is not None:
                     if block_size <= 0:
                         raise RuntimeError(
                             f"Dream dLLM block size must be positive: {block_size}"

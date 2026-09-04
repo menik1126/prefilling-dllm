@@ -29,11 +29,17 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, NamedTuple, Sequence
 
 from transformers import AutoTokenizer
 
 TASK = "multifieldqa_en"
+PARTIAL_DRAFT_ROUNDS = 1
+
+
+class PartialDraft(NamedTuple):
+    token_ids: list[int]
+    confirmed_mask: list[bool]
 
 
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -213,6 +219,126 @@ class SGLangClient:
             }
         )
 
+    def partial_draft(
+        self,
+        input_ids: Sequence[int],
+        max_new_tokens: int,
+        *,
+        rounds: int = PARTIAL_DRAFT_ROUNDS,
+    ) -> PartialDraft:
+        if rounds < 0:
+            raise ValueError("partial draft rounds must be non-negative")
+        if max_new_tokens <= 0:
+            return PartialDraft([], [])
+        result = self.post(
+            {
+                "input_ids": list(input_ids),
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                    "custom_params": {
+                        "dllm_partial_draft": {"rounds": rounds},
+                    },
+                },
+                "return_logprob": True,
+                "return_text_in_logprobs": False,
+            }
+        )
+        return self._partial_draft_from_result(result, max_new_tokens, rounds)
+
+    def partial_draft_batch(
+        self,
+        input_ids: Sequence[Sequence[int]],
+        max_new_tokens: int,
+        *,
+        rounds: int = PARTIAL_DRAFT_ROUNDS,
+    ) -> list[PartialDraft]:
+        if rounds < 0:
+            raise ValueError("partial draft rounds must be non-negative")
+        if max_new_tokens <= 0:
+            return [PartialDraft([], []) for _ in input_ids]
+        if not input_ids:
+            return []
+        if len(input_ids) == 1:
+            return [
+                self.partial_draft(
+                    input_ids[0],
+                    max_new_tokens,
+                    rounds=rounds,
+                )
+            ]
+        result = self.post(
+            {
+                "input_ids": [list(ids) for ids in input_ids],
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                    "custom_params": {
+                        "dllm_partial_draft": {"rounds": rounds},
+                    },
+                },
+                "return_logprob": True,
+                "return_text_in_logprobs": False,
+            }
+        )
+        rows = result if isinstance(result, list) else [result]
+        if len(rows) != len(input_ids):
+            raise RuntimeError(
+                "Dream partial draft generation returned "
+                f"{len(rows)} rows, expected {len(input_ids)}"
+            )
+        return [
+            self._partial_draft_from_result(row, max_new_tokens, rounds) for row in rows
+        ]
+
+    @staticmethod
+    def _partial_draft_from_result(
+        result: dict[str, Any], max_new_tokens: int, rounds: int
+    ) -> PartialDraft:
+        output_ids = result.get("output_ids", [])
+        if output_ids and isinstance(output_ids[0], list):
+            if len(output_ids) != 1:
+                raise RuntimeError(
+                    "Dream partial draft response contains multiple output-id rows"
+                )
+            output_ids = output_ids[0]
+        token_ids = [int(token_id) for token_id in output_ids]
+        if len(token_ids) != max_new_tokens:
+            raise RuntimeError(
+                "Dream partial draft generation returned "
+                f"{len(token_ids)} slots, expected {max_new_tokens}"
+            )
+
+        meta_info = result.get("meta_info")
+        if not isinstance(meta_info, dict) or "dllm_confirmed_mask" not in meta_info:
+            raise RuntimeError(
+                "Dream partial draft response is missing "
+                "meta_info.dllm_confirmed_mask"
+            )
+        confirmed_mask = meta_info["dllm_confirmed_mask"]
+        if not isinstance(confirmed_mask, list):
+            raise RuntimeError("Dream partial draft confirmed mask must be a list")
+        if len(confirmed_mask) != max_new_tokens:
+            raise RuntimeError(
+                "Dream partial draft confirmed mask has "
+                f"{len(confirmed_mask)} slots, expected {max_new_tokens}"
+            )
+        if any(type(value) is not bool for value in confirmed_mask):
+            raise RuntimeError(
+                "Dream partial draft confirmed mask must contain only booleans"
+            )
+        expected_confirmed = min(max_new_tokens, 1 + rounds)
+        if sum(confirmed_mask) != expected_confirmed:
+            raise RuntimeError(
+                "Dream partial draft confirmed "
+                f"{sum(confirmed_mask)} slots, expected {expected_confirmed}"
+            )
+        if max_new_tokens and not confirmed_mask[0]:
+            raise RuntimeError("Dream partial draft must confirm slot zero")
+        return PartialDraft(token_ids, list(confirmed_mask))
+
     def draft_ids(
         self,
         input_ids: Sequence[int],
@@ -302,13 +428,39 @@ class SGLangClient:
         return token_ids
 
 
-def mean_query_logprob(values: Sequence[Any], expected_tokens: int) -> float:
+def mean_query_logprob(
+    values: Sequence[Any],
+    expected_tokens: int,
+    score_token_mask: Sequence[bool] | None = None,
+) -> float:
     if expected_tokens <= 0:
         raise ValueError("expected_tokens must be positive")
+    if len(values) < expected_tokens:
+        raise ValueError(
+            "prompt logprob row has "
+            f"{len(values)} tokens, expected at least {expected_tokens}"
+        )
+    if score_token_mask is None:
+        score_token_mask = [True] * expected_tokens
+    elif len(score_token_mask) != expected_tokens:
+        raise ValueError(
+            "score token mask has "
+            f"{len(score_token_mask)} slots, expected {expected_tokens}"
+        )
+    elif any(type(value) is not bool for value in score_token_mask):
+        raise ValueError("score token mask must contain only booleans")
     logprobs = []
-    for value in values[-expected_tokens:]:
-        if value and value[0] is not None:
-            logprobs.append(float(value[0]))
+    for target_offset, (value, should_score) in enumerate(
+        zip(values[-expected_tokens:], score_token_mask, strict=True)
+    ):
+        if not should_score:
+            continue
+        if not value or value[0] is None:
+            raise ValueError(
+                "prompt logprob row is missing a scored target at offset "
+                f"{target_offset}"
+            )
+        logprobs.append(float(value[0]))
     if not logprobs:
         return float("-inf")
     return sum(logprobs) / len(logprobs)
@@ -320,24 +472,47 @@ def score_chunks(
     chunks: Sequence[Sequence[int]],
     scoring_query_ids: Sequence[int],
     batch_size: int,
+    score_token_mask: Sequence[bool] | None = None,
 ) -> list[float]:
     return score_chunk_groups(
         client,
         [(prefix_ids, chunks, scoring_query_ids)],
         batch_size,
+        score_token_masks=(
+            [score_token_mask] if score_token_mask is not None else None
+        ),
     )[0]
 
 
 def score_chunk_groups(
     client: SGLangClient,
-    groups: Sequence[
-        tuple[Sequence[int], Sequence[Sequence[int]], Sequence[int]]
-    ],
+    groups: Sequence[tuple[Sequence[int], Sequence[Sequence[int]], Sequence[int]]],
     batch_size: int,
+    score_token_masks: Sequence[Sequence[bool] | None] | None = None,
 ) -> list[list[float]]:
-    scores: list[list[float | None]] = [
-        [None] * len(chunks) for _, chunks, _ in groups
-    ]
+    if score_token_masks is None:
+        group_score_token_masks: list[Sequence[bool] | None] = [None] * len(groups)
+    else:
+        if len(score_token_masks) != len(groups):
+            raise ValueError(
+                "score token masks have "
+                f"{len(score_token_masks)} groups, expected {len(groups)}"
+            )
+        group_score_token_masks = list(score_token_masks)
+    for (_, _, scoring_query_ids), score_token_mask in zip(
+        groups, group_score_token_masks, strict=True
+    ):
+        if score_token_mask is not None and len(score_token_mask) != len(
+            scoring_query_ids
+        ):
+            raise ValueError(
+                "score token mask length does not match scoring query length"
+            )
+        if score_token_mask is not None and any(
+            type(value) is not bool for value in score_token_mask
+        ):
+            raise ValueError("score token mask must contain only booleans")
+    scores: list[list[float | None]] = [[None] * len(chunks) for _, chunks, _ in groups]
     coordinates = [
         (group_index, chunk_index)
         for group_index, (_, chunks, _) in enumerate(groups)
@@ -348,23 +523,36 @@ def score_chunk_groups(
         rows = []
         logprob_starts = []
         expected_tokens = []
+        batch_score_token_masks = []
         for group_index, chunk_index in batch_coordinates:
             prefix_ids, chunks, scoring_query_ids = groups[group_index]
             chunk = chunks[chunk_index]
             rows.append(list(prefix_ids) + list(chunk) + list(scoring_query_ids))
-            logprob_starts.append(len(prefix_ids) + len(chunk))
+            # SGLang's causal prompt-logprob path consumes the hidden state at
+            # logprob_start_len and then shifts labels by one position.  Start
+            # one token earlier so the first scoring-query token is included.
+            logprob_starts.append(len(prefix_ids) + len(chunk) - 1)
             expected_tokens.append(len(scoring_query_ids))
+            batch_score_token_masks.append(group_score_token_masks[group_index])
         logprob_rows = client.prompt_logprobs(rows, logprob_starts)
         if len(logprob_rows) != len(batch_coordinates):
             raise RuntimeError(
                 "Chunk selector returned "
                 f"{len(logprob_rows)} rows, expected {len(batch_coordinates)}"
             )
-        for coordinate, values, token_count in zip(
-            batch_coordinates, logprob_rows, expected_tokens
+        for coordinate, values, token_count, score_token_mask in zip(
+            batch_coordinates,
+            logprob_rows,
+            expected_tokens,
+            batch_score_token_masks,
+            strict=True,
         ):
             group_index, chunk_index = coordinate
-            scores[group_index][chunk_index] = mean_query_logprob(values, token_count)
+            scores[group_index][chunk_index] = mean_query_logprob(
+                values,
+                token_count,
+                score_token_mask,
+            )
     invalid = [
         (group_index, chunk_index)
         for group_index, group_scores in enumerate(scores)
@@ -409,8 +597,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--score-base-url",
         help=(
-            "Optional separate SGLang endpoint for causal Dream prompt logprobs. "
-            "The generation endpoint remains --base-url."
+            "Separate SGLang endpoint for causal Dream prompt logprobs; required "
+            "by --selection-mode=query_logprob. The generation endpoint remains "
+            "--base-url."
         ),
     )
     parser.add_argument("--model-path", required=True)
@@ -466,7 +655,15 @@ def build_parser() -> argparse.ArgumentParser:
             "together. One preserves the original per-example schedule."
         ),
     )
-    parser.add_argument("--draft-tokens", type=int, default=0)
+    parser.add_argument(
+        "--draft-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Number of partial-draft slots appended to the scoring query. "
+            "Positive values request one partial denoising round."
+        ),
+    )
     parser.add_argument("--generation-block-size", type=int, default=32)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--prediction-max-words", type=int, default=0)
@@ -489,6 +686,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Number of independently masked chunks packed into one server forward.",
     )
+    parser.add_argument(
+        "--selection-only",
+        action="store_true",
+        help=(
+            "Run draft generation and chunk scoring/selection, write their "
+            "artifacts, and skip final answer generation."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -501,6 +706,21 @@ def main() -> None:
         raise ValueError("score_batch_size must be positive")
     if args.selector_microbatch_size <= 0:
         raise ValueError("selector_microbatch_size must be positive")
+    if args.draft_tokens not in (0, 4):
+        raise ValueError(
+            "--draft-tokens must be 0 (disabled) or 4 for partial-draft selection"
+        )
+    if args.selection_only and args.dry_run:
+        raise ValueError("--selection-only and --dry-run cannot be combined")
+    if (
+        args.selection_mode == "query_logprob"
+        and not args.dry_run
+        and args.score_base_url is None
+    ):
+        raise ValueError(
+            "--selection-mode=query_logprob requires a dedicated "
+            "--score-base-url for isolated causal scoring"
+        )
     fixed_chunk_indices = [
         int(value) for value in args.fixed_chunk_indices.split(",") if value.strip()
     ]
@@ -532,7 +752,7 @@ def main() -> None:
         else SGLangClient(
             args.score_base_url or args.base_url,
             args.timeout,
-            causal_prompt_logprobs=args.score_base_url is not None,
+            causal_prompt_logprobs=args.selection_mode == "query_logprob",
         )
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -543,7 +763,6 @@ def main() -> None:
         args.output_dir
         / f"{TASK}_{args.selection_mode}_{args.position_mode}_metrics.json"
     )
-
     prepared = []
     for local_index, example in enumerate(examples):
         index = args.start_index + local_index
@@ -580,6 +799,8 @@ def main() -> None:
         group = prepared[group_start : group_start + args.selector_microbatch_size]
         for state in group:
             state["draft_ids"] = []
+            state["partial_draft_ids"] = []
+            state["draft_confirmed_mask"] = []
             state["chunk_scores"] = None
             state["draft_seconds"] = 0.0
             state["chunk_score_seconds"] = 0.0
@@ -604,34 +825,50 @@ def main() -> None:
             assert score_client is not None
             if args.draft_tokens > 0:
                 draft_start = time.perf_counter()
-                draft_groups = client.draft_ids_batch(
+                partial_drafts = client.partial_draft_batch(
                     [
                         state["prefix_ids"] + state["query_ids"]
                         for state in scoring_group
                     ],
                     args.draft_tokens,
-                    args.generation_block_size,
+                    rounds=PARTIAL_DRAFT_ROUNDS,
                 )
+                draft_groups = [draft.token_ids for draft in partial_drafts]
+                draft_confirmed_masks = [
+                    draft.confirmed_mask for draft in partial_drafts
+                ]
                 draft_seconds = time.perf_counter() - draft_start
                 draft_request_count += 1
             else:
                 draft_groups = [[] for _ in scoring_group]
+                draft_confirmed_masks = [[] for _ in scoring_group]
                 draft_seconds = 0.0
 
             scoring_query_groups = [
                 state["query_ids"] + draft_ids
-                for state, draft_ids in zip(scoring_group, draft_groups)
+                for state, draft_ids in zip(scoring_group, draft_groups, strict=True)
             ]
+            score_token_masks = (
+                [
+                    [True] * len(state["query_ids"]) + draft_confirmed_mask
+                    for state, draft_confirmed_mask in zip(
+                        scoring_group, draft_confirmed_masks, strict=True
+                    )
+                ]
+                if args.draft_tokens > 0
+                else None
+            )
             chunk_score_start = time.perf_counter()
             chunk_score_groups = score_chunk_groups(
                 score_client,
                 [
                     (state["prefix_ids"], state["chunks"], scoring_query_ids)
                     for state, scoring_query_ids in zip(
-                        scoring_group, scoring_query_groups
+                        scoring_group, scoring_query_groups, strict=True
                     )
                 ],
                 args.score_batch_size,
+                score_token_masks=score_token_masks,
             )
             chunk_score_seconds = time.perf_counter() - chunk_score_start
             candidate_count = sum(len(state["chunks"]) for state in scoring_group)
@@ -644,10 +881,16 @@ def main() -> None:
             active_microbatch_sizes.append(len(scoring_group))
             shared_selector_timing |= len(scoring_group) > 1
             draft_share = draft_seconds / len(scoring_group)
-            for state, draft_ids, chunk_scores in zip(
-                scoring_group, draft_groups, chunk_score_groups
+            for state, draft_ids, draft_confirmed_mask, chunk_scores in zip(
+                scoring_group,
+                draft_groups,
+                draft_confirmed_masks,
+                chunk_score_groups,
+                strict=True,
             ):
                 state["draft_ids"] = draft_ids
+                state["partial_draft_ids"] = draft_ids
+                state["draft_confirmed_mask"] = draft_confirmed_mask
                 state["chunk_scores"] = chunk_scores
                 state["draft_seconds"] = draft_share
                 state["score_seconds_are_attributed"] = len(scoring_group) > 1
@@ -667,6 +910,8 @@ def main() -> None:
             query_ids = state["query_ids"]
             chunks = state["chunks"]
             draft_ids = state["draft_ids"]
+            partial_draft_ids = state["partial_draft_ids"]
+            draft_confirmed_mask = state["draft_confirmed_mask"]
             chunk_scores = state["chunk_scores"]
             score_seconds = state["draft_seconds"] + state["chunk_score_seconds"]
 
@@ -680,9 +925,7 @@ def main() -> None:
                     raise ValueError(
                         f"Selection manifest has no entry for index {index}"
                     )
-                invalid = [
-                    value for value in requested_indices if value >= len(chunks)
-                ]
+                invalid = [value for value in requested_indices if value >= len(chunks)]
                 if invalid:
                     raise ValueError(
                         f"Fixed chunk indices {invalid} exceed chunk count {len(chunks)}"
@@ -696,9 +939,7 @@ def main() -> None:
                     chunk_scores,
                 )
             selected_context_ids = [
-                token_id
-                for chunk_index in selected
-                for token_id in chunks[chunk_index]
+                token_id for chunk_index in selected for token_id in chunks[chunk_index]
             ]
             compressed_ids = prefix_ids + selected_context_ids + query_ids
 
@@ -706,7 +947,8 @@ def main() -> None:
             raw_prediction = ""
             prediction = ""
             generation_seconds = 0.0
-            if client is not None:
+            position_offset = None
+            if client is not None and not args.selection_only:
                 query_start = len(prefix_ids) + len(selected_context_ids)
                 position_offset = 0
                 if args.query_position_mode == "after_selected_chunks":
@@ -759,9 +1001,7 @@ def main() -> None:
                 generation = client.generate(
                     compressed_ids,
                     args.max_new_tokens,
-                    position_start=(
-                        None if args.server_chunk_prefill else query_start
-                    ),
+                    position_start=(None if args.server_chunk_prefill else query_start),
                     position_offset=0 if args.server_chunk_prefill else position_offset,
                     custom_params=custom_params,
                 )
@@ -782,16 +1022,14 @@ def main() -> None:
                 "answers": example.get("answers", []),
                 "score": (
                     score_prediction(prediction, example.get("answers", []))
-                    if client
+                    if client is not None and not args.selection_only
                     else None
                 ),
                 "selection_mode": args.selection_mode,
                 "position_mode": args.position_mode,
                 "query_position_mode": args.query_position_mode,
                 "chunk_query_position_mode": args.chunk_query_position_mode,
-                "query_position_offset": (
-                    position_offset if client is not None else None
-                ),
+                "query_position_offset": position_offset,
                 "chunk_size": args.chunk_size,
                 "top_k": args.top_k,
                 "score_batch_size": args.score_batch_size,
@@ -815,6 +1053,8 @@ def main() -> None:
                 ],
                 "chunk_scores": chunk_scores,
                 "draft_ids": draft_ids,
+                "partial_draft_ids": partial_draft_ids,
+                "draft_confirmed_mask": draft_confirmed_mask,
                 "selector_scoring_skipped": state["selector_scoring_skipped"],
                 "prefix_tokens": len(prefix_ids),
                 "query_tokens": len(query_ids),
@@ -822,9 +1062,7 @@ def main() -> None:
                 "score_seconds": score_seconds,
                 "draft_seconds": state["draft_seconds"],
                 "chunk_score_seconds": state["chunk_score_seconds"],
-                "score_seconds_are_attributed": state[
-                    "score_seconds_are_attributed"
-                ],
+                "score_seconds_are_attributed": state["score_seconds_are_attributed"],
                 "generation_seconds": generation_seconds,
                 "generation_meta": generation.get("meta_info") if generation else None,
             }
@@ -869,6 +1107,10 @@ def main() -> None:
         "server_chunk_prefill": args.server_chunk_prefill,
         "server_chunk_prefill_batch_size": args.server_chunk_prefill_batch_size,
         "draft_tokens": args.draft_tokens,
+        "draft_partial_rounds": (
+            PARTIAL_DRAFT_ROUNDS if args.draft_tokens > 0 else None
+        ),
+        "selection_only": args.selection_only,
         "prediction_max_words": args.prediction_max_words,
         "stop_at_answer_boundary": args.stop_at_answer_boundary,
         "average_raw_context_tokens": sum(

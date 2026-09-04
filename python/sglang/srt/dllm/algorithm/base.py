@@ -53,8 +53,10 @@ class DllmAlgorithm:
         states: List[Any],
     ) -> List[bool]:
         """One denoise step, advancing ``forward_batch.input_ids``/``states`` in
-        place. Returns, per block, whether it was already complete *on entry* --
-        i.e. this forward persisted its final KV cache and it can be emitted.
+        place. Returns, per block, whether the resulting IDs are complete and
+        can be emitted. Most algorithms report completion when no masks remain
+        on entry; bounded partial algorithms may report it after their final
+        mutation because a finished request does not retain its KV cache.
         """
         raise NotImplementedError
 

@@ -1160,6 +1160,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if (
+            getattr(forward_batch, "dllm_canvas_lens_cpu", None) is not None
+            or getattr(forward_batch, "dllm_raw_last_logits_cpu", None) is not None
+        ):
+            # Partial Dream drafting carries request-specific Python metadata
+            # that is not represented by the static replay ForwardBatch. Keep
+            # these three short staged forwards eager until the graph replay
+            # schema can preserve their canvas and raw-last-logit semantics.
+            return False
+
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (

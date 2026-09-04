@@ -18,6 +18,7 @@ from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -44,12 +45,14 @@ def _config(**kwargs):
 
 
 class TestDreamRequestCanvas(CustomTestCase):
-    def _make_req(self, config, *, max_new_tokens=3):
+    def _make_req(self, config, *, max_new_tokens=3, custom_params=None):
         return Req(
             rid="req",
             origin_input_text="prompt",
             origin_input_ids=array("q", [10, 11]),
-            sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+            sampling_params=SamplingParams(
+                max_new_tokens=max_new_tokens, custom_params=custom_params
+            ),
             dllm_config=config,
         )
 
@@ -90,15 +93,117 @@ class TestDreamRequestCanvas(CustomTestCase):
         )
         self.assertEqual(req.dllm_phase, DllmReqPhase.STAGING_DECODE)
 
+    def test_partial_draft_initializes_request_specific_canvas(self):
+        config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={"threshold": 0.9, "dual_cache": True},
+            block_size=32,
+            first_done_first_out_mode=True,
+        )
+        req = self._make_req(
+            config,
+            max_new_tokens=4,
+            custom_params={"dllm_partial_draft": {"rounds": 1}},
+        )
+
+        self.assertEqual(req.dllm_algo_state["canvas_len"], 4)
+        self.assertEqual(req.dllm_algo_state["partial_draft_stage"], "prompt")
+        self.assertIsNone(req.dllm_algo_state["partial_draft_first_token"])
+        self.assertEqual(req.dllm_algo_state["partial_draft_round_limit"], 1)
+        self.assertEqual(req.dllm_algo_state["partial_draft_rounds_done"], 0)
+        self.assertEqual(
+            req.dllm_algo_state["partial_draft_confirmed_mask"],
+            [False, False, False, False],
+        )
+        self.assertEqual(req.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
+
+        req.init_next_round_input()
+        self.assertEqual(list(req.full_untruncated_fill_ids), [10, 11])
+
+        req.dllm_algo_state["partial_draft_stage"] = "suffix_init"
+        req.dllm_algo_state["partial_draft_first_token"] = 7
+        req.prefix_indices = torch.tensor([101, 102])
+        req.dllm_initialized = False
+        req.init_next_round_input()
+        self.assertEqual(list(req.full_untruncated_fill_ids), [10, 11, 99, 99, 99, 99])
+        self.assertEqual(req.prefix_indices.tolist(), [101, 102])
+
+    def test_partial_draft_reset_discards_staged_kv_state(self):
+        config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={"threshold": 0.9, "dual_cache": True},
+            block_size=32,
+            first_done_first_out_mode=True,
+        )
+        req = self._make_req(
+            config,
+            max_new_tokens=4,
+            custom_params={"dllm_partial_draft": {"rounds": 1}},
+        )
+        req.dllm_algo_state.update(
+            {
+                "partial_draft_stage": "partial_round",
+                "partial_draft_first_token": 7,
+                "partial_draft_rounds_done": 1,
+                "partial_draft_confirmed_mask": [True, False, True, False],
+                "dual_cache_ready": True,
+                "is_prefill": False,
+            }
+        )
+        req.dllm_incomplete_ids = array("q", [7, 99, 8, 99])
+        req.dllm_kv_indices = torch.tensor([201, 202, 203, 204])
+
+        req.reset_partial_draft_state()
+
+        self.assertEqual(req.dllm_algo_state["partial_draft_stage"], "prompt")
+        self.assertIsNone(req.dllm_algo_state["partial_draft_first_token"])
+        self.assertEqual(req.dllm_algo_state["partial_draft_rounds_done"], 0)
+        self.assertEqual(
+            req.dllm_algo_state["partial_draft_confirmed_mask"],
+            [False, False, False, False],
+        )
+        self.assertFalse(req.dllm_incomplete_ids)
+        self.assertIsNone(req.dllm_kv_indices)
+        self.assertNotIn("dual_cache_ready", req.dllm_algo_state)
+
+    def test_partial_draft_rejects_non_reference_shape(self):
+        config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={"threshold": 0.9, "dual_cache": True},
+            block_size=32,
+            first_done_first_out_mode=True,
+        )
+        with self.assertRaisesRegex(ValueError, "max_new_tokens=4"):
+            self._make_req(
+                config,
+                max_new_tokens=3,
+                custom_params={"dllm_partial_draft": {"rounds": 1}},
+            )
+        with self.assertRaisesRegex(ValueError, "rounds=1"):
+            self._make_req(
+                config,
+                max_new_tokens=4,
+                custom_params={"dllm_partial_draft": {"rounds": 2}},
+            )
+
 
 class TestDreamAlgorithm(CustomTestCase):
-    def _forward_batch(self, input_ids, lengths, *, top_k=None, block_size=None):
+    def _forward_batch(
+        self,
+        input_ids,
+        lengths,
+        *,
+        top_k=None,
+        block_size=None,
+        canvas_lens=None,
+    ):
         batch_size = len(lengths)
         return SimpleNamespace(
             input_ids=input_ids,
             extend_seq_lens_cpu=lengths,
             batch_size=batch_size,
             dllm_block_size=block_size,
+            dllm_canvas_lens_cpu=canvas_lens,
             sampling_info=SimpleNamespace(
                 original_temperatures=torch.ones(batch_size),
                 original_top_ks=torch.tensor(
@@ -135,9 +240,7 @@ class TestDreamAlgorithm(CustomTestCase):
     def test_dream_accepts_logits_pruned_to_generation_blocks(self):
         dream = Dream(_config())
         input_ids = torch.tensor([10, 11, 99, 99, 20, 99, 99])
-        forward_batch = self._forward_batch(
-            input_ids, [4, 3], top_k=1, block_size=2
-        )
+        forward_batch = self._forward_batch(input_ids, [4, 3], top_k=1, block_size=2)
         logits = torch.zeros((4, 5))
         logits[:, 3] = 5.0
         states = [
@@ -169,6 +272,112 @@ class TestDreamAlgorithm(CustomTestCase):
         self.assertEqual(done, [False])
         self.assertEqual(forward_batch.input_ids.tolist(), [10, 11, 4, 99])
         self.assertTrue(states[0]["dual_cache_ready"])
+
+    def test_prefilling_dream_partial_draft_uses_explicit_confirmation_mask(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={"threshold": 0.9, "dual_cache": True},
+                block_size=32,
+                mask_id=4,
+            )
+        )
+        state = {
+            "prompt_len": 2,
+            "partial_draft": True,
+            "partial_draft_stage": "prompt",
+            "partial_draft_first_token": None,
+            "canvas_len": 4,
+            "partial_draft_round_limit": 1,
+            "partial_draft_rounds_done": 0,
+            "partial_draft_confirmed_mask": [False, False, False, False],
+        }
+
+        first_batch = self._forward_batch(
+            torch.tensor([10, 11]),
+            [2],
+            block_size=32,
+            canvas_lens=[1],
+        )
+        first_logits = torch.zeros((1, 5))
+        first_logits[0, 4] = 5.0
+
+        first_done = algorithm.step(first_batch, first_logits, [state])
+
+        self.assertEqual(first_done, [False])
+        self.assertEqual(first_batch.input_ids.tolist(), [10, 11])
+        self.assertEqual(state["partial_draft_stage"], "suffix_init")
+        self.assertEqual(state["partial_draft_first_token"], 4)
+        self.assertEqual(
+            state["partial_draft_confirmed_mask"],
+            [False, False, False, False],
+        )
+        self.assertFalse(state["last_round_was_dual_cache"])
+
+        second_batch = self._forward_batch(
+            torch.tensor([4, 4, 4, 4]),
+            [4],
+            block_size=32,
+            canvas_lens=[4],
+        )
+        second_done = algorithm.step(second_batch, torch.zeros((4, 5)), [state])
+
+        self.assertEqual(second_done, [False])
+        # The first confirmed token deliberately equals mask_id. Its explicit
+        # confirmed bit must keep it out of the next round's candidates.
+        self.assertEqual(second_batch.input_ids.tolist(), [4, 4, 4, 4])
+        self.assertEqual(state["partial_draft_stage"], "partial_round")
+        self.assertEqual(
+            state["partial_draft_confirmed_mask"],
+            [True, False, False, False],
+        )
+        self.assertTrue(state["dual_cache_ready"])
+        self.assertFalse(state["last_round_was_dual_cache"])
+
+        third_batch = self._forward_batch(
+            torch.tensor([4, 4, 4, 4]),
+            [4],
+            block_size=32,
+            canvas_lens=[4],
+        )
+        # All three candidates exceed the normal threshold. Partial drafting
+        # must nevertheless accept only the single globally most-confident row.
+        third_logits = torch.zeros((4, 5))
+        third_logits[0, 0] = 20.0
+        third_logits[1, 1] = 5.0
+        third_logits[2, 2] = 8.0
+        third_logits[3, 3] = 6.0
+
+        third_done = algorithm.step(third_batch, third_logits, [state])
+
+        self.assertEqual(third_done, [True])
+        self.assertEqual(third_batch.input_ids.tolist(), [4, 4, 2, 4])
+        self.assertEqual(state["partial_draft_rounds_done"], 1)
+        self.assertEqual(
+            state["partial_draft_confirmed_mask"],
+            [True, False, True, False],
+        )
+        self.assertTrue(state["last_round_was_dual_cache"])
+
+    def test_prefilling_dream_default_threshold_path_is_unchanged(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={"threshold": 0.9, "dual_cache": True},
+                block_size=3,
+            )
+        )
+        batch = self._forward_batch(torch.tensor([99, 99, 99]), [3], block_size=3)
+        logits = torch.zeros((3, 5))
+        logits[0, 1] = 8.0
+        logits[1, 2] = 8.0
+        logits[2, 3] = 8.0
+        state = {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True}
+
+        done = algorithm.step(batch, logits, [state])
+
+        self.assertEqual(done, [False])
+        self.assertEqual(batch.input_ids.tolist(), [1, 2, 3])
 
     def test_dream_fdfo_carries_each_request_until_done(self):
         dream = Dream(_config(algorithm_config={"steps": 2, "alg": "origin"}))
@@ -264,7 +473,12 @@ class TestDreamAlgorithm(CustomTestCase):
 
 class TestDreamCudaGraphPath(CustomTestCase):
     def _dream_forward_with_hidden_states(
-        self, hidden_states, seq_lens, block_size=None
+        self,
+        hidden_states,
+        seq_lens,
+        block_size=None,
+        canvas_lens=None,
+        raw_last_logits=None,
     ):
         def model(*args, **kwargs):
             del args, kwargs
@@ -284,6 +498,8 @@ class TestDreamCudaGraphPath(CustomTestCase):
             forward_mode=ForwardMode.DLLM_EXTEND,
             extend_seq_lens_cpu=seq_lens,
             dllm_block_size=block_size,
+            dllm_canvas_lens_cpu=canvas_lens,
+            dllm_raw_last_logits_cpu=raw_last_logits,
         )
         return DreamModel.forward(
             dream_model,
@@ -333,8 +549,71 @@ class TestDreamCudaGraphPath(CustomTestCase):
         )
 
         self.assertEqual(output.full_logits.shape, (2, 1))
+        self.assertTrue(torch.equal(output.full_logits[:, 0], torch.tensor([0.0, 0.0])))
+
+    def test_dream_forward_projects_mixed_request_canvas_lengths(self):
+        hidden_states = torch.arange(40, dtype=torch.float32).view(40, 1)
+
+        output = self._dream_forward_with_hidden_states(
+            hidden_states,
+            [6, 34],
+            block_size=32,
+            canvas_lens=[4, 32],
+        )
+
+        self.assertEqual(output.full_logits.shape, (36, 1))
         self.assertTrue(
-            torch.equal(output.full_logits[:, 0], torch.tensor([0.0, 0.0]))
+            torch.equal(output.full_logits[:4, 0], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        )
+        self.assertTrue(
+            torch.equal(
+                output.full_logits[4:, 0], torch.arange(7, 39, dtype=torch.float32)
+            )
+        )
+
+    def test_dream_forward_partial_prompt_uses_raw_final_hidden_state(self):
+        hidden_states = torch.tensor([[10.0], [20.0], [30.0]])
+
+        output = self._dream_forward_with_hidden_states(
+            hidden_states,
+            [3],
+            block_size=32,
+            canvas_lens=[1],
+            raw_last_logits=[True],
+        )
+
+        # Normal Dream shifting would expose 20.0 at the final row. The partial
+        # prompt stage must instead project the raw final prompt hidden state.
+        self.assertEqual(output.full_logits.shape, (1, 1))
+        self.assertEqual(output.full_logits.item(), 30.0)
+
+    def test_dream_forward_rejects_oversized_request_canvas(self):
+        with self.assertRaisesRegex(RuntimeError, "fit their request token spans"):
+            self._dream_forward_with_hidden_states(
+                torch.zeros((3, 1)),
+                [3],
+                block_size=32,
+                canvas_lens=[4],
+            )
+
+    def test_prefill_graph_rejects_partial_dream_dynamic_metadata(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+
+        self.assertFalse(
+            runner.can_run_graph(
+                SimpleNamespace(
+                    dllm_canvas_lens_cpu=[4],
+                    dllm_raw_last_logits_cpu=None,
+                )
+            )
+        )
+        self.assertFalse(
+            runner.can_run_graph(
+                SimpleNamespace(
+                    dllm_canvas_lens_cpu=None,
+                    dllm_raw_last_logits_cpu=[True],
+                )
+            )
         )
 
     def test_prefill_bcg_trims_full_logits_to_raw_tokens(self):
@@ -552,6 +831,50 @@ class TestDreamSchedulerAdmission(CustomTestCase):
         self.assertEqual(len(scheduler.dllm_manager.waiting_queue), 1)
         self.assertEqual(len(scheduler.waiting_queue), 3)
 
+    def test_partial_prompt_incoming_admission_preserves_prompt_boundary(self):
+        config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={"threshold": 0.9, "dual_cache": True},
+            block_size=32,
+            first_done_first_out_mode=True,
+        )
+        req = Req(
+            rid="partial-admission",
+            origin_input_text="prompt",
+            origin_input_ids=array("q", [10, 11]),
+            sampling_params=SamplingParams(
+                max_new_tokens=4,
+                custom_params={"dllm_partial_draft": {"rounds": 1}},
+            ),
+            dllm_config=config,
+        )
+        self.assertEqual(req.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
+
+        adder = SimpleNamespace(
+            can_run_list=[],
+            add_one_req=MagicMock(return_value=AddReqResult.CONTINUE),
+        )
+        running_batch = SimpleNamespace(reqs=[], batch_is_full=False)
+        scheduler = SimpleNamespace(
+            dllm_config=config,
+            tree_cache=MagicMock(),
+            truncation_align_size=1,
+            enable_priority_preemption=False,
+            server_args=SimpleNamespace(),
+            get_num_allocatable_reqs=lambda _running_bs: 4,
+        )
+
+        result = SchedulerDllmMixin.process_dllm_incoming_reqs(
+            scheduler, adder, [req], running_batch
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(list(req.full_untruncated_fill_ids), [10, 11])
+        self.assertEqual(req.dllm_algo_state["prompt_len"], 2)
+        adder.add_one_req.assert_called_once_with(
+            req, has_chunked_req=True, truncation_align_size=1
+        )
+
 
 class TestDreamFDFOResultProcessing(CustomTestCase):
     def test_unresolved_canvas_and_state_survive_scheduler_round(self):
@@ -624,6 +947,196 @@ class TestDreamFDFOResultProcessing(CustomTestCase):
         self.assertEqual(list(req.output_ids), [20, 30, 40])
         self.assertTrue(req.finished())
         self.assertIsNone(req.dllm_algo_state)
+
+    def test_partial_draft_stages_clean_prompt_then_mask_suffix_kv(self):
+        config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={"threshold": 0.9, "dual_cache": True},
+            block_size=32,
+            first_done_first_out_mode=True,
+        )
+        sampling_params = SamplingParams(
+            max_new_tokens=4,
+            ignore_eos=True,
+            custom_params={"dllm_partial_draft": {"rounds": 1}},
+        )
+        sampling_params.normalize(None)
+        req = Req(
+            rid="staged-partial",
+            origin_input_text="prompt",
+            origin_input_ids=array("q", [10, 11]),
+            sampling_params=sampling_params,
+            dllm_config=config,
+        )
+        req.init_next_round_input()
+        self.assertEqual(list(req.full_untruncated_fill_ids), [10, 11])
+
+        scheduler = SimpleNamespace(
+            dllm_config=config,
+            metrics_reporter=SimpleNamespace(
+                num_generated_tokens=0,
+                report_prefill_stats=MagicMock(),
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=MagicMock(),
+                free_group_end=MagicMock(),
+            ),
+            tree_cache=MagicMock(),
+            output_streamer=SimpleNamespace(stream_output=MagicMock()),
+        )
+        batch_base = dict(
+            batch_size=lambda: 1,
+            reqs=[req],
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+
+        prompt_state = req.dllm_algo_state
+        prompt_state.update(
+            {
+                "partial_draft_first_token": 7,
+                "partial_draft_stage": "suffix_init",
+                "last_partial_draft_stage": "prompt",
+                "last_round_was_dual_cache": False,
+            }
+        )
+        prompt_batch = SimpleNamespace(
+            **batch_base,
+            extend_lens=[2],
+            out_cache_loc=torch.tensor([101, 102]),
+        )
+        prompt_result = SimpleNamespace(
+            copy_done=None,
+            accept_length_per_req_cpu=None,
+            dllm_done_per_req_cpu=[False],
+            dllm_algo_state=[prompt_state],
+            next_token_ids=[[10, 11]],
+            can_run_cuda_graph=False,
+        )
+
+        SchedulerDllmMixin.process_batch_result_dllm(
+            scheduler, prompt_batch, prompt_result
+        )
+
+        self.assertEqual(req.prefix_indices.tolist(), [101, 102])
+        self.assertEqual(req.dllm_algo_state["partial_draft_stage"], "suffix_init")
+        self.assertFalse(req.dllm_incomplete_ids)
+        self.assertEqual(list(req.output_ids), [])
+
+        # DllmManager.init_next_round() rebuilds only the suffix while retaining
+        # the clean prompt KV prefix.
+        req.init_next_round_input()
+        self.assertEqual(list(req.full_untruncated_fill_ids), [10, 11, 99, 99, 99, 99])
+        self.assertEqual(req.prefix_indices.tolist(), [101, 102])
+
+        suffix_state = req.dllm_algo_state
+        suffix_state.update(
+            {
+                "partial_draft_stage": "partial_round",
+                "last_partial_draft_stage": "suffix_init",
+                "dual_cache_ready": True,
+                "is_prefill": False,
+                "partial_draft_confirmed_mask": [True, False, False, False],
+            }
+        )
+        suffix_batch = SimpleNamespace(
+            **batch_base,
+            extend_lens=[4],
+            out_cache_loc=torch.tensor([201, 202, 203, 204]),
+        )
+        suffix_result = SimpleNamespace(
+            copy_done=None,
+            accept_length_per_req_cpu=None,
+            dllm_done_per_req_cpu=[False],
+            dllm_algo_state=[suffix_state],
+            next_token_ids=[[7, 99, 99, 99]],
+            can_run_cuda_graph=False,
+        )
+
+        SchedulerDllmMixin.process_batch_result_dllm(
+            scheduler, suffix_batch, suffix_result
+        )
+
+        self.assertEqual(req.prefix_indices.tolist(), [101, 102])
+        self.assertEqual(req.dllm_kv_indices.tolist(), [201, 202, 203, 204])
+        self.assertEqual(list(req.dllm_incomplete_ids), [7, 99, 99, 99])
+        self.assertEqual(list(req.full_untruncated_fill_ids), [10, 11, 7, 99, 99, 99])
+        self.assertEqual(list(req.output_ids), [])
+
+    def test_partial_draft_returns_confirmed_bitmap_after_dual_cache_round(self):
+        config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={"threshold": 0.9, "dual_cache": True},
+            block_size=32,
+            first_done_first_out_mode=True,
+        )
+        sampling_params = SamplingParams(
+            max_new_tokens=4,
+            ignore_eos=True,
+            custom_params={"dllm_partial_draft": {"rounds": 1}},
+        )
+        sampling_params.normalize(None)
+        req = Req(
+            rid="partial",
+            origin_input_text="prompt",
+            origin_input_ids=array("q", [10]),
+            sampling_params=sampling_params,
+            dllm_config=config,
+        )
+        req.init_next_round_input()
+        req.dllm_algo_state["dual_cache_ready"] = True
+        req.dllm_algo_state["last_round_was_dual_cache"] = True
+        req.dllm_algo_state["partial_draft_confirmed_mask"] = [
+            True,
+            False,
+            True,
+            False,
+        ]
+
+        scheduler = SimpleNamespace(
+            dllm_config=config,
+            metrics_reporter=SimpleNamespace(
+                num_generated_tokens=0,
+                report_prefill_stats=MagicMock(),
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=MagicMock(),
+                free_group_end=MagicMock(),
+            ),
+            tree_cache=MagicMock(),
+            output_streamer=SimpleNamespace(stream_output=MagicMock()),
+        )
+        batch = SimpleNamespace(
+            batch_size=lambda: 1,
+            reqs=[req],
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        done = SimpleNamespace(
+            copy_done=None,
+            accept_length_per_req_cpu=None,
+            dllm_done_per_req_cpu=[True],
+            dllm_algo_state=[None],
+            # Slot 0 deliberately equals mask_id even though the algorithm
+            # confirmed it. The explicit bitmap, not token equality, is the
+            # source of truth.
+            next_token_ids=[[99, 99, 30, 99]],
+            can_run_cuda_graph=False,
+        )
+
+        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+            SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, done)
+
+        self.assertEqual(list(req.output_ids), [99, 99, 30, 99])
+        self.assertEqual(
+            req.customized_info["dllm_confirmed_mask"],
+            [True, False, True, False],
+        )
+        self.assertTrue(req.finished())
+        self.assertIsNone(req.dllm_algo_state)
+        release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
 
 
 if __name__ == "__main__":

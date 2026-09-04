@@ -519,6 +519,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Number of trailing generation-canvas rows needed by a dLLM model's LM
     # head.  Dream uses this to avoid materializing prompt-length full logits.
     dllm_block_size: Optional[int] = None
+    # Optional per-request override for bounded Dream canvases. This remains
+    # None for ordinary requests so the server-wide block-size path is
+    # byte-for-byte unchanged.
+    dllm_canvas_lens_cpu: Optional[List[int]] = None
+    # Partial drafting's prompt stage projects the raw final prompt hidden
+    # state instead of Dream's usual right-shifted generation rows.
+    dllm_raw_last_logits_cpu: Optional[List[bool]] = None
     # ParallelComp retains causal chunk KV even though Dream's generation
     # canvas itself uses bidirectional attention.
     dllm_force_causal: bool = False
@@ -787,6 +794,38 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         parallelcomp_states = [
             getattr(req, "dllm_parallelcomp_state", None) for req in batch.reqs
         ]
+        dllm_canvas_lens_cpu = None
+        dllm_raw_last_logits_cpu = None
+        if batch.dllm_config is not None and batch.dllm_config.needs_full_prefill:
+            has_canvas_override = any(
+                isinstance(getattr(req, "dllm_algo_state", None), dict)
+                and "canvas_len" in req.dllm_algo_state
+                for req in batch.reqs
+            )
+            if has_canvas_override:
+                default_canvas_len = batch.dllm_config.block_size
+                if default_canvas_len is None:
+                    raise RuntimeError(
+                        "Per-request Dream canvases require a configured block size"
+                    )
+                canvas_lens = []
+                raw_last_logits = []
+                for req in batch.reqs:
+                    state = getattr(req, "dllm_algo_state", None)
+                    state = state if isinstance(state, dict) else {}
+                    use_raw_last = bool(
+                        state.get("partial_draft", False)
+                        and state.get("partial_draft_stage") == "prompt"
+                    )
+                    raw_last_logits.append(use_raw_last)
+                    canvas_lens.append(
+                        1
+                        if use_raw_last
+                        else int(state.get("canvas_len", default_canvas_len))
+                    )
+                dllm_canvas_lens_cpu = canvas_lens
+                if any(raw_last_logits):
+                    dllm_raw_last_logits_cpu = raw_last_logits
         dllm_force_causal = _parallelcomp_force_causal(batch.reqs)
         dllm_parallelcomp_item_lens = [
             (
@@ -836,6 +875,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             dllm_force_causal=dllm_force_causal,
+            dllm_canvas_lens_cpu=dllm_canvas_lens_cpu,
+            dllm_raw_last_logits_cpu=dllm_raw_last_logits_cpu,
             dllm_parallelcomp_item_lens=dllm_parallelcomp_item_lens,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,

@@ -211,12 +211,110 @@ class SchedulerDllmMixin:
                         round_tokens = round_tokens.tolist()
                     round_tokens = array("q", round_tokens)
 
+                    algo_state = req.dllm_algo_state or {}
+                    last_partial_draft_stage = algo_state.get(
+                        "last_partial_draft_stage"
+                    )
+                    if last_partial_draft_stage == "prompt":
+                        if result.dllm_done_per_req_cpu[idx]:
+                            raise RuntimeError(
+                                "Partial draft prompt stage completed prematurely"
+                            )
+                        next_state = (
+                            algo_states[idx] if algo_states is not None else None
+                        )
+                        if (
+                            not isinstance(next_state, dict)
+                            or next_state.get("partial_draft_stage") != "suffix_init"
+                            or not isinstance(
+                                next_state.get("partial_draft_first_token"), int
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Partial draft prompt stage returned invalid state"
+                            )
+                        cache_offset = sum(batch.extend_lens[:idx])
+                        round_cache_loc = batch.out_cache_loc[
+                            cache_offset : cache_offset + batch.extend_lens[idx]
+                        ]
+                        prompt_len = next_state["prompt_len"]
+                        if (
+                            len(round_tokens) != prompt_len
+                            or len(round_cache_loc) != prompt_len
+                        ):
+                            raise RuntimeError(
+                                "Partial draft prompt token/KV span mismatch: "
+                                f"tokens={len(round_tokens)}, "
+                                f"kv={len(round_cache_loc)}, prompt={prompt_len}"
+                            )
+                        req.dllm_algo_state = next_state
+                        req.prefix_indices = round_cache_loc.clone()
+                        req.dllm_incomplete_ids = array("q")
+                        req.dllm_kv_indices = None
+                        req.dllm_initialized = False
+                        req.dllm_canvas_output_len = -1
+                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        continue
+
+                    if last_partial_draft_stage == "suffix_init":
+                        if result.dllm_done_per_req_cpu[idx]:
+                            raise RuntimeError(
+                                "Partial draft suffix stage completed prematurely"
+                            )
+                        next_state = (
+                            algo_states[idx] if algo_states is not None else None
+                        )
+                        if (
+                            not isinstance(next_state, dict)
+                            or next_state.get("partial_draft_stage") != "partial_round"
+                            or not next_state.get("dual_cache_ready", False)
+                        ):
+                            raise RuntimeError(
+                                "Partial draft suffix stage returned invalid state"
+                            )
+                        canvas_len = next_state["canvas_len"]
+                        prompt_len = next_state["prompt_len"]
+                        cache_offset = sum(batch.extend_lens[:idx])
+                        round_cache_loc = batch.out_cache_loc[
+                            cache_offset : cache_offset + batch.extend_lens[idx]
+                        ]
+                        if (
+                            len(round_tokens) != canvas_len
+                            or len(round_cache_loc) != canvas_len
+                            or len(req.prefix_indices) != prompt_len
+                        ):
+                            raise RuntimeError(
+                                "Partial draft suffix token/KV span mismatch: "
+                                f"tokens={len(round_tokens)}, "
+                                f"kv={len(round_cache_loc)}, "
+                                f"prefix={len(req.prefix_indices)}, "
+                                f"canvas={canvas_len}, prompt={prompt_len}"
+                            )
+                        req.dllm_algo_state = next_state
+                        req.full_untruncated_fill_ids[
+                            prompt_len : prompt_len + canvas_len
+                        ] = round_tokens
+                        req.dllm_incomplete_ids = array("q", round_tokens)
+                        req.dllm_kv_indices = round_cache_loc.clone()
+                        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        continue
+
                     # step() mutates the carried state in place, so the first
                     # full-canvas pass already appears dual-cache-ready here.
                     # The returned token span is the authoritative round type.
+                    last_round_was_dual_cache = algo_state.get(
+                        "last_round_was_dual_cache"
+                    )
+                    expected_canvas_len = algo_state.get(
+                        "canvas_len", self.dllm_config.block_size
+                    )
                     dual_cache_round = bool(
                         self.dllm_config.dual_cache
-                        and len(round_tokens) == self.dllm_config.block_size
+                        and (
+                            last_round_was_dual_cache
+                            if last_round_was_dual_cache is not None
+                            else len(round_tokens) == expected_canvas_len
+                        )
                     )
                     if parallelcomp is not None:
                         full_prompt_len = len(req.origin_input_ids)
@@ -249,12 +347,37 @@ class SchedulerDllmMixin:
                     canvas = req.full_untruncated_fill_ids
 
                     if result.dllm_done_per_req_cpu[idx]:
+                        partial_draft = bool(
+                            req.dllm_algo_state
+                            and req.dllm_algo_state.get("partial_draft", False)
+                        )
                         prompt_len = (
                             len(req.origin_input_ids)
                             if parallelcomp is not None
                             else req.dllm_algo_state["prompt_len"]
                         )
                         req.output_ids = array("q", canvas[prompt_len:])
+                        if partial_draft:
+                            confirmed_mask = req.dllm_algo_state.get(
+                                "partial_draft_confirmed_mask"
+                            )
+                            if (
+                                not isinstance(confirmed_mask, list)
+                                or len(confirmed_mask) != len(req.output_ids)
+                                or any(
+                                    not isinstance(value, bool)
+                                    for value in confirmed_mask
+                                )
+                            ):
+                                raise RuntimeError(
+                                    "Completed partial draft is missing a valid "
+                                    "canvas-aligned confirmed mask"
+                                )
+                            if req.customized_info is None:
+                                req.customized_info = {}
+                            req.customized_info["dllm_confirmed_mask"] = list(
+                                confirmed_mask
+                            )
                         req.dllm_incomplete_ids = array("q")
                         req.dllm_kv_indices = None
                         req.dllm_algo_state = None
@@ -577,30 +700,44 @@ class SchedulerDllmMixin:
                         break
                     continue
 
-                # Req state can predate tokenization. Once Dream materializes
-                # its canvas, derive the authoritative prompt boundary from
-                # prompt + committed output + remaining-mask layout.
-                remaining = max(
-                    req.sampling_params.max_new_tokens - len(req.output_ids), 0
+                partial_draft_prompt = bool(
+                    req.dllm_algo_state.get("partial_draft", False)
+                    and req.dllm_algo_state.get("partial_draft_stage") == "prompt"
                 )
-                prompt_len = len(req.full_untruncated_fill_ids) - remaining
-                if not 0 <= prompt_len <= len(req.full_untruncated_fill_ids):
-                    raise RuntimeError(
-                        "Invalid Dream prompt boundary: "
-                        f"prompt_len={prompt_len}, "
-                        f"canvas_len={len(req.full_untruncated_fill_ids)}, "
-                        f"remaining={remaining}"
-                    )
-                parallelcomp = req.dllm_parallelcomp_state
-                if (
-                    parallelcomp is not None
-                    and parallelcomp["stage"] == "decode"
-                    and not req.dllm_algo_state.get("dual_cache_ready", False)
-                ):
-                    req.dllm_algo_state["prompt_len"] = parallelcomp["query_len"]
-                    req.dllm_algo_state["full_prompt_len"] = prompt_len
-                else:
+                if partial_draft_prompt:
+                    prompt_len = len(req.origin_input_ids)
+                    if len(req.full_untruncated_fill_ids) != prompt_len:
+                        raise RuntimeError(
+                            "Partial draft prompt admission requires prompt-only input: "
+                            f"input={len(req.full_untruncated_fill_ids)}, "
+                            f"prompt={prompt_len}"
+                        )
                     req.dllm_algo_state["prompt_len"] = prompt_len
+                else:
+                    # Req state can predate tokenization. Once Dream materializes
+                    # its canvas, derive the authoritative prompt boundary from
+                    # prompt + committed output + remaining-mask layout.
+                    remaining = max(
+                        req.sampling_params.max_new_tokens - len(req.output_ids), 0
+                    )
+                    prompt_len = len(req.full_untruncated_fill_ids) - remaining
+                    if not 0 <= prompt_len <= len(req.full_untruncated_fill_ids):
+                        raise RuntimeError(
+                            "Invalid Dream prompt boundary: "
+                            f"prompt_len={prompt_len}, "
+                            f"canvas_len={len(req.full_untruncated_fill_ids)}, "
+                            f"remaining={remaining}"
+                        )
+                    parallelcomp = req.dllm_parallelcomp_state
+                    if (
+                        parallelcomp is not None
+                        and parallelcomp["stage"] == "decode"
+                        and not req.dllm_algo_state.get("dual_cache_ready", False)
+                    ):
+                        req.dllm_algo_state["prompt_len"] = parallelcomp["query_len"]
+                        req.dllm_algo_state["full_prompt_len"] = prompt_len
+                    else:
+                        req.dllm_algo_state["prompt_len"] = prompt_len
             res = adder.add_one_req(
                 req,
                 has_chunked_req=True,

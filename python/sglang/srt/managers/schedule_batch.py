@@ -1356,6 +1356,7 @@ class Req(ReqDllmMixin):
             and self.dllm_config.needs_full_prefill
             and not dual_cache_ready
             and not self.has_parallelcomp_prefill_cache()
+            and not self.has_partial_draft_prompt_cache()
         ):
             # Bidirectional attention makes cached prefix K/V invalid: every
             # denoising pass must see prompt and all generated positions.
@@ -1751,6 +1752,7 @@ class Req(ReqDllmMixin):
         self.extend_range = None
         self.dllm_initialized = False
         self.reset_parallelcomp_prefill_state()
+        self.reset_partial_draft_state()
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None

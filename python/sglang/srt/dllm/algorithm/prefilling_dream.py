@@ -46,12 +46,24 @@ class PrefillingDream(DllmAlgorithm):
         input_parts = forward_batch.input_ids.split(lengths)
         logits_pruned_to_generation = full_logits.shape[0] != sum(lengths)
         if logits_pruned_to_generation:
+            canvas_lens = getattr(forward_batch, "dllm_canvas_lens_cpu", None)
             block_size = getattr(forward_batch, "dllm_block_size", None)
-            if block_size is None:
+            if canvas_lens is not None:
+                if len(canvas_lens) != len(lengths):
+                    raise RuntimeError(
+                        "PrefillingDream canvas lengths do not match the request batch: "
+                        f"{len(canvas_lens)} != {len(lengths)}"
+                    )
+                logits_lengths = [
+                    min(length, canvas_len)
+                    for length, canvas_len in zip(lengths, canvas_lens)
+                ]
+            elif block_size is not None:
+                logits_lengths = [min(length, block_size) for length in lengths]
+            else:
                 raise RuntimeError(
                     "PrefillingDream received pruned logits without a dLLM block size"
                 )
-            logits_lengths = [min(length, block_size) for length in lengths]
             if sum(logits_lengths) != full_logits.shape[0]:
                 raise RuntimeError(
                     "PrefillingDream pruned-logits rows do not match generation blocks: "
@@ -64,11 +76,85 @@ class PrefillingDream(DllmAlgorithm):
 
         for ids, logits, state in zip(input_parts, logits_parts, states):
             prompt_len = state["prompt_len"]
+            partial_draft_stage = state.get("partial_draft_stage")
+            if partial_draft_stage is not None:
+                state["last_partial_draft_stage"] = partial_draft_stage
             dual_cache_round = bool(
                 self.dual_cache and state.get("dual_cache_ready", False)
             )
+            # The state is shallow-carried by FDFO, so the scheduler can use
+            # this pre-step fact instead of inferring the round type from a
+            # server-wide block size.
+            state["last_round_was_dual_cache"] = dual_cache_round
+
+            if partial_draft_stage == "prompt":
+                if dual_cache_round or logits.shape[0] != 1:
+                    raise RuntimeError(
+                        "PrefillingDream partial prompt requires one raw final logit"
+                    )
+                prompt_probs = F.softmax(logits[0], dim=-1)
+                state["partial_draft_first_token"] = int(
+                    prompt_probs.argmax(dim=-1).item()
+                )
+                state["partial_draft_stage"] = "suffix_init"
+                done.append(False)
+                continue
+
+            if partial_draft_stage == "suffix_init":
+                canvas_len = state["canvas_len"]
+                if dual_cache_round or len(ids) != canvas_len:
+                    raise RuntimeError(
+                        "PrefillingDream partial suffix initialization requires "
+                        "one uncached canvas"
+                    )
+                if not bool(ids.eq(self.mask_id).all().item()):
+                    raise RuntimeError(
+                        "PrefillingDream partial suffix must start fully masked"
+                    )
+                first_token = state.get("partial_draft_first_token")
+                if not isinstance(first_token, int):
+                    raise RuntimeError(
+                        "PrefillingDream partial suffix is missing its prompt token"
+                    )
+                confirmed_mask = state.get("partial_draft_confirmed_mask")
+                if not isinstance(confirmed_mask, list) or len(confirmed_mask) != len(
+                    ids
+                ):
+                    raise RuntimeError(
+                        "PrefillingDream partial draft requires a canvas-aligned "
+                        "confirmed mask"
+                    )
+                ids[0] = first_token
+                confirmed_mask[0] = True
+                state["is_prefill"] = False
+                state["dual_cache_ready"] = self.dual_cache
+                state["partial_draft_stage"] = "partial_round"
+                done.append(False)
+                continue
+
             generation_ids = ids if dual_cache_round else ids[prompt_len:]
-            mask = generation_ids.eq(self.mask_id)
+            partial_draft = bool(state.get("partial_draft", False))
+            confirmed_mask = None
+            if partial_draft:
+                confirmed_mask = state.get("partial_draft_confirmed_mask")
+                if (
+                    not isinstance(confirmed_mask, list)
+                    or len(confirmed_mask) != len(generation_ids)
+                    or any(type(value) is not bool for value in confirmed_mask)
+                ):
+                    raise RuntimeError(
+                        "PrefillingDream partial draft requires a canvas-aligned "
+                        "boolean confirmed mask"
+                    )
+                # Confirmation is algorithm state, not a token-id property: the
+                # model is allowed to select mask_id as a real token. Excluding
+                # confirmed slots by bitmap prevents such a slot from being
+                # selected again in the bounded round.
+                mask = torch.tensor(
+                    confirmed_mask, dtype=torch.bool, device=generation_ids.device
+                ).logical_not()
+            else:
+                mask = generation_ids.eq(self.mask_id)
             if not bool(mask.any().item()):
                 done.append(True)
                 continue
@@ -93,13 +179,39 @@ class PrefillingDream(DllmAlgorithm):
                 accepted = torch.zeros(1, dtype=torch.long, device=ids.device)
                 state["is_prefill"] = False
                 state["dual_cache_ready"] = self.dual_cache
+                partial_draft_done = False
+            elif partial_draft:
+                # Reference partial drafting deliberately ignores the normal
+                # confidence threshold: each bounded round confirms only the
+                # single most-confident remaining slot.
+                accepted = torch.topk(confidence, k=1).indices
+                state["partial_draft_rounds_done"] += 1
+                partial_draft_done = (
+                    state["partial_draft_rounds_done"]
+                    >= state["partial_draft_round_limit"]
+                )
             else:
                 accepted = torch.where(confidence >= self.threshold)[0]
                 if accepted.numel() == 0:
                     accepted = torch.topk(confidence, k=1).indices
+                partial_draft_done = False
 
-            generation_ids[mask_positions[accepted]] = sampled_tokens[accepted]
-            done.append(False)
+            accepted_positions = mask_positions[accepted]
+            generation_ids[accepted_positions] = sampled_tokens[accepted]
+            if partial_draft:
+                assert confirmed_mask is not None
+                for position in accepted_positions.tolist():
+                    confirmed_mask[position] = True
+                expected_confirmed = min(
+                    len(confirmed_mask), 1 + state["partial_draft_rounds_done"]
+                )
+                if sum(confirmed_mask) != expected_confirmed:
+                    raise RuntimeError(
+                        "PrefillingDream partial draft confirmed an unexpected "
+                        f"number of slots: {sum(confirmed_mask)} != "
+                        f"{expected_confirmed}"
+                    )
+            done.append(partial_draft_done)
 
         return done
 

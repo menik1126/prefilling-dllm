@@ -1,6 +1,9 @@
 import importlib.util
+import json
+import sys
 from pathlib import Path
 
+import pytest
 
 SCRIPT = Path(__file__).with_name("bench_multifieldqa_chunk_selection.py")
 SPEC = importlib.util.spec_from_file_location("chunk_selection", SCRIPT)
@@ -109,15 +112,195 @@ def test_zero_length_draft_batch_skips_request():
     assert client.draft_ids_batch([[1], [2]], 0, 32) == [[], []]
 
 
+def test_partial_draft_preserves_all_slots_and_confirmed_mask():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    payloads = []
+    client.post = lambda payload: payloads.append(payload) or {
+        "output_ids": [10, 151666, 12, 151666],
+        "meta_info": {
+            "output_token_logprobs": [],
+            "dllm_confirmed_mask": [True, False, True, False],
+        },
+    }
+
+    draft = client.partial_draft([1, 2], 4, rounds=1)
+
+    assert draft == MODULE.PartialDraft(
+        token_ids=[10, 151666, 12, 151666],
+        confirmed_mask=[True, False, True, False],
+    )
+    assert payloads[0]["input_ids"] == [1, 2]
+    assert payloads[0]["sampling_params"] == {
+        "temperature": 0,
+        "max_new_tokens": 4,
+        "ignore_eos": True,
+        "custom_params": {"dllm_partial_draft": {"rounds": 1}},
+    }
+
+
+def test_partial_draft_batch_preserves_response_order():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    payloads = []
+    client.post = lambda payload: payloads.append(payload) or [
+        {
+            "output_ids": [10, 151666, 12, 151666],
+            "meta_info": {
+                "dllm_confirmed_mask": [True, False, True, False],
+            },
+        },
+        {
+            "output_ids": [20, 21, 151666, 151666],
+            "meta_info": {
+                "dllm_confirmed_mask": [True, True, False, False],
+            },
+        },
+    ]
+
+    drafts = client.partial_draft_batch([[1], [2]], 4, rounds=1)
+
+    assert drafts == [
+        MODULE.PartialDraft(
+            token_ids=[10, 151666, 12, 151666],
+            confirmed_mask=[True, False, True, False],
+        ),
+        MODULE.PartialDraft(
+            token_ids=[20, 21, 151666, 151666],
+            confirmed_mask=[True, True, False, False],
+        ),
+    ]
+    assert payloads[0]["input_ids"] == [[1], [2]]
+    assert payloads[0]["sampling_params"]["max_new_tokens"] == 4
+
+
+def test_single_partial_draft_batch_preserves_scalar_request_shape():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    payloads = []
+    client.post = lambda payload: payloads.append(payload) or {
+        "output_ids": [10, 11, 151666, 151666],
+        "meta_info": {
+            "dllm_confirmed_mask": [True, True, False, False],
+        },
+    }
+
+    drafts = client.partial_draft_batch([[1, 2]], 4, rounds=1)
+
+    assert drafts[0].token_ids == [10, 11, 151666, 151666]
+    assert payloads[0]["input_ids"] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        (
+            {"output_ids": [10, 11, 12, 13], "meta_info": {}},
+            "missing meta_info.dllm_confirmed_mask",
+        ),
+        (
+            {
+                "output_ids": [10, 11, 12, 13],
+                "meta_info": {"dllm_confirmed_mask": [True, False]},
+            },
+            "confirmed mask has 2 slots, expected 4",
+        ),
+        (
+            {
+                "output_ids": [10, 11, 12, 13],
+                "meta_info": {"dllm_confirmed_mask": [1, 0, 1, 0]},
+            },
+            "must contain only booleans",
+        ),
+        (
+            {
+                "output_ids": [10, 11, 12, 13],
+                "meta_info": {"dllm_confirmed_mask": [True, True, True, False]},
+            },
+            "confirmed 3 slots, expected 2",
+        ),
+        (
+            {
+                "output_ids": [10, 11, 12, 13],
+                "meta_info": {"dllm_confirmed_mask": [False, True, True, False]},
+            },
+            "must confirm slot zero",
+        ),
+    ],
+)
+def test_partial_draft_rejects_invalid_confirmed_mask(response, error):
+    with pytest.raises(RuntimeError, match=error):
+        MODULE.SGLangClient._partial_draft_from_result(response, 4, 1)
+
+
+def test_partial_draft_rejects_wrong_slot_count_and_negative_rounds():
+    with pytest.raises(RuntimeError, match="3 slots, expected 4"):
+        MODULE.SGLangClient._partial_draft_from_result(
+            {
+                "output_ids": [10, 11, 12],
+                "meta_info": {"dllm_confirmed_mask": [True, True, False, False]},
+            },
+            4,
+            1,
+        )
+
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    client.post = lambda payload: (_ for _ in ()).throw(AssertionError(payload))
+    with pytest.raises(ValueError, match="rounds must be non-negative"):
+        client.partial_draft([1], 4, rounds=-1)
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 2, 3, 5, 8])
+def test_main_rejects_unsupported_partial_draft_slot_count_before_io(
+    monkeypatch, tmp_path, draft_tokens
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(MODULE.__file__),
+            "--model-path",
+            "unused",
+            "--data-path",
+            str(tmp_path / "missing-data.jsonl"),
+            "--prompt-config",
+            str(tmp_path / "missing-prompts.json"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--draft-tokens",
+            str(draft_tokens),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="must be 0 .* or 4"):
+        MODULE.main()
+
+
+def test_main_requires_dedicated_causal_scorer_before_io(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(MODULE.__file__),
+            "--model-path",
+            "unused",
+            "--data-path",
+            str(tmp_path / "missing-data.jsonl"),
+            "--prompt-config",
+            str(tmp_path / "missing-prompts.json"),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires a dedicated --score-base-url"):
+        MODULE.main()
+
+
 def test_score_chunk_groups_flattens_and_scatters_variable_groups():
     client = MODULE.SGLangClient("http://example.invalid", timeout=1)
     batch_shapes = []
 
     def prompt_logprobs(rows, starts):
         batch_shapes.append((len(rows), list(starts)))
-        return [
-            [[float(token_id), token_id, None] for token_id in row] for row in rows
-        ]
+        return [[[float(token_id), token_id, None] for token_id in row] for row in rows]
 
     client.prompt_logprobs = prompt_logprobs
     scores = MODULE.score_chunk_groups(
@@ -130,8 +313,268 @@ def test_score_chunk_groups_flattens_and_scatters_variable_groups():
         batch_size=4,
     )
 
-    assert batch_shapes == [(4, [2, 2, 3, 1]), (2, [1, 1])]
+    # Prompt logprobs start one position before the scoring target so the
+    # causal shift includes the first query token.
+    assert batch_shapes == [(4, [1, 1, 2, 0]), (2, [0, 0])]
     assert scores == [[100.5, 100.5], [102.0], [104.0, 104.0, 104.0]]
+
+
+def test_score_chunk_groups_keeps_partial_slots_but_masks_their_logprobs():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    seen_rows = []
+
+    def prompt_logprobs(rows, starts):
+        seen_rows.extend(rows)
+        assert starts == [1, 1, 2]
+        return [[[float(token_id), token_id, None] for token_id in row] for row in rows]
+
+    client.prompt_logprobs = prompt_logprobs
+    scores = MODULE.score_chunk_groups(
+        client,
+        [
+            (
+                [1],
+                [[10], [11]],
+                [100, 101, 151666, 102, 151666],
+            ),
+            (
+                [2, 3],
+                [[12]],
+                [200, 201, 151666, 151666],
+            ),
+        ],
+        batch_size=3,
+        score_token_masks=[
+            [True, True, False, True, False],
+            [True, True, False, False],
+        ],
+    )
+
+    assert seen_rows == [
+        [1, 10, 100, 101, 151666, 102, 151666],
+        [1, 11, 100, 101, 151666, 102, 151666],
+        [2, 3, 12, 200, 201, 151666, 151666],
+    ]
+    assert scores == [[101.0, 101.0], [200.5]]
+
+
+def test_masked_mean_uses_trailing_target_positions_only():
+    values = [
+        [-999.0, 1, None],
+        [-1.0, 100, None],
+        [-2.0, 101, None],
+        [-100.0, 151666, None],
+        [-3.0, 102, None],
+        [-100.0, 151666, None],
+    ]
+    assert (
+        MODULE.mean_query_logprob(
+            values,
+            5,
+            [True, True, False, True, False],
+        )
+        == -2.0
+    )
+
+
+def test_mean_query_logprob_rejects_missing_scored_target():
+    with pytest.raises(ValueError, match="missing a scored target at offset 0"):
+        MODULE.mean_query_logprob([[None, 100, None]], 1)
+
+    assert (
+        MODULE.mean_query_logprob(
+            [[None, 100, None], [-2.0, 101, None]],
+            2,
+            [False, True],
+        )
+        == -2.0
+    )
+
+
+def test_score_chunk_groups_rejects_invalid_mask_shape_and_values():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    client.prompt_logprobs = lambda rows, starts: (_ for _ in ()).throw(
+        AssertionError((rows, starts))
+    )
+    groups = [([1], [[10]], [100, 101])]
+
+    with pytest.raises(ValueError, match="0 groups, expected 1"):
+        MODULE.score_chunk_groups(
+            client,
+            groups,
+            batch_size=1,
+            score_token_masks=[],
+        )
+    with pytest.raises(ValueError, match="length does not match"):
+        MODULE.score_chunk_groups(
+            client,
+            groups,
+            batch_size=1,
+            score_token_masks=[[True]],
+        )
+    with pytest.raises(ValueError, match="only booleans"):
+        MODULE.score_chunk_groups(
+            client,
+            groups,
+            batch_size=1,
+            score_token_masks=[[True, 1]],
+        )
+
+
+def test_selection_only_writes_selector_artifacts_without_generation(
+    monkeypatch, tmp_path
+):
+    data_path = tmp_path / "multifieldqa_en.jsonl"
+    data_path.write_text(
+        "\n".join(
+            json.dumps(example)
+            for example in [
+                {
+                    "_id": "example-0",
+                    "context": "CTX",
+                    "input": "ASK",
+                    "answers": ["answer"],
+                },
+                {
+                    "_id": "example-1",
+                    "context": "ONE",
+                    "input": "ASK",
+                    "answers": ["answer"],
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prompt_path = tmp_path / "dataset2prompt.json"
+    prompt_path.write_text(
+        json.dumps({"multifieldqa_en": "P{context}Q{input}"}),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+
+    class FakeTokenizer:
+        bos_token_id = None
+
+        @staticmethod
+        def encode(text, add_special_tokens=False):
+            assert not add_special_tokens
+            return {
+                "P": [1],
+                "CTX": [10, 11],
+                "ONE": [12],
+                "QASK": [20, 21],
+            }[text]
+
+    class FakeClient:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            self.partial_calls = []
+            self.score_rows = []
+            self.generate_calls = 0
+            self.causal_prompt_logprobs = kwargs.get("causal_prompt_logprobs", False)
+            self.instances.append(self)
+
+        def partial_draft_batch(
+            self, input_ids, max_new_tokens, *, rounds=MODULE.PARTIAL_DRAFT_ROUNDS
+        ):
+            self.partial_calls.append((input_ids, max_new_tokens, rounds))
+            return [
+                MODULE.PartialDraft(
+                    [30, 151666, 31, 151666],
+                    [True, False, True, False],
+                )
+                for _ in input_ids
+            ]
+
+        def prompt_logprobs(self, rows, starts):
+            self.score_rows.extend(rows)
+            return [
+                [
+                    [-float(offset + 1), token_id, None]
+                    for offset, token_id in enumerate(row)
+                ]
+                for row in rows
+            ]
+
+        def generate(self, *args, **kwargs):
+            self.generate_calls += 1
+            raise AssertionError("selection-only must skip final generation")
+
+    monkeypatch.setattr(
+        MODULE.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(MODULE, "SGLangClient", FakeClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(MODULE.__file__),
+            "--model-path",
+            "unused",
+            "--data-path",
+            str(data_path),
+            "--prompt-config",
+            str(prompt_path),
+            "--output-dir",
+            str(output_dir),
+            "--chunk-size",
+            "1",
+            "--top-k",
+            "1",
+            "--draft-tokens",
+            "4",
+            "--num-examples",
+            "2",
+            "--score-base-url",
+            "http://score.invalid",
+            "--selection-only",
+        ],
+    )
+
+    MODULE.main()
+
+    records = [
+        json.loads(line)
+        for line in (output_dir / "multifieldqa_en_query_logprob_continuous.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    metrics = json.loads(
+        (
+            output_dir / "multifieldqa_en_query_logprob_continuous_metrics.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert len(records) == 2
+    assert records[0]["draft_ids"] == [30, 151666, 31, 151666]
+    assert records[0]["partial_draft_ids"] == [30, 151666, 31, 151666]
+    assert records[0]["draft_confirmed_mask"] == [True, False, True, False]
+    assert records[0]["prediction"] == ""
+    assert records[0]["raw_prediction"] == ""
+    assert records[0]["score"] is None
+    assert records[0]["generation_seconds"] == 0.0
+    assert records[0]["generation_meta"] is None
+    assert records[1]["selected_chunk_indices"] == [0]
+    assert records[1]["chunk_scores"] is None
+    assert records[1]["draft_ids"] == []
+    assert records[1]["partial_draft_ids"] == []
+    assert records[1]["draft_confirmed_mask"] == []
+    assert records[1]["selector_scoring_skipped"] == "top_k_covers_all"
+    assert records[1]["score_seconds"] == 0.0
+    assert records[1]["generation_seconds"] == 0.0
+    assert metrics["score"] is None
+    assert metrics["selection_only"] is True
+    assert metrics["draft_partial_rounds"] == 1
+    assert metrics["total_generation_seconds"] == 0.0
+    assert FakeClient.instances[0].partial_calls == [([[1, 20, 21]], 4, 1)]
+    assert not FakeClient.instances[0].causal_prompt_logprobs
+    assert FakeClient.instances[1].causal_prompt_logprobs
+    assert len(FakeClient.instances[1].score_rows) == 2
+    assert all(client.generate_calls == 0 for client in FakeClient.instances)
 
 
 def test_mean_query_logprob_rejects_empty_scoring_target():
