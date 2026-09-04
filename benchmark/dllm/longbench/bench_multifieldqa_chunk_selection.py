@@ -19,6 +19,7 @@ mode; omit ``--server-chunk-prefill`` for accuracy-aligned evaluation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -47,6 +48,11 @@ def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
         for line in file:
             if line.strip():
                 yield json.loads(line)
+
+
+def token_ids_sha256(token_ids: Sequence[int]) -> str:
+    payload = json.dumps(list(token_ids), separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def load_selection_manifest(path: Path) -> dict[int, list[int]]:
@@ -198,6 +204,26 @@ class SGLangClient:
         position_offset: int = 0,
         custom_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        sampling_params = self._generation_sampling_params(
+            max_new_tokens,
+            position_start,
+            position_offset,
+            custom_params,
+        )
+        return self.post(
+            {
+                "input_ids": list(input_ids),
+                "sampling_params": sampling_params,
+            }
+        )
+
+    @staticmethod
+    def _generation_sampling_params(
+        max_new_tokens: int,
+        position_start: int | None,
+        position_offset: int,
+        custom_params: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         sampling_params: dict[str, Any] = {
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
@@ -212,12 +238,81 @@ class SGLangClient:
             )
         if request_custom_params:
             sampling_params["custom_params"] = request_custom_params
-        return self.post(
+        return sampling_params
+
+    def generate_batch(
+        self,
+        input_ids: Sequence[Sequence[int]],
+        max_new_tokens: int,
+        *,
+        position_starts: Sequence[int | None] | None = None,
+        position_offsets: Sequence[int] | None = None,
+        custom_params: Sequence[dict[str, Any] | None] | None = None,
+    ) -> list[dict[str, Any]]:
+        batch_size = len(input_ids)
+        if batch_size == 0:
+            return []
+        if position_starts is None:
+            position_starts = [None] * batch_size
+        if position_offsets is None:
+            position_offsets = [0] * batch_size
+        if custom_params is None:
+            custom_params = [None] * batch_size
+        for name, values in (
+            ("position_starts", position_starts),
+            ("position_offsets", position_offsets),
+            ("custom_params", custom_params),
+        ):
+            if len(values) != batch_size:
+                raise ValueError(
+                    f"{name} has {len(values)} rows, expected {batch_size}"
+                )
+        if batch_size == 1:
+            return [
+                self.generate(
+                    input_ids[0],
+                    max_new_tokens,
+                    position_start=position_starts[0],
+                    position_offset=position_offsets[0],
+                    custom_params=custom_params[0],
+                )
+            ]
+
+        sampling_params = [
+            self._generation_sampling_params(
+                max_new_tokens,
+                position_start,
+                position_offset,
+                request_custom_params,
+            )
+            for position_start, position_offset, request_custom_params in zip(
+                position_starts,
+                position_offsets,
+                custom_params,
+                strict=True,
+            )
+        ]
+        result = self.post(
             {
-                "input_ids": list(input_ids),
+                "input_ids": [list(ids) for ids in input_ids],
                 "sampling_params": sampling_params,
             }
         )
+        rows = result if isinstance(result, list) else [result]
+        if len(rows) != batch_size:
+            raise RuntimeError(
+                "Dream final generation returned "
+                f"{len(rows)} rows, expected {batch_size}"
+            )
+        invalid_rows = [
+            index for index, row in enumerate(rows) if not isinstance(row, dict)
+        ]
+        if invalid_rows:
+            raise RuntimeError(
+                "Dream final generation returned non-object rows at indices "
+                f"{invalid_rows}"
+            )
+        return rows
 
     def partial_draft(
         self,
@@ -656,6 +751,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--generation-microbatch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of compressed prompts submitted together for final answer "
+            "generation. One preserves the original scalar request shape. "
+            "The effective batch is bounded by --selector-microbatch-size."
+        ),
+    )
+    parser.add_argument(
         "--draft-tokens",
         type=int,
         default=0,
@@ -706,6 +811,8 @@ def main() -> None:
         raise ValueError("score_batch_size must be positive")
     if args.selector_microbatch_size <= 0:
         raise ValueError("selector_microbatch_size must be positive")
+    if args.generation_microbatch_size <= 0:
+        raise ValueError("generation_microbatch_size must be positive")
     if args.draft_tokens not in (0, 4):
         raise ValueError(
             "--draft-tokens must be 0 (disabled) or 4 for partial-draft selection"
@@ -795,6 +902,10 @@ def main() -> None:
     score_request_count = 0
     shared_selector_timing = False
     active_microbatch_sizes = []
+    generation_request_count = 0
+    shared_generation_timing = False
+    active_generation_microbatch_sizes = []
+    total_generation_batch_seconds = 0.0
     for group_start in range(0, len(prepared), args.selector_microbatch_size):
         group = prepared[group_start : group_start + args.selector_microbatch_size]
         for state in group:
@@ -902,18 +1013,11 @@ def main() -> None:
                 )
 
         for state in group:
-            local_index = state["local_index"]
             index = state["index"]
-            example = state["example"]
             prefix_ids = state["prefix_ids"]
-            context_ids = state["context_ids"]
             query_ids = state["query_ids"]
             chunks = state["chunks"]
-            draft_ids = state["draft_ids"]
-            partial_draft_ids = state["partial_draft_ids"]
-            draft_confirmed_mask = state["draft_confirmed_mask"]
             chunk_scores = state["chunk_scores"]
-            score_seconds = state["draft_seconds"] + state["chunk_score_seconds"]
 
             if args.selection_mode in {"fixed", "manifest"}:
                 requested_indices = (
@@ -943,75 +1047,137 @@ def main() -> None:
             ]
             compressed_ids = prefix_ids + selected_context_ids + query_ids
 
-            generation = None
-            raw_prediction = ""
-            prediction = ""
-            generation_seconds = 0.0
-            position_offset = None
-            if client is not None and not args.selection_only:
-                query_start = len(prefix_ids) + len(selected_context_ids)
-                position_offset = 0
-                if args.query_position_mode == "after_selected_chunks":
-                    query_rope_start = len(prefix_ids) + len(selected) * args.chunk_size
-                    position_offset = query_rope_start - query_start
-                    if position_offset < 0:
-                        raise RuntimeError(
-                            "Selected chunk slots end before the compressed query"
-                        )
-                elif args.query_position_mode == "after_reused_window":
-                    query_rope_start = len(prefix_ids) + args.chunk_size
-                    position_offset = query_rope_start - query_start
-                else:
-                    query_rope_start = query_start
+            state["selected"] = selected
+            state["compressed_ids"] = compressed_ids
+            state["generation"] = None
+            state["generation_seconds"] = 0.0
+            state["generation_seconds_are_attributed"] = False
+            state["generation_active_microbatch_size"] = 0
+            state["query_position_offset"] = None
+            state["generation_position_start"] = None
+            state["generation_position_offset"] = 0
+            state["generation_custom_params"] = None
+            if client is None or args.selection_only:
+                continue
 
-                custom_params = None
-                if args.server_chunk_prefill:
-                    if args.position_mode == "reuse":
-                        chunk_position_starts = [len(prefix_ids)] * len(selected)
-                    else:
-                        chunk_position_starts = [
-                            len(prefix_ids) + order * args.chunk_size
-                            for order in range(len(selected))
-                        ]
-                    if args.chunk_query_position_mode == "after_reused_window":
-                        chunk_query_position_starts = [
-                            len(prefix_ids) + args.chunk_size
-                        ] * len(selected)
-                    else:
-                        chunk_query_position_starts = [
-                            start + len(chunks[chunk_index])
-                            for start, chunk_index in zip(
-                                chunk_position_starts, selected
-                            )
-                        ]
-                    custom_params = {
-                        "dllm_parallelcomp": {
-                            "prefix_len": len(prefix_ids),
-                            "chunk_lens": [
-                                len(chunks[chunk_index]) for chunk_index in selected
-                            ],
-                            "query_len": len(query_ids),
-                            "chunk_batch_size": args.server_chunk_prefill_batch_size,
-                            "chunk_position_starts": chunk_position_starts,
-                            "chunk_query_position_starts": chunk_query_position_starts,
-                            "query_position_start": query_rope_start,
-                        }
+            query_start = len(prefix_ids) + len(selected_context_ids)
+            position_offset = 0
+            if args.query_position_mode == "after_selected_chunks":
+                query_rope_start = len(prefix_ids) + len(selected) * args.chunk_size
+                position_offset = query_rope_start - query_start
+                if position_offset < 0:
+                    raise RuntimeError(
+                        "Selected chunk slots end before the compressed query"
+                    )
+            elif args.query_position_mode == "after_reused_window":
+                query_rope_start = len(prefix_ids) + args.chunk_size
+                position_offset = query_rope_start - query_start
+            else:
+                query_rope_start = query_start
+
+            custom_params = None
+            if args.server_chunk_prefill:
+                if args.position_mode == "reuse":
+                    chunk_position_starts = [len(prefix_ids)] * len(selected)
+                else:
+                    chunk_position_starts = [
+                        len(prefix_ids) + order * args.chunk_size
+                        for order in range(len(selected))
+                    ]
+                if args.chunk_query_position_mode == "after_reused_window":
+                    chunk_query_position_starts = [
+                        len(prefix_ids) + args.chunk_size
+                    ] * len(selected)
+                else:
+                    chunk_query_position_starts = [
+                        start + len(chunks[chunk_index])
+                        for start, chunk_index in zip(chunk_position_starts, selected)
+                    ]
+                custom_params = {
+                    "dllm_parallelcomp": {
+                        "prefix_len": len(prefix_ids),
+                        "chunk_lens": [
+                            len(chunks[chunk_index]) for chunk_index in selected
+                        ],
+                        "query_len": len(query_ids),
+                        "chunk_batch_size": args.server_chunk_prefill_batch_size,
+                        "chunk_position_starts": chunk_position_starts,
+                        "chunk_query_position_starts": chunk_query_position_starts,
+                        "query_position_start": query_rope_start,
                     }
+                }
+            state["query_position_offset"] = position_offset
+            state["generation_position_start"] = (
+                None if args.server_chunk_prefill else query_start
+            )
+            state["generation_position_offset"] = (
+                0 if args.server_chunk_prefill else position_offset
+            )
+            state["generation_custom_params"] = custom_params
+
+        if client is not None and not args.selection_only:
+            for generation_start_index in range(
+                0, len(group), args.generation_microbatch_size
+            ):
+                generation_group = group[
+                    generation_start_index : generation_start_index
+                    + args.generation_microbatch_size
+                ]
                 generation_start = time.perf_counter()
-                generation = client.generate(
-                    compressed_ids,
+                generations = client.generate_batch(
+                    [state["compressed_ids"] for state in generation_group],
                     args.max_new_tokens,
-                    position_start=(None if args.server_chunk_prefill else query_start),
-                    position_offset=0 if args.server_chunk_prefill else position_offset,
-                    custom_params=custom_params,
+                    position_starts=[
+                        state["generation_position_start"] for state in generation_group
+                    ],
+                    position_offsets=[
+                        state["generation_position_offset"]
+                        for state in generation_group
+                    ],
+                    custom_params=[
+                        state["generation_custom_params"] for state in generation_group
+                    ],
                 )
                 generation_seconds = time.perf_counter() - generation_start
-                raw_prediction = generation.get("text", "")
-                prediction = postprocess_prediction(
-                    raw_prediction,
-                    max_words=args.prediction_max_words,
-                    stop_at_answer_boundary=args.stop_at_answer_boundary,
-                )
+                generation_request_count += 1
+                total_generation_batch_seconds += generation_seconds
+                active_generation_microbatch_sizes.append(len(generation_group))
+                shared_generation_timing |= len(generation_group) > 1
+                generation_share = generation_seconds / len(generation_group)
+                for state, generation in zip(
+                    generation_group, generations, strict=True
+                ):
+                    state["generation"] = generation
+                    state["generation_seconds"] = generation_share
+                    state["generation_seconds_are_attributed"] = (
+                        len(generation_group) > 1
+                    )
+                    state["generation_active_microbatch_size"] = len(generation_group)
+
+        for state in group:
+            local_index = state["local_index"]
+            index = state["index"]
+            example = state["example"]
+            prefix_ids = state["prefix_ids"]
+            context_ids = state["context_ids"]
+            query_ids = state["query_ids"]
+            chunks = state["chunks"]
+            draft_ids = state["draft_ids"]
+            partial_draft_ids = state["partial_draft_ids"]
+            draft_confirmed_mask = state["draft_confirmed_mask"]
+            chunk_scores = state["chunk_scores"]
+            score_seconds = state["draft_seconds"] + state["chunk_score_seconds"]
+            selected = state["selected"]
+            compressed_ids = state["compressed_ids"]
+            generation = state["generation"]
+            raw_prediction = (
+                generation.get("text", "") if generation is not None else ""
+            )
+            prediction = postprocess_prediction(
+                raw_prediction,
+                max_words=args.prediction_max_words,
+                stop_at_answer_boundary=args.stop_at_answer_boundary,
+            )
 
             record = {
                 "task": TASK,
@@ -1029,13 +1195,17 @@ def main() -> None:
                 "position_mode": args.position_mode,
                 "query_position_mode": args.query_position_mode,
                 "chunk_query_position_mode": args.chunk_query_position_mode,
-                "query_position_offset": position_offset,
+                "query_position_offset": state["query_position_offset"],
                 "chunk_size": args.chunk_size,
                 "top_k": args.top_k,
                 "score_batch_size": args.score_batch_size,
                 "selector_microbatch_size": args.selector_microbatch_size,
                 "selector_active_microbatch_size": state[
                     "selector_active_microbatch_size"
+                ],
+                "generation_microbatch_size": args.generation_microbatch_size,
+                "generation_active_microbatch_size": state[
+                    "generation_active_microbatch_size"
                 ],
                 "chunk_bos": args.chunk_bos,
                 "server_chunk_prefill": args.server_chunk_prefill,
@@ -1059,12 +1229,18 @@ def main() -> None:
                 "prefix_tokens": len(prefix_ids),
                 "query_tokens": len(query_ids),
                 "compressed_prompt_tokens": len(compressed_ids),
+                "generation_input_sha256": token_ids_sha256(compressed_ids),
                 "score_seconds": score_seconds,
                 "draft_seconds": state["draft_seconds"],
                 "chunk_score_seconds": state["chunk_score_seconds"],
                 "score_seconds_are_attributed": state["score_seconds_are_attributed"],
-                "generation_seconds": generation_seconds,
-                "generation_meta": generation.get("meta_info") if generation else None,
+                "generation_seconds": state["generation_seconds"],
+                "generation_seconds_are_attributed": state[
+                    "generation_seconds_are_attributed"
+                ],
+                "generation_meta": (
+                    generation.get("meta_info") if generation is not None else None
+                ),
             }
             records.append(record)
             with output_path.open("a", encoding="utf-8") as file:
@@ -1104,6 +1280,24 @@ def main() -> None:
         "max_selector_active_microbatch_size": (
             max(active_microbatch_sizes) if active_microbatch_sizes else 0
         ),
+        "generation_microbatch_size": args.generation_microbatch_size,
+        "average_generation_active_microbatch_size": (
+            sum(active_generation_microbatch_sizes)
+            / len(active_generation_microbatch_sizes)
+            if active_generation_microbatch_sizes
+            else 0.0
+        ),
+        "max_generation_active_microbatch_size": (
+            max(active_generation_microbatch_sizes)
+            if active_generation_microbatch_sizes
+            else 0
+        ),
+        "generation_batch_size_histogram": {
+            str(batch_size): count
+            for batch_size, count in sorted(
+                Counter(active_generation_microbatch_sizes).items()
+            )
+        },
         "server_chunk_prefill": args.server_chunk_prefill,
         "server_chunk_prefill_batch_size": args.server_chunk_prefill_batch_size,
         "draft_tokens": args.draft_tokens,
@@ -1131,9 +1325,10 @@ def main() -> None:
         "draft_request_count": draft_request_count,
         "score_request_count": score_request_count,
         "score_seconds_are_attributed": shared_selector_timing,
-        "total_generation_seconds": sum(
-            record["generation_seconds"] for record in records
-        ),
+        "generation_request_count": generation_request_count,
+        "generation_seconds_are_attributed": shared_generation_timing,
+        "total_generation_seconds": total_generation_batch_seconds,
+        "total_generation_batch_seconds": total_generation_batch_seconds,
     }
     with metrics_path.open("w", encoding="utf-8") as file:
         json.dump(metrics, file, indent=2, ensure_ascii=False)

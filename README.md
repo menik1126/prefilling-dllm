@@ -317,6 +317,46 @@ two-replica wall time was 237 seconds, and the slower replica spent 166.871
 seconds in final generation versus 76.383 seconds on the earlier FlashInfer
 path.
 
+Final answer generation can now batch compressed prompts across examples with
+`--generation-microbatch-size`. Each request retains its own query position
+offset and custom parameters through a per-request `sampling_params` row, and
+responses are validated and scattered back in input order. The default is one,
+which preserves the previous scalar HTTP request. Records include a compressed
+input hash, active generation batch size, and attributed timing; metrics report
+the request count, actual batch-size histogram, and batch wall time without
+counting the same shared latency once per example.
+
+A selector-free two-H20 A/B fixed all 150 selections with the reference
+manifest, used two independent 75-example replicas, and changed only final
+generation batch size. Times are the dual-replica wall and the slower replica's
+generation critical path:
+
+| Final generation microbatch | Wall (s) | Generation (s) | Requests / GPU | Raw F1 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 174 | 167.661 | 75 | 47.6335 |
+| 4 | 145 | 138.506 | 19 | 47.6893 |
+| 8 | 142 | 134.695 | 10 | 47.8287 |
+
+Microbatch eight therefore made final generation 1.245x faster and the
+selector-free run 1.225x faster. All 150 compressed-input hashes, selections,
+and position offsets matched the scalar run. FP16 batch shape did change four
+of 150 raw predictions: batched GEMM reduction shape can move a near-tied
+greedy decision even at temperature zero. This was not request/result
+misalignment: per-example F1 matched on 147/150 examples, aggregate F1 rose by
+0.195 point, and a second microbatch-eight run reproduced all 150 batched
+predictions exactly. Microbatch four also changed four raw predictions and
+shifted aggregate F1 by +0.056 point.
+
+The complete selector-plus-generation run used selector and final-generation
+microbatches of eight. It matched all 150 reference selections (110/110 active
+examples), reproduced the manifest-batched predictions 150/150, and scored
+**47.829**, only **0.205** point below the 48.033 FP16 reference. Final
+generation fell from 166.871 to 133.855 seconds (1.247x), while two-replica
+wall time fell from 237 to 208 seconds (1.139x). Both 75-example replicas
+completed with zero empty responses, retractions, request failures, CUDA
+errors, or OOMs. Observed batch-eight GPU memory usage reached about 87.2 and
+84.5 GB on the two 96-GB H20s.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

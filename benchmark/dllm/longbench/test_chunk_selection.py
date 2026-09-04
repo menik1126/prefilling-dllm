@@ -65,6 +65,93 @@ def test_causal_prompt_logprob_marker():
     }
 
 
+def test_single_generate_batch_preserves_scalar_request_shape():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    payloads = []
+    response = {"text": "answer", "meta_info": {"row": 0}}
+    client.post = lambda payload: payloads.append(payload) or response
+    request_custom_params = {"tag": "one"}
+
+    result = client.generate_batch(
+        [[1, 2]],
+        7,
+        position_starts=[2],
+        position_offsets=[3],
+        custom_params=[request_custom_params],
+    )
+
+    assert result == [response]
+    assert payloads == [
+        {
+            "input_ids": [1, 2],
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 7,
+                "custom_params": {
+                    "tag": "one",
+                    "dllm_position_start": 2,
+                    "dllm_position_offset": 3,
+                },
+            },
+        }
+    ]
+    assert request_custom_params == {"tag": "one"}
+
+
+def test_generate_batch_preserves_request_and_response_order():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    payloads = []
+    responses = [
+        {"text": "first", "meta_info": {"row": 0}},
+        {"text": "second", "meta_info": {"row": 1}},
+    ]
+    client.post = lambda payload: payloads.append(payload) or responses
+
+    result = client.generate_batch(
+        [[1], [2, 3]],
+        7,
+        position_starts=[4, 5],
+        position_offsets=[6, 0],
+        custom_params=[{"tag": "first"}, {"tag": "second"}],
+    )
+
+    assert result == responses
+    assert payloads[0]["input_ids"] == [[1], [2, 3]]
+    assert payloads[0]["sampling_params"] == [
+        {
+            "temperature": 0,
+            "max_new_tokens": 7,
+            "custom_params": {
+                "tag": "first",
+                "dllm_position_start": 4,
+                "dllm_position_offset": 6,
+            },
+        },
+        {
+            "temperature": 0,
+            "max_new_tokens": 7,
+            "custom_params": {"tag": "second"},
+        },
+    ]
+
+
+def test_generate_batch_validates_parameter_and_response_rows():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    client.post = lambda payload: (_ for _ in ()).throw(AssertionError(payload))
+
+    assert client.generate_batch([], 7) == []
+    with pytest.raises(ValueError, match="position_starts has 1 rows, expected 2"):
+        client.generate_batch([[1], [2]], 7, position_starts=[0])
+
+    client.post = lambda payload: {"text": "only one row"}
+    with pytest.raises(RuntimeError, match="returned 1 rows, expected 2"):
+        client.generate_batch([[1], [2]], 7)
+
+    client.post = lambda payload: [{"text": "valid"}, "invalid"]
+    with pytest.raises(RuntimeError, match="non-object rows at indices \\[1\\]"):
+        client.generate_batch([[1], [2]], 7)
+
+
 def test_draft_ids_fall_back_to_diffusion_output_ids():
     client = MODULE.SGLangClient("http://example.invalid", timeout=1)
     payloads = []
@@ -421,6 +508,213 @@ def test_score_chunk_groups_rejects_invalid_mask_shape_and_values():
         )
 
 
+def test_main_batches_final_generation_and_scatters_in_input_order(
+    monkeypatch, tmp_path
+):
+    data_path = tmp_path / "multifieldqa_en.jsonl"
+    data_path.write_text(
+        "\n".join(
+            json.dumps(example)
+            for example in [
+                {
+                    "_id": "example-0",
+                    "context": "CTX0",
+                    "input": "ASK0",
+                    "answers": ["first"],
+                },
+                {
+                    "_id": "example-1",
+                    "context": "CTX1",
+                    "input": "ASK1",
+                    "answers": ["second"],
+                },
+                {
+                    "_id": "example-2",
+                    "context": "CTX2",
+                    "input": "ASK2",
+                    "answers": ["third"],
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prompt_path = tmp_path / "dataset2prompt.json"
+    prompt_path.write_text(
+        json.dumps({"multifieldqa_en": "P{context}Q{input}"}),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+
+    class FakeTokenizer:
+        bos_token_id = None
+
+        @staticmethod
+        def encode(text, add_special_tokens=False):
+            assert not add_special_tokens
+            return {
+                "P": [1],
+                "CTX0": [10, 11, 12],
+                "CTX1": [13, 14, 15, 16],
+                "CTX2": [17, 18, 19, 20],
+                "QASK0": [20],
+                "QASK1": [21],
+                "QASK2": [22],
+            }[text]
+
+    class FakeClient:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            self.batch_calls = []
+            self.instances.append(self)
+
+        def generate(self, *args, **kwargs):
+            raise AssertionError("main must use generate_batch")
+
+        def generate_batch(
+            self,
+            input_ids,
+            max_new_tokens,
+            *,
+            position_starts=None,
+            position_offsets=None,
+            custom_params=None,
+        ):
+            self.batch_calls.append(
+                {
+                    "input_ids": input_ids,
+                    "max_new_tokens": max_new_tokens,
+                    "position_starts": position_starts,
+                    "position_offsets": position_offsets,
+                    "custom_params": custom_params,
+                }
+            )
+            outputs = {
+                20: ("first trailing", 0),
+                21: ("second trailing", 1),
+                22: ("third trailing", 2),
+            }
+            return [
+                {
+                    "text": outputs[ids[-1]][0],
+                    "meta_info": {"row": outputs[ids[-1]][1]},
+                }
+                for ids in input_ids
+            ]
+
+    clock = iter([10.0, 14.0, 20.0, 23.0])
+    monkeypatch.setattr(MODULE.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(
+        MODULE.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(MODULE, "SGLangClient", FakeClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(MODULE.__file__),
+            "--model-path",
+            "unused",
+            "--data-path",
+            str(data_path),
+            "--prompt-config",
+            str(prompt_path),
+            "--output-dir",
+            str(output_dir),
+            "--selection-mode",
+            "fixed",
+            "--fixed-chunk-indices",
+            "1",
+            "--chunk-size",
+            "2",
+            "--selector-microbatch-size",
+            "3",
+            "--generation-microbatch-size",
+            "2",
+            "--query-position-mode",
+            "after_selected_chunks",
+            "--max-new-tokens",
+            "7",
+            "--prediction-max-words",
+            "1",
+            "--num-examples",
+            "3",
+        ],
+    )
+
+    MODULE.main()
+
+    generation_client = FakeClient.instances[0]
+    assert generation_client.batch_calls == [
+        {
+            "input_ids": [[1, 12, 20], [1, 15, 16, 21]],
+            "max_new_tokens": 7,
+            "position_starts": [2, 3],
+            "position_offsets": [1, 0],
+            "custom_params": [None, None],
+        },
+        {
+            "input_ids": [[1, 19, 20, 22]],
+            "max_new_tokens": 7,
+            "position_starts": [3],
+            "position_offsets": [0],
+            "custom_params": [None],
+        },
+    ]
+    records = [
+        json.loads(line)
+        for line in (output_dir / "multifieldqa_en_fixed_continuous.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    metrics = json.loads(
+        (output_dir / "multifieldqa_en_fixed_continuous_metrics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [record["index"] for record in records] == [0, 1, 2]
+    assert [record["example_id"] for record in records] == [
+        "example-0",
+        "example-1",
+        "example-2",
+    ]
+    assert [record["raw_prediction"] for record in records] == [
+        "first trailing",
+        "second trailing",
+        "third trailing",
+    ]
+    assert [record["prediction"] for record in records] == [
+        "first",
+        "second",
+        "third",
+    ]
+    assert [record["generation_meta"] for record in records] == [
+        {"row": 0},
+        {"row": 1},
+        {"row": 2},
+    ]
+    assert [record["score"] for record in records] == [1.0, 1.0, 1.0]
+    assert [record["generation_seconds"] for record in records] == [2.0, 2.0, 3.0]
+    assert [record["generation_seconds_are_attributed"] for record in records] == [
+        True,
+        True,
+        False,
+    ]
+    assert [record["generation_active_microbatch_size"] for record in records] == [
+        2,
+        2,
+        1,
+    ]
+    assert metrics["score"] == 100.0
+    assert metrics["generation_request_count"] == 2
+    assert metrics["generation_batch_size_histogram"] == {"1": 1, "2": 1}
+    assert metrics["total_generation_seconds"] == 7.0
+    assert metrics["total_generation_batch_seconds"] == 7.0
+
+
 def test_selection_only_writes_selector_artifacts_without_generation(
     monkeypatch, tmp_path
 ):
@@ -570,6 +864,10 @@ def test_selection_only_writes_selector_artifacts_without_generation(
     assert metrics["selection_only"] is True
     assert metrics["draft_partial_rounds"] == 1
     assert metrics["total_generation_seconds"] == 0.0
+    assert metrics["generation_request_count"] == 0
+    assert metrics["generation_batch_size_histogram"] == {}
+    assert metrics["generation_seconds_are_attributed"] is False
+    assert all(record["generation_active_microbatch_size"] == 0 for record in records)
     assert FakeClient.instances[0].partial_calls == [([[1, 20, 21]], 4, 1)]
     assert not FakeClient.instances[0].causal_prompt_logprobs
     assert FakeClient.instances[1].causal_prompt_logprobs
