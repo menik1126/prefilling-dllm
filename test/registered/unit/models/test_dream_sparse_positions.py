@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -7,6 +8,8 @@ from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.model_executor.forward_batch_info import (
+    ForwardMode,
+    _build_dllm_denoise_plan_key,
     _compute_dllm_positions,
     _parallelcomp_force_causal,
 )
@@ -208,3 +211,218 @@ def test_parallelcomp_flashinfer_items_preserve_explicit_rope_positions():
     assert params.token_pos_in_items_len == 5
     assert params.max_item_len_ptr.tolist() == [2]
     assert torch.equal(forward_batch.positions, positions)
+
+
+def test_denoise_plan_key_tracks_retained_request_identity():
+    prefix_0 = torch.tensor([10, 11, 12])
+    canvas_0 = torch.tensor([20, 21])
+    prefix_1 = torch.tensor([30, 31, 32, 33])
+    canvas_1 = torch.tensor([40, 41])
+    req_0 = SimpleNamespace(
+        rid="req-0",
+        req_pool_idx=1,
+        prefix_indices=prefix_0,
+        dllm_kv_indices=canvas_0,
+    )
+    req_1 = SimpleNamespace(
+        rid="req-1",
+        req_pool_idx=2,
+        prefix_indices=prefix_1,
+        dllm_kv_indices=canvas_1,
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DLLM_DENOISE,
+        dllm_config=SimpleNamespace(flashinfer_denoise_plan_cache=True),
+        req_to_token_pool=SimpleNamespace(req_generation=torch.tensor([0, 7, 11])),
+        reqs=[req_0, req_1],
+    )
+
+    key = _build_dllm_denoise_plan_key(batch)
+    assert key == (
+        ("req-0", 1, 7, prefix_0.data_ptr(), canvas_0.data_ptr()),
+        ("req-1", 2, 11, prefix_1.data_ptr(), canvas_1.data_ptr()),
+    )
+    assert _build_dllm_denoise_plan_key(batch) == key
+
+    batch.req_to_token_pool.req_generation[1] += 1
+    assert _build_dllm_denoise_plan_key(batch) != key
+    batch.req_to_token_pool.req_generation[1] -= 1
+
+    batch.reqs = [req_1, req_0]
+    assert _build_dllm_denoise_plan_key(batch) == (key[1], key[0])
+    batch.reqs = [req_0, req_1]
+
+    req_0.prefix_indices = prefix_0.clone()
+    assert _build_dllm_denoise_plan_key(batch) != key
+    req_0.prefix_indices = prefix_0
+    req_0.dllm_kv_indices = canvas_0.clone()
+    assert _build_dllm_denoise_plan_key(batch) != key
+
+    batch.forward_mode = ForwardMode.DLLM_EXTEND
+    assert _build_dllm_denoise_plan_key(batch) is None
+    batch.forward_mode = ForwardMode.DLLM_DENOISE
+    batch.dllm_config.flashinfer_denoise_plan_cache = False
+    assert _build_dllm_denoise_plan_key(batch) is None
+
+
+def test_flashinfer_reuses_only_consecutive_stable_denoise_plans():
+    backend = object.__new__(FlashInferAttnBackend)
+    backend._dllm_denoise_plan_cache_enabled = True
+    backend._dllm_denoise_plan_cache_key = None
+    backend._dllm_denoise_plan_cache_metadata = None
+    backend._dllm_denoise_plan_cache_hits = 0
+    backend._dllm_denoise_plan_cache_misses = 0
+    backend.dispatch_reason = None
+    backend.num_wrappers = 1
+    backend.use_sliding_window_kv_pool = False
+    backend.enable_mis = False
+    backend.is_multimodal = False
+    backend.prefill_uses_dequant_workspace = False
+    backend.enable_deterministic = False
+    backend.use_paged = False
+    backend.skip_prefill = False
+    backend.page_size = 1
+    backend.prefill_backend = "fa2"
+    backend._dllm_denoise_plan_cache_single_rank = True
+    backend._dllm_denoise_plan_cache_breakable = True
+    backend.dllm_config = SimpleNamespace(
+        algorithm="PrefillingDream",
+        block_size=2,
+        needs_full_prefill=True,
+        dual_cache=True,
+        first_done_first_out_mode=True,
+        flashinfer_denoise_plan_cache_max_batch_size=8,
+    )
+    backend.prefill_wrappers_paged = [object()]
+    backend.indices_updater_prefill = MagicMock()
+    backend.prefill_split_tile_size = None
+    backend.forward_metadata = None
+
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DLLM_DENOISE,
+        batch_size=2,
+        input_ids=torch.tensor([99, 99, 99, 99]),
+        positions=torch.arange(4),
+        req_pool_indices=torch.tensor([3, 4]),
+        seq_lens=torch.tensor([7, 9]),
+        seq_lens_cpu=torch.tensor([7, 9]),
+        seq_lens_sum=16,
+        extend_prefix_lens=torch.tensor([5, 7]),
+        extend_prefix_lens_cpu=[5, 7],
+        extend_seq_lens_cpu=[2, 2],
+        out_cache_loc=torch.tensor([20, 21, 30, 31]),
+        extend_num_tokens=4,
+        return_logprob=False,
+        spec_info=None,
+        encoder_lens=None,
+        dllm_parallelcomp_item_lens=None,
+        dllm_force_causal=False,
+        dllm_raw_last_logits_cpu=None,
+        dllm_canvas_lens_cpu=None,
+        dllm_disable_prefill_cuda_graph=False,
+        dllm_denoise_plan_key=(
+            ("req-0", 3, 7, 100, 200),
+            ("req-1", 4, 11, 300, 400),
+        ),
+        cross_attention_custom_mask=None,
+        rids=["req-0", "req-1"],
+        tbo_split_seq_index=None,
+        lora_ids=[None, None],
+    )
+
+    valid_input_ids = batch.input_ids
+    batch.input_ids = None
+    assert backend._make_dllm_denoise_plan_cache_key(batch) is None
+    batch.input_ids = valid_input_ids
+
+    backend.init_forward_metadata(batch)
+    first_metadata = backend.forward_metadata
+    # Token/canvas contents are not part of attention planning.
+    batch.input_ids = torch.tensor([1, 99, 2, 99])
+    backend.init_forward_metadata(batch)
+
+    assert backend.indices_updater_prefill.update.call_count == 1
+    assert backend.forward_metadata is first_metadata
+    assert backend._dllm_denoise_plan_cache_hits == 1
+    assert backend._dllm_denoise_plan_cache_misses == 1
+
+    # Per-request geometry is part of the plan even if the batch total stays
+    # constant, so [7, 9] -> [8, 8] must not reuse the old plan.
+    batch.seq_lens = torch.tensor([8, 8])
+    batch.seq_lens_cpu = torch.tensor([8, 8])
+    batch.extend_prefix_lens = torch.tensor([6, 6])
+    batch.extend_prefix_lens_cpu = [6, 6]
+    backend.init_forward_metadata(batch)
+    assert backend.indices_updater_prefill.update.call_count == 2
+    assert backend._dllm_denoise_plan_cache_misses == 2
+
+    # Ordered membership matters even when the set of requests and all shapes
+    # are otherwise identical.
+    batch.req_pool_indices = torch.tensor([4, 3])
+    batch.dllm_denoise_plan_key = tuple(reversed(batch.dllm_denoise_plan_key))
+    backend.init_forward_metadata(batch)
+    assert backend.indices_updater_prefill.update.call_count == 3
+    assert backend._dllm_denoise_plan_cache_misses == 3
+
+    batch.req_pool_indices = torch.tensor([3, 4])
+    batch.seq_lens = torch.tensor([7, 9])
+    batch.seq_lens_cpu = torch.tensor([7, 9])
+    batch.extend_prefix_lens = torch.tensor([5, 7])
+    batch.extend_prefix_lens_cpu = [5, 7]
+    batch.dllm_denoise_plan_key = tuple(reversed(batch.dllm_denoise_plan_key))
+    backend.init_forward_metadata(batch)
+    assert backend.indices_updater_prefill.update.call_count == 4
+    assert backend._dllm_denoise_plan_cache_misses == 4
+
+    # Request-pool generation prevents ABA reuse of an identical slot number.
+    batch.dllm_denoise_plan_key = (
+        ("req-0", 3, 7, 100, 200),
+        ("req-1", 4, 12, 300, 400),
+    )
+    backend.init_forward_metadata(batch)
+    assert backend.indices_updater_prefill.update.call_count == 5
+    assert backend._dllm_denoise_plan_cache_misses == 5
+
+    # A membership change must rebuild even when the batch shape is unchanged.
+    batch.req_pool_indices = torch.tensor([3, 5])
+    batch.dllm_denoise_plan_key = (
+        ("req-0", 3, 7, 100, 200),
+        ("req-2", 5, 3, 500, 600),
+    )
+    backend.init_forward_metadata(batch)
+    assert backend.indices_updater_prefill.update.call_count == 6
+    assert backend._dllm_denoise_plan_cache_misses == 6
+
+    # Any intervening mode mutates the shared wrappers and invalidates the
+    # one-entry cache. Returning to the old denoise geometry must rebuild.
+    batch.forward_mode = ForwardMode.DLLM_EXTEND
+    backend.init_forward_metadata(batch)
+    batch.forward_mode = ForwardMode.DLLM_DENOISE
+    batch.req_pool_indices = torch.tensor([3, 4])
+    batch.dllm_denoise_plan_key = (
+        ("req-0", 3, 7, 100, 200),
+        ("req-1", 4, 12, 300, 400),
+    )
+    backend.init_forward_metadata(batch)
+    assert backend.indices_updater_prefill.update.call_count == 8
+    assert backend._dllm_denoise_plan_cache_misses == 7
+
+    # A failed miss must not leave the previously successful plan reusable.
+    batch.dllm_denoise_plan_key = (
+        ("req-0", 3, 7, 100, 200),
+        ("req-1", 4, 13, 300, 400),
+    )
+    backend.indices_updater_prefill.update.side_effect = RuntimeError("plan failed")
+    with pytest.raises(RuntimeError, match="plan failed"):
+        backend.init_forward_metadata(batch)
+    assert backend._dllm_denoise_plan_cache_key is None
+    assert backend._dllm_denoise_plan_cache_metadata is None
+
+    backend.indices_updater_prefill.update.side_effect = None
+    batch.dllm_denoise_plan_key = (
+        ("req-0", 3, 7, 100, 200),
+        ("req-1", 4, 12, 300, 400),
+    )
+    backend.init_forward_metadata(batch)
+    assert backend.indices_updater_prefill.update.call_count == 10
+    assert backend._dllm_denoise_plan_cache_misses == 9

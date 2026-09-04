@@ -506,6 +506,43 @@ Raw artifacts and the machine-readable analysis are under
 `/results/dream_vectorized_hostmerge_ab_20260905` in the fixed experiment
 container.
 
+FlashInfer planning for the same steady-state denoising rounds can also be
+reused with `flashinfer_denoise_plan_cache: true`; the validated configuration
+is `benchmark/dllm/prefilling_dream_longbench_plan_cache.yaml`. The optimization
+uses a one-entry consecutive cache for the ragged-canvas and paged-prefix plans.
+It is restricted to the single-rank FlashInfer FA2, page-size-one,
+PrefillingDream/FDFO/dual-cache dedicated denoise path. The key includes ordered
+request IDs, request-pool slots and their allocation generations, retained
+prefix/canvas identities, and every sequence length. Any request membership,
+slot generation, length, attention mode, unsupported feature, graph-state
+rebuild, or planning failure invalidates the entry before normal planning.
+Input tokens, positions, KV writes, and output locations still refresh every
+round.
+
+The same 150-example two-phase cross-over compared
+`prefilling_dream_longbench_vectorized_denoise.yaml` with the plan-cache
+configuration, changing only this cache:
+
+| FlashInfer planning | Phase 0 generation (s) | Phase 1 generation (s) | 150-example sum (s) | B=8 graph round (ms) | Estimated graph time (s) | Raw F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Replan every round | 39.067 | 41.166 | 80.233 | 42.775 | 19.217 | 47.736176 |
+| Consecutive denoise plan cache | 39.064 | 40.937 | 80.000 | 42.243 | 18.984 | 47.736176 |
+
+This cross-over observed a 1.0126x improvement for cached B=8 rounds and a
+1.0123x improvement in estimated graph time, while complete generation
+improved only 1.0029x. Both paths executed the same
+577 graph launches, 3,440 request-rounds, and 110,080 query tokens. All 150
+input hashes, raw and processed predictions, per-example scores, completion
+token counts, and finish reasons matched exactly, with zero empty responses,
+retractions, or inference errors. The cache therefore removes the repeated
+FlashInfer planner and blocking metadata transfers safely, but they account for
+only a small fraction of the full forward. The local graph-round result was
+directionally consistent on both GPU assignments, while the small end-to-end
+number needs repeated cross-overs before it should be treated as stable. The
+option remains disabled by default.
+Raw artifacts and the machine-readable analysis are under
+`/results/dream_plan_cache_ab_20260905` in the fixed experiment container.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

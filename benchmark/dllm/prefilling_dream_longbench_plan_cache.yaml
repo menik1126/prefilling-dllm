@@ -1,0 +1,10 @@
+block_size: 32
+threshold: 0.9
+dual_cache: true
+denoise_fast_path: true
+finish_on_final_mutation: true
+vectorized_dual_cache: true
+vectorized_dual_cache_max_batch_size: 8
+batch_token_host_transfer: true
+flashinfer_denoise_plan_cache: true
+flashinfer_denoise_plan_cache_max_batch_size: 8

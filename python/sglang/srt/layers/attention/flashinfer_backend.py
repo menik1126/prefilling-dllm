@@ -337,6 +337,16 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
+        self._dllm_denoise_plan_cache_enabled = bool(
+            self.dllm_config is not None
+            and self.dllm_config.flashinfer_denoise_plan_cache
+        )
+        # This is deliberately a one-entry consecutive cache. Any intervening
+        # attention mode clears it because every mode shares these wrappers.
+        self._dllm_denoise_plan_cache_key = None
+        self._dllm_denoise_plan_cache_metadata = None
+        self._dllm_denoise_plan_cache_hits = 0
+        self._dllm_denoise_plan_cache_misses = 0
 
         self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
@@ -407,6 +417,18 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             self.num_wrappers = 1
             self.dispatch_reason = None
+
+        parallel_config = get_parallel()
+        self._dllm_denoise_plan_cache_single_rank = (
+            parallel_config.tp_size == 1
+            and parallel_config.dp_size == 1
+            and parallel_config.pp_size == 1
+            and parallel_config.attn_cp_size == 1
+            and parallel_config.attn_dcp_size == 1
+        )
+        self._dllm_denoise_plan_cache_breakable = check_cuda_graph_backend(
+            Phase.PREFILL, Backend.BREAKABLE
+        )
 
         # Qwen2/Qwen3 models require higher flashinfer workspace size
         if (
@@ -870,6 +892,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        # Full/decode CUDA Graph paths share the same FlashInfer wrappers but
+        # do not participate in the consecutive dLLM eager-plan cache.
+        self._clear_dllm_denoise_plan_cache()
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -1110,7 +1135,146 @@ class FlashInferAttnBackend(AttentionBackend):
             return None, None
         return layer.k_scale, layer.v_scale
 
+    def _clear_dllm_denoise_plan_cache(self) -> None:
+        self._dllm_denoise_plan_cache_key = None
+        self._dllm_denoise_plan_cache_metadata = None
+
+    def _make_dllm_denoise_plan_cache_key(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[tuple]:
+        """Build a host-only key for stable Dream attention geometry.
+
+        The cache is intentionally restricted to the dedicated denoise mode.
+        That scheduler path retains request slots and the complete prompt plus
+        canvas page table across rounds. Token values change, but none of the
+        tensors consumed by FlashInfer planning do.
+        """
+        if (
+            not self._dllm_denoise_plan_cache_enabled
+            or type(self) is not FlashInferAttnBackend
+            or not forward_batch.forward_mode.is_dllm_denoise()
+            or self.dllm_config.algorithm != "PrefillingDream"
+            or not self.dllm_config.needs_full_prefill
+            or not self.dllm_config.dual_cache
+            or not self.dllm_config.first_done_first_out_mode
+            or not self._dllm_denoise_plan_cache_single_rank
+            or not self._dllm_denoise_plan_cache_breakable
+            or forward_batch.batch_size
+            > self.dllm_config.flashinfer_denoise_plan_cache_max_batch_size
+            or self.prefill_backend != "fa2"
+            or self.page_size != 1
+            or self.skip_prefill
+            or self.dispatch_reason is not None
+            or self.num_wrappers != 1
+            or self.use_sliding_window_kv_pool
+            or self.enable_mis
+            or self.is_multimodal
+            or self.prefill_uses_dequant_workspace
+            or self.enable_deterministic
+            or is_in_tc_piecewise_cuda_graph()
+            or self.use_paged
+            or getattr(forward_batch, "return_logprob", False)
+            or getattr(forward_batch, "spec_info", None) is not None
+            or getattr(forward_batch, "encoder_lens", None) is not None
+            or getattr(forward_batch, "dllm_parallelcomp_item_lens", None) is not None
+            or getattr(forward_batch, "dllm_force_causal", False)
+            or getattr(forward_batch, "cross_attention_custom_mask", None) is not None
+            or getattr(forward_batch, "dllm_raw_last_logits_cpu", None) is not None
+            or getattr(forward_batch, "dllm_canvas_lens_cpu", None) is not None
+            or getattr(forward_batch, "dllm_disable_prefill_cuda_graph", False)
+            or getattr(forward_batch, "tbo_split_seq_index", None) is not None
+            or any(
+                lora_id is not None
+                for lora_id in (getattr(forward_batch, "lora_ids", None) or ())
+            )
+        ):
+            return None
+
+        block_size = self.dllm_config.block_size
+        scheduler_key = getattr(forward_batch, "dllm_denoise_plan_key", None)
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+        batch_size = forward_batch.batch_size
+        if (
+            block_size is None
+            or block_size <= 0
+            or batch_size <= 0
+            or not isinstance(scheduler_key, tuple)
+            or len(scheduler_key) != batch_size
+            or not isinstance(seq_lens_cpu, torch.Tensor)
+            or seq_lens_cpu.device.type != "cpu"
+            or seq_lens_cpu.ndim != 1
+            or seq_lens_cpu.numel() != batch_size
+            or prefix_lens_cpu is None
+            or len(prefix_lens_cpu) != batch_size
+            or extend_lens_cpu is None
+            or len(extend_lens_cpu) != batch_size
+            or not isinstance(forward_batch.req_pool_indices, torch.Tensor)
+            or forward_batch.req_pool_indices.ndim != 1
+            or forward_batch.req_pool_indices.numel() != batch_size
+            or not isinstance(forward_batch.seq_lens, torch.Tensor)
+            or forward_batch.seq_lens.ndim != 1
+            or forward_batch.seq_lens.numel() != batch_size
+            or not isinstance(forward_batch.out_cache_loc, torch.Tensor)
+            or forward_batch.out_cache_loc.numel() != batch_size * block_size
+            or not isinstance(forward_batch.input_ids, torch.Tensor)
+            or forward_batch.input_ids.device.type not in ("cpu", "cuda")
+            or forward_batch.input_ids.ndim != 1
+            or forward_batch.input_ids.numel() != batch_size * block_size
+            or not isinstance(forward_batch.positions, torch.Tensor)
+            or forward_batch.positions.ndim != 1
+            or forward_batch.positions.numel() != batch_size * block_size
+            or forward_batch.extend_num_tokens != batch_size * block_size
+        ):
+            return None
+
+        seq_lens = tuple(int(value) for value in seq_lens_cpu.tolist())
+        prefix_lens = tuple(int(value) for value in prefix_lens_cpu)
+        extend_lens = tuple(int(value) for value in extend_lens_cpu)
+        if (
+            any(length != block_size for length in extend_lens)
+            or any(
+                seq_len != prefix_len + block_size
+                for seq_len, prefix_len in zip(seq_lens, prefix_lens)
+            )
+            or forward_batch.seq_lens_sum != sum(seq_lens)
+        ):
+            return None
+
+        return (
+            scheduler_key,
+            seq_lens,
+            prefix_lens,
+            extend_lens,
+            int(forward_batch.seq_lens_sum),
+            int(forward_batch.extend_num_tokens),
+            block_size,
+        )
+
+    def _reuse_dllm_denoise_plan(self, cache_key: Optional[tuple]) -> bool:
+        if (
+            cache_key is None
+            or cache_key != self._dllm_denoise_plan_cache_key
+            or self.forward_metadata is not self._dllm_denoise_plan_cache_metadata
+            or not isinstance(self.forward_metadata, PrefillMetadata)
+            or self.forward_metadata.prefill_wrappers is not self.prefill_wrappers_paged
+            or not self.forward_metadata.use_ragged
+        ):
+            return False
+        self._dllm_denoise_plan_cache_hits += 1
+        if self._dllm_denoise_plan_cache_hits == 1:
+            logger.info("FlashInfer Dream denoise plan cache is active")
+        return True
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        dllm_cache_key = self._make_dllm_denoise_plan_cache_key(forward_batch)
+        if self._reuse_dllm_denoise_plan(dllm_cache_key):
+            return
+        self._clear_dllm_denoise_plan_cache()
+        if dllm_cache_key is not None:
+            self._dllm_denoise_plan_cache_misses += 1
+
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             assert self._swa_kv_pool is not None
@@ -1230,6 +1394,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 swa_out_cache_loc=swa_out_cache_loc,
                 force_causal=forward_batch.dllm_force_causal,
             )
+            if dllm_cache_key is not None:
+                self._dllm_denoise_plan_cache_key = dllm_cache_key
+                self._dllm_denoise_plan_cache_metadata = self.forward_metadata
 
     def init_cuda_graph_state(
         self,
@@ -1237,6 +1404,7 @@ class FlashInferAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        self._clear_dllm_denoise_plan_cache()
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len,),

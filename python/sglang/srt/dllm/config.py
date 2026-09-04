@@ -31,6 +31,27 @@ class DllmConfig:
         # rounds. Keep it opt-in: exact outputs match the generic path, but the
         # production benchmark has not shown a measurable end-to-end speedup.
         self.denoise_fast_path = bool(algorithm_config.get("denoise_fast_path", False))
+        # FlashInfer's prefill wrappers rebuild identical attention plans on
+        # every fixed-width Dream denoising round. The dedicated denoise path
+        # keeps request/page-table geometry stable, which makes consecutive
+        # plan reuse safe. Keep this backend-specific optimization opt-in.
+        self.flashinfer_denoise_plan_cache = bool(
+            algorithm_config.get("flashinfer_denoise_plan_cache", False)
+        )
+        self.flashinfer_denoise_plan_cache_max_batch_size = int(
+            algorithm_config.get("flashinfer_denoise_plan_cache_max_batch_size", 8)
+        )
+        if self.flashinfer_denoise_plan_cache_max_batch_size < 1:
+            raise ValueError(
+                "flashinfer_denoise_plan_cache_max_batch_size must be positive"
+            )
+        if self.flashinfer_denoise_plan_cache and not (
+            self.dual_cache and self.denoise_fast_path
+        ):
+            raise ValueError(
+                "flashinfer_denoise_plan_cache requires dual_cache and "
+                "denoise_fast_path"
+            )
 
     @staticmethod
     def from_server_args(

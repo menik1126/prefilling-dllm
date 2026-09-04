@@ -549,6 +549,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional packed CPU token result produced by a dLLM algorithm so the
     # FDFO result path can reuse the same D2H transfer used for completion.
     dllm_output_ids_cpu: Optional[torch.Tensor] = None
+    # Host-only identity/version key for the retained Dream page-table layout.
+    # It is populated only by the opt-in dedicated denoise plan-cache path.
+    dllm_denoise_plan_key: Optional[tuple] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
@@ -855,6 +858,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if not any(items is not None for items in dllm_parallelcomp_item_lens):
             dllm_parallelcomp_item_lens = None
 
+        dllm_denoise_plan_key = _build_dllm_denoise_plan_key(batch)
+
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -898,6 +903,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dllm_canvas_lens_cpu=dllm_canvas_lens_cpu,
             dllm_raw_last_logits_cpu=dllm_raw_last_logits_cpu,
             dllm_parallelcomp_item_lens=dllm_parallelcomp_item_lens,
+            dllm_denoise_plan_key=dllm_denoise_plan_key,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
@@ -1927,6 +1933,49 @@ def _parallelcomp_force_causal(reqs) -> bool:
             "a batch with ordinary Dream forwards"
         )
     return bool(causal_flags) and all(causal_flags)
+
+
+def _build_dllm_denoise_plan_key(batch: ScheduleBatch) -> Optional[tuple]:
+    """Snapshot retained request/page-table identity without a device sync.
+
+    Consecutive ``prepare_for_denoise`` rounds never rewrite a retained
+    request-to-token row. If that invariant is relaxed, this key must gain a
+    page-table/layout generation rather than relying on tensor identity.
+    """
+    if (
+        not batch.forward_mode.is_dllm_denoise()
+        or batch.dllm_config is None
+        or not getattr(batch.dllm_config, "flashinfer_denoise_plan_cache", False)
+        or batch.req_to_token_pool is None
+    ):
+        return None
+
+    req_generations = batch.req_to_token_pool.req_generation
+    key_parts = []
+    for req in batch.reqs:
+        slot = req.req_pool_idx
+        prefix_indices = req.prefix_indices
+        canvas_indices = req.dllm_kv_indices
+        if (
+            not isinstance(req.rid, str)
+            or slot is None
+            or not isinstance(prefix_indices, torch.Tensor)
+            or not isinstance(canvas_indices, torch.Tensor)
+        ):
+            return None
+        slot = int(slot)
+        if slot <= 0 or slot >= req_generations.numel():
+            return None
+        key_parts.append(
+            (
+                req.rid,
+                slot,
+                int(req_generations[slot]),
+                prefix_indices.data_ptr(),
+                canvas_indices.data_ptr(),
+            )
+        )
+    return tuple(key_parts)
 
 
 def _compute_dllm_positions(req) -> List[int]:
