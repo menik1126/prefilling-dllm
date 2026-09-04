@@ -456,7 +456,11 @@ class TestDreamAlgorithm(CustomTestCase):
         algorithm = PrefillingDream(
             _config(
                 algorithm="PrefillingDream",
-                algorithm_config={"threshold": 0.9, "dual_cache": True},
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "finish_on_final_mutation": True,
+                },
                 block_size=32,
                 mask_id=4,
             )
@@ -538,7 +542,7 @@ class TestDreamAlgorithm(CustomTestCase):
         )
         self.assertTrue(state["last_round_was_dual_cache"])
 
-    def test_prefilling_dream_default_threshold_path_is_unchanged(self):
+    def test_prefilling_dream_default_keeps_final_observation_round(self):
         algorithm = PrefillingDream(
             _config(
                 algorithm="PrefillingDream",
@@ -557,6 +561,155 @@ class TestDreamAlgorithm(CustomTestCase):
 
         self.assertEqual(done, [False])
         self.assertEqual(batch.input_ids.tolist(), [1, 2, 3])
+
+    def test_prefilling_dream_completes_after_final_mutation_when_enabled(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "finish_on_final_mutation": True,
+                },
+                block_size=3,
+            )
+        )
+        batch = self._forward_batch(torch.tensor([99, 99, 99]), [3], block_size=3)
+        logits = torch.zeros((3, 5))
+        logits[0, 1] = 8.0
+        logits[1, 2] = 8.0
+        logits[2, 3] = 8.0
+        state = {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True}
+
+        done = algorithm.step(batch, logits, [state])
+
+        self.assertEqual(done, [True])
+        self.assertEqual(batch.input_ids.tolist(), [1, 2, 3])
+
+    def test_prefilling_dream_does_not_finish_on_sampled_mask_token(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "finish_on_final_mutation": True,
+                },
+                block_size=1,
+                mask_id=4,
+            )
+        )
+        batch = self._forward_batch(torch.tensor([4]), [1], block_size=1)
+        logits = torch.zeros((1, 5))
+        logits[0, 4] = 8.0
+        state = {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True}
+
+        done = algorithm.step(batch, logits, [state])
+
+        self.assertEqual(done, [False])
+        self.assertEqual(batch.input_ids.tolist(), [4])
+
+    def test_prefilling_dream_keeps_observer_for_logprob_requests(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "finish_on_final_mutation": True,
+                },
+                block_size=1,
+            )
+        )
+        batch = self._forward_batch(torch.tensor([99]), [1], block_size=1)
+        batch.return_logprob = True
+        logits = torch.zeros((1, 5))
+        logits[0, 3] = 8.0
+        state = {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True}
+
+        done = algorithm.step(batch, logits, [state])
+
+        self.assertEqual(done, [False])
+        self.assertEqual(batch.input_ids.tolist(), [3])
+
+    def test_prefilling_dream_fdfo_carries_only_unfinished_requests(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "finish_on_final_mutation": True,
+                },
+                block_size=2,
+                mask_id=4,
+                first_done_first_out_mode=True,
+            )
+        )
+        batch = self._forward_batch(
+            torch.tensor([4, 4, 4, 4]),
+            [2, 2],
+            block_size=2,
+        )
+        logits = torch.zeros((4, 5))
+        logits[0, 0] = 8.0
+        logits[1, 1] = 8.0
+        logits[2, 2] = 8.0
+        states = [
+            {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True},
+            {"prompt_len": 0, "is_prefill": False, "dual_cache_ready": True},
+        ]
+        model_runner = MagicMock()
+        model_runner.forward.return_value = SimpleNamespace(
+            logits_output=SimpleNamespace(full_logits=logits),
+            can_run_graph=True,
+        )
+
+        result = algorithm._run_fdfo_full_prefill(model_runner, batch, states)
+
+        self.assertEqual(result[5], [True, False])
+        self.assertEqual(result[1], [[0, 1], [2, 4]])
+        self.assertIsNone(result[3][0])
+        self.assertIs(result[3][1], states[1])
+        model_runner.forward.assert_called_once()
+
+    def test_prefilling_dream_sync_skips_final_observation_forward(self):
+        algorithm = PrefillingDream(
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "threshold": 0.9,
+                    "dual_cache": True,
+                    "finish_on_final_mutation": True,
+                },
+                block_size=2,
+                first_done_first_out_mode=False,
+            )
+        )
+        batch = self._forward_batch(torch.tensor([99, 99]), [2], block_size=2)
+        logits = torch.zeros((2, 5))
+        logits[0, 1] = 8.0
+        logits[1, 2] = 8.0
+        model_runner = MagicMock()
+        model_runner.forward.side_effect = [
+            SimpleNamespace(
+                logits_output=SimpleNamespace(full_logits=logits),
+                can_run_graph=True,
+            ),
+            SimpleNamespace(
+                logits_output=SimpleNamespace(full_logits=logits),
+                can_run_graph=True,
+            ),
+        ]
+
+        result = algorithm._run_sync(
+            model_runner,
+            batch,
+            [{"prompt_len": 0, "is_prefill": True}],
+        )
+
+        self.assertEqual(result[1][0].tolist(), [1, 2])
+        self.assertEqual(model_runner.forward.call_count, 2)
 
     def test_dream_fdfo_carries_each_request_until_done(self):
         dream = Dream(_config(algorithm_config={"steps": 2, "alg": "origin"}))

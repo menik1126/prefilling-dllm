@@ -434,6 +434,46 @@ should therefore target repeated model work or a larger part of metadata
 planning rather than only KV/page-table bookkeeping. Raw artifacts are under
 `/results/dllm_denoise_20260904` in the fixed experiment container.
 
+PrefillingDream can also skip the final observation forward after the last
+mask is resolved. Enable `finish_on_final_mutation: true`, or use
+`benchmark/dllm/prefilling_dream_longbench_early_done.yaml`. The optimization
+returns `done` immediately after the final accepted-token mutation, but only
+when every remaining mask was accepted and none of the accepted tokens is the
+mask token itself. Partial drafting keeps its explicit confirmation bitmap and
+round-limit semantics, while requests returning logprobs retain the observer
+round. The completed request's mutated canvas is committed as the output and
+its stale final-round KV is released without entering the prefix cache, so no
+consumer needs an extra fully denoised observation forward.
+
+A paired same-source A/B used two independent H20 replicas, the same 150 fixed
+manifest examples split 75+75, generation microbatch eight, FlashInfer, and
+the same Breakable CUDA Graph shapes. The server KV pool was fixed at 707,345
+tokens on both GPUs:
+
+| Completion mode | GPU 0 generation (s) | GPU 1 generation (s) | Critical path (s) | Dual-GPU wall (s) | Graph launches | Request-rounds | Query tokens | Raw F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Final observation (default) | 39.821 | 41.987 | 41.987 | 48.898 | 597 | 3,587 | 114,784 | 47.736176 |
+| Finish on final mutation | 39.387 | 41.595 | 41.595 | 48.505 | 577 | 3,440 | 110,080 | 47.736176 |
+
+The optimized critical path was 1.0094x faster and measured dual-GPU wall time
+was 1.0081x faster. It removed one graph launch from every generation
+microbatch: graph launches fell 3.35%, while request-rounds and graph query
+tokens fell 4.10%. Three requests took one additional real denoising round
+after the active batch shape changed, so the net reduction was 147 rather than
+the ideal 150 request-rounds.
+
+All 150 input hashes and per-example F1 values matched, aggregate F1 was
+unchanged, and both modes had 95 stop completions, 55 length completions, 3,371
+completion tokens, zero empty responses, zero retractions, and zero service
+errors. One of 150 raw predictions changed reproducibly even though its input
+hash and score were unchanged; removing completed requests earlier changes the
+FP16 batch shape for the survivors. Because the end-to-end gain is modest and
+the output is not bit-exact, this option remains disabled by default. Three
+additional optimized repeats produced the same outputs and graph counts, with
+critical paths of 41.746, 41.924, and 41.621 seconds. Raw artifacts are under
+`/results/dream_early_done_ab_20260904` and
+`/results/dream_early_done_20260904` in the fixed experiment container.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

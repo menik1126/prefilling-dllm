@@ -1,0 +1,4 @@
+block_size: 32
+threshold: 0.9
+dual_cache: true
+finish_on_final_mutation: true

@@ -24,10 +24,14 @@ class PrefillingDream(DllmAlgorithm):
         super().__init__(config)
         self.threshold = float(config.algorithm_config.get("threshold", 0.9))
         self.dual_cache = config.dual_cache
+        self.finish_on_final_mutation = bool(
+            config.algorithm_config.get("finish_on_final_mutation", False)
+        )
 
     def max_steps(self, block_size: int) -> int:
-        # One initial prefill transfer, at most one forced token per later step,
-        # and one final forward to observe that no masks remain.
+        # One initial prefill transfer and at most one forced token per later
+        # step. The extra iteration preserves the default observer behavior and
+        # retains the existing bounded retry when the model selects mask_id.
         return block_size + 1
 
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
@@ -197,7 +201,8 @@ class PrefillingDream(DllmAlgorithm):
                 partial_draft_done = False
 
             accepted_positions = mask_positions[accepted]
-            generation_ids[accepted_positions] = sampled_tokens[accepted]
+            accepted_tokens = sampled_tokens[accepted]
+            generation_ids[accepted_positions] = accepted_tokens
             if partial_draft:
                 assert confirmed_mask is not None
                 for position in accepted_positions.tolist():
@@ -211,7 +216,23 @@ class PrefillingDream(DllmAlgorithm):
                         f"number of slots: {sum(confirmed_mask)} != "
                         f"{expected_confirmed}"
                     )
-            done.append(partial_draft_done)
+                request_done = partial_draft_done
+            elif self.finish_on_final_mutation and not getattr(
+                forward_batch, "return_logprob", False
+            ):
+                # The old path discovered completion at the start of the next
+                # round, after one redundant full-canvas forward. Completion
+                # here is equivalent when every remaining candidate was
+                # accepted and none was rewritten to mask_id itself. Only the
+                # possible final round pays the small device-to-host check.
+                request_done = accepted.numel() == mask_positions.numel()
+                if request_done:
+                    request_done = not bool(
+                        accepted_tokens.eq(self.mask_id).any().item()
+                    )
+            else:
+                request_done = False
+            done.append(request_done)
 
         return done
 
