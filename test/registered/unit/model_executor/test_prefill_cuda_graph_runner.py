@@ -226,6 +226,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             extend_prefix_lens_cpu=[0],
             mm_inputs=None,
             mm_input_embeds=mm_input_embeds,
+            dllm_block_size=32,
+            dllm_force_causal=False,
+            dllm_disable_prefill_cuda_graph=False,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_forward_mode=ForwardMode.EXTEND,
         )
@@ -233,6 +236,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         static_batch = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+        self.assertEqual(static_batch.dllm_block_size, 32)
+        self.assertFalse(static_batch.dllm_force_causal)
+        self.assertFalse(static_batch.dllm_disable_prefill_cuda_graph)
 
     def test_prefix_chunk_capacity_is_aggregate_and_can_be_overridden(self):
         graph_config = SimpleNamespace(
@@ -409,7 +415,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             input_ids=torch.zeros(4, dtype=torch.int64),
             input_embeds=None,
             replace_embeds=None,
-            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
             return_logprob=False,

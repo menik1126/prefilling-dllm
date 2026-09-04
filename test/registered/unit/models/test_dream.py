@@ -19,7 +19,11 @@ from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
@@ -616,6 +620,20 @@ class TestDreamCudaGraphPath(CustomTestCase):
             )
         )
 
+    def test_prefill_graph_rejects_parallelcomp_dream_forward(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+
+        self.assertFalse(
+            runner.can_run_graph(
+                SimpleNamespace(
+                    forward_mode=ForwardMode.DLLM_EXTEND,
+                    dllm_disable_prefill_cuda_graph=True,
+                    dllm_canvas_lens_cpu=None,
+                    dllm_raw_last_logits_cpu=None,
+                )
+            )
+        )
+
     def test_prefill_bcg_trims_full_logits_to_raw_tokens(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
@@ -641,11 +659,11 @@ class TestDreamCudaGraphPath(CustomTestCase):
         args.pp_size = 1
         args.disable_radix_cache = False
         args.disable_cuda_graph = disable_cuda_graph
-        args.cuda_graph_config = SimpleNamespace(
-            decode=SimpleNamespace(
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(
                 backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL
             ),
-            prefill=SimpleNamespace(
+            prefill=PhaseConfig(
                 backend=Backend.DISABLED if disable_cuda_graph else Backend.BREAKABLE
             ),
         )
@@ -662,22 +680,33 @@ class TestDreamCudaGraphPath(CustomTestCase):
         )
         return args
 
-    @patch("sglang.srt.arg_groups.overrides.run_post_process_pass")
+    @patch("sglang.srt.arg_groups.dllm_hook.run_post_process_pass")
     def test_server_guard_selects_dream_graph_backend(self, run_post_process_pass):
+        from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
+        from sglang.srt.arg_groups.overrides import resolution_result
+
         for disable_cuda_graph in (False, True):
             with self.subTest(disable_cuda_graph=disable_cuda_graph):
                 args = self._make_server_args_for_graph_test(disable_cuda_graph)
-                with patch("sglang.srt.server_args.is_hip", return_value=False):
-                    args._handle_dllm_inference()
+                with (
+                    patch("sglang.srt.arg_groups.dllm_hook.is_hip", return_value=False),
+                    patch(
+                        "sglang.srt.arg_groups.dllm_hook.model_config_of",
+                        return_value=SimpleNamespace(
+                            hf_config=SimpleNamespace(architectures=["DreamModel"])
+                        ),
+                    ),
+                ):
+                    handle_dllm_inference(args)
 
-                self.assertTrue(args.disable_radix_cache)
                 self.assertTrue(args.dllm_fdfo)
+                graph_config = resolution_result(args, "cuda_graph_config")
                 self.assertEqual(
-                    args.cuda_graph_config.decode.backend,
+                    graph_config.decode.backend,
                     Backend.DISABLED,
                 )
                 self.assertEqual(
-                    args.cuda_graph_config.prefill.backend,
+                    graph_config.prefill.backend,
                     Backend.DISABLED if disable_cuda_graph else Backend.BREAKABLE,
                 )
                 self.assertEqual(run_post_process_pass.call_count, 3)

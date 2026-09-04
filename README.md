@@ -357,6 +357,49 @@ completed with zero empty responses, retractions, request failures, CUDA
 errors, or OOMs. Observed batch-eight GPU memory usage reached about 87.2 and
 84.5 GB on the two 96-GB H20s.
 
+PrefillingDream's repeated dual-cache denoising forwards can additionally use
+the prefill Breakable CUDA Graph backend. Dream decode graphs remain disabled:
+the graph token buckets below describe aggregate prefill tokens, so a 32-token
+generation canvas with one to eight active requests maps exactly to eight
+shapes. The initial long compressed prompt is larger than 256 tokens and falls
+back to eager execution.
+
+```bash
+--attention-backend flashinfer \
+--cuda-graph-backend-decode disabled \
+--cuda-graph-backend-prefill breakable \
+--cuda-graph-max-bs-prefill 256 \
+--cuda-graph-bs-prefill 32 64 96 128 160 192 224 256
+```
+
+Do not also pass `--disable-cuda-graph`. Limiting capture to these shapes took
+1.91--1.95 seconds and 0.16 GB per H20, instead of capturing unused long-prompt
+buckets. Partial-draft forwards keep their dynamic canvas metadata on the eager
+path. ParallelComp now carries a separate prefill-graph exclusion flag so its
+causal chunk-building stages cannot replay a bidirectional Dream graph. The
+static replay batch also retains Dream's block/canvas/logits metadata, ensuring
+that its eager logits tail projects only the generation canvas.
+
+A selector-free two-H20 comparison fixed the same 150 reference-manifest
+selections, used generation microbatch eight, and changed only FlashInfer eager
+versus FlashInfer plus Breakable CUDA Graph:
+
+| Generator mode | GPU 0 generation (s) | GPU 1 generation (s) | Critical path (s) | Raw F1 |
+| --- | ---: | ---: | ---: | ---: |
+| FlashInfer eager | 40.604 | 42.594 | 42.594 | 47.736 |
+| FlashInfer + graph | 39.778 | 41.944 | 41.944 | 47.736 |
+| FlashInfer + graph, repeat | 39.774 | 41.940 | 41.940 | 47.736 |
+
+Both graph runs reproduced all 150 eager raw predictions exactly and remained
+0.297 point below the 48.033 FP16 reference. Each run replayed 597 of 617 model
+forwards (96.76%); the 20 eager forwards were the ten long-prompt batches on
+each replica. Median server throughput improved about 2.06x at 32 tokens,
+1.60x at 64, and 1.23x at 96, but only 1.02--1.05x from 128 through 256. Since
+256-token batches dominate this workload, the complete generation critical
+path improved by a reproducible 1.015x. Peak observed generator-only memory was
+66.6 and 63.1 GB, with no request failures, empty outputs, retractions, CUDA
+errors, or OOMs.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

@@ -529,6 +529,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # ParallelComp retains causal chunk KV even though Dream's generation
     # canvas itself uses bidirectional attention.
     dllm_force_causal: bool = False
+    # Multi-stage dLLM requests whose attention topology changes between
+    # forwards must stay out of the prefill CUDA Graph runner.
+    dllm_disable_prefill_cuda_graph: bool = False
     # Per request, lengths of independently masked ``chunk + query`` items
     # packed into the current ParallelComp chunk forward.
     dllm_parallelcomp_item_lens: Optional[List[Optional[List[int]]]] = None
@@ -875,6 +878,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             dllm_force_causal=dllm_force_causal,
+            dllm_disable_prefill_cuda_graph=any(
+                state is not None for state in parallelcomp_states
+            ),
             dllm_canvas_lens_cpu=dllm_canvas_lens_cpu,
             dllm_raw_last_logits_cpu=dllm_raw_last_logits_cpu,
             dllm_parallelcomp_item_lens=dllm_parallelcomp_item_lens,

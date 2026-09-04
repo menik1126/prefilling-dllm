@@ -1170,6 +1170,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # schema can preserve their canvas and raw-last-logit semantics.
             return False
 
+        if getattr(forward_batch, "dllm_disable_prefill_cuda_graph", False):
+            # Multi-stage dLLM forwards can change attention semantics at
+            # runtime (currently ParallelComp's causal chunk construction).
+            # Keep them out of the captured bidirectional Dream topology.
+            return False
+
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1648,6 +1654,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             temperature=forward_batch.temperature,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
+            # Breakable/Full graph captures only the transformer body and runs
+            # the model-specific logits tail eagerly against this static view.
+            # Preserve Dream's projection metadata so the tail still selects
+            # only the generation canvas instead of projecting the full prompt.
+            dllm_block_size=forward_batch.dllm_block_size,
+            dllm_canvas_lens_cpu=forward_batch.dllm_canvas_lens_cpu,
+            dllm_raw_last_logits_cpu=forward_batch.dllm_raw_last_logits_cpu,
+            dllm_force_causal=forward_batch.dllm_force_causal,
+            dllm_disable_prefill_cuda_graph=(
+                forward_batch.dllm_disable_prefill_cuda_graph
+            ),
+            dllm_parallelcomp_item_lens=forward_batch.dllm_parallelcomp_item_lens,
             return_pooled_hidden_states=(
                 self.capture_return_pooled_hidden_states
                 or forward_batch.return_pooled_hidden_states
