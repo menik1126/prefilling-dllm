@@ -31,10 +31,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
+    UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -178,6 +179,7 @@ class PrefillMetadata:
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
     force_causal: bool = False
+    dllm_denoise_single_paged: bool = False
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -337,6 +339,14 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
+        self._model_dtype = model_runner.dtype
+        self._dllm_denoise_single_paged_enabled = bool(
+            self.dllm_config is not None
+            and self.dllm_config.flashinfer_denoise_single_paged
+        )
+        self._dllm_denoise_single_paged_logged = False
+        self._dllm_denoise_single_paged_layout_key = None
+        self._dllm_denoise_single_paged_offsets = None
         self._dllm_denoise_plan_cache_enabled = bool(
             self.dllm_config is not None
             and self.dllm_config.flashinfer_denoise_plan_cache
@@ -388,6 +398,38 @@ class FlashInferAttnBackend(AttentionBackend):
                 or self.decode_uses_dequant_workspace
             )
             else model_runner.kv_cache_dtype
+        )
+        pool = self.token_to_kv_pool
+        pool_buffers = (
+            tuple(pool.k_buffer) + tuple(pool.v_buffer)
+            if type(pool) is MHATokenToKVPool
+            and pool.k_buffer is not None
+            and pool.v_buffer is not None
+            else ()
+        )
+        # The split path consumes the current canvas directly, whereas the
+        # single-paged path round-trips it through the KV cache first. Restrict
+        # the latter to a byte-preserving, plain NHD cache representation.
+        self._dllm_denoise_single_paged_plain_kv = bool(
+            type(pool) is MHATokenToKVPool
+            and type(self.kv_cache_quant_method) is UnquantizedKVCacheMethod
+            and self.prefill_kv_access is not None
+            and self.prefill_kv_access.kind == KVCacheAttentionAccessKind.PLAIN
+            and self.prefill_kv_access.storage_dtype is None
+            and self.prefill_kv_access.attention_kv_dtype is None
+            and self.prefill_kv_access.scale_recipe is None
+            and self.prefill_kv_access.workspace_dtype is None
+            and not self.prefill_uses_dequant_workspace
+            and self._model_dtype in (torch.float16, torch.bfloat16)
+            and pool.dtype == self._model_dtype
+            and pool.store_dtype == self._model_dtype
+            and model_runner.kv_cache_dtype == self._model_dtype
+            and self.flashinfer_kv_cache_dtype == self._model_dtype
+            and pool.kv_cache_layout == "nhd"
+            and not pool.use_hnd
+            and bool(pool_buffers)
+            and len(pool.k_buffer) == len(pool.v_buffer) == pool.layer_num
+            and all(tensor.dtype == self._model_dtype for tensor in pool_buffers)
         )
 
         # Parse constants
@@ -895,6 +937,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # Full/decode CUDA Graph paths share the same FlashInfer wrappers but
         # do not participate in the consecutive dLLM eager-plan cache.
         self._clear_dllm_denoise_plan_cache()
+        self._dllm_denoise_single_paged_layout_key = None
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -1139,28 +1182,20 @@ class FlashInferAttnBackend(AttentionBackend):
         self._dllm_denoise_plan_cache_key = None
         self._dllm_denoise_plan_cache_metadata = None
 
-    def _make_dllm_denoise_plan_cache_key(
+    def _make_dllm_denoise_geometry_key(
         self, forward_batch: ForwardBatch
     ) -> Optional[tuple]:
-        """Build a host-only key for stable Dream attention geometry.
-
-        The cache is intentionally restricted to the dedicated denoise mode.
-        That scheduler path retains request slots and the complete prompt plus
-        canvas page table across rounds. Token values change, but none of the
-        tensors consumed by FlashInfer planning do.
-        """
+        """Validate and snapshot fixed-width Dream denoise geometry."""
+        if type(self) is not FlashInferAttnBackend:
+            return None
         if (
-            not self._dllm_denoise_plan_cache_enabled
-            or type(self) is not FlashInferAttnBackend
-            or not forward_batch.forward_mode.is_dllm_denoise()
+            not forward_batch.forward_mode.is_dllm_denoise()
             or self.dllm_config.algorithm != "PrefillingDream"
             or not self.dllm_config.needs_full_prefill
             or not self.dllm_config.dual_cache
             or not self.dllm_config.first_done_first_out_mode
             or not self._dllm_denoise_plan_cache_single_rank
             or not self._dllm_denoise_plan_cache_breakable
-            or forward_batch.batch_size
-            > self.dllm_config.flashinfer_denoise_plan_cache_max_batch_size
             or self.prefill_backend != "fa2"
             or self.page_size != 1
             or self.skip_prefill
@@ -1210,6 +1245,9 @@ class FlashInferAttnBackend(AttentionBackend):
             or len(prefix_lens_cpu) != batch_size
             or extend_lens_cpu is None
             or len(extend_lens_cpu) != batch_size
+            or not isinstance(forward_batch.extend_prefix_lens, torch.Tensor)
+            or forward_batch.extend_prefix_lens.ndim != 1
+            or forward_batch.extend_prefix_lens.numel() != batch_size
             or not isinstance(forward_batch.req_pool_indices, torch.Tensor)
             or forward_batch.req_pool_indices.ndim != 1
             or forward_batch.req_pool_indices.numel() != batch_size
@@ -1252,14 +1290,115 @@ class FlashInferAttnBackend(AttentionBackend):
             block_size,
         )
 
-    def _reuse_dllm_denoise_plan(self, cache_key: Optional[tuple]) -> bool:
+    def _use_dllm_denoise_single_paged(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        geometry_key: Optional[tuple] = None,
+    ) -> bool:
+        """Return whether this batch may use write-then-full-paged attention."""
+        if not (
+            getattr(self, "_dllm_denoise_single_paged_enabled", False)
+            and getattr(self, "_dllm_denoise_single_paged_plain_kv", False)
+            and self._model_dtype in (torch.float16, torch.bfloat16)
+            and forward_batch.batch_size
+            <= self.dllm_config.flashinfer_denoise_single_paged_max_batch_size
+        ):
+            return False
+        if geometry_key is None:
+            geometry_key = self._make_dllm_denoise_geometry_key(forward_batch)
+        return geometry_key is not None
+
+    def _validate_dllm_denoise_single_paged_layout(
+        self, forward_batch: ForwardBatch, geometry_key: tuple
+    ) -> None:
+        """Check once per geometry that paged attention sees the canvas slots."""
+        if getattr(self, "_dllm_denoise_single_paged_layout_key", None) == geometry_key:
+            return
+
+        page_table = getattr(self.req_to_token_pool, "req_to_token", None)
+        tensors = (
+            page_table,
+            forward_batch.req_pool_indices,
+            forward_batch.extend_prefix_lens,
+            forward_batch.out_cache_loc,
+        )
+        if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+            raise RuntimeError(
+                "FlashInfer Dream single-paged denoise requires tensor page-table metadata"
+            )
+
+        device = page_table.device
+        if any(tensor.device != device for tensor in tensors[1:]):
+            raise RuntimeError(
+                "FlashInfer Dream single-paged denoise page-table tensors must share a device"
+            )
+
+        block_size = geometry_key[-1]
+        offsets = getattr(self, "_dllm_denoise_single_paged_offsets", None)
+        if (
+            not isinstance(offsets, torch.Tensor)
+            or offsets.device != device
+            or offsets.numel() != block_size
+        ):
+            offsets = torch.arange(block_size, dtype=torch.int64, device=device)
+            self._dllm_denoise_single_paged_offsets = offsets
+
+        rows = forward_batch.req_pool_indices.to(dtype=torch.int64).view(-1, 1)
+        columns = forward_batch.extend_prefix_lens.to(dtype=torch.int64).view(
+            -1, 1
+        ) + offsets.view(1, -1)
+        actual = page_table[rows, columns]
+        expected = forward_batch.out_cache_loc.view_as(actual).to(dtype=actual.dtype)
+        matches = actual.eq(expected).all()
+        message = (
+            "FlashInfer Dream single-paged denoise page-table canvas does not match "
+            "out_cache_loc"
+        )
+        if device.type == "cuda":
+            torch._assert_async(matches, message)
+        elif not bool(matches.item()):
+            raise RuntimeError(message)
+        self._dllm_denoise_single_paged_layout_key = geometry_key
+
+    def _make_dllm_denoise_plan_cache_key(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        single_paged: bool = False,
+        geometry_key: Optional[tuple] = None,
+    ) -> Optional[tuple]:
+        """Build a host-only key for stable Dream attention geometry.
+
+        The cache is intentionally restricted to the dedicated denoise mode.
+        That scheduler path retains request slots and the complete prompt plus
+        canvas page table across rounds. Token values change, but none of the
+        tensors consumed by FlashInfer planning do.
+        """
+        if (
+            not self._dllm_denoise_plan_cache_enabled
+            or forward_batch.batch_size
+            > self.dllm_config.flashinfer_denoise_plan_cache_max_batch_size
+        ):
+            return None
+        if geometry_key is None:
+            geometry_key = self._make_dllm_denoise_geometry_key(forward_batch)
+        if geometry_key is None:
+            return None
+
+        return (*geometry_key, bool(single_paged))
+
+    def _reuse_dllm_denoise_plan(
+        self, cache_key: Optional[tuple], *, single_paged: bool = False
+    ) -> bool:
         if (
             cache_key is None
             or cache_key != self._dllm_denoise_plan_cache_key
             or self.forward_metadata is not self._dllm_denoise_plan_cache_metadata
             or not isinstance(self.forward_metadata, PrefillMetadata)
             or self.forward_metadata.prefill_wrappers is not self.prefill_wrappers_paged
-            or not self.forward_metadata.use_ragged
+            or self.forward_metadata.use_ragged != (not single_paged)
+            or self.forward_metadata.dllm_denoise_single_paged != single_paged
         ):
             return False
         self._dllm_denoise_plan_cache_hits += 1
@@ -1268,8 +1407,37 @@ class FlashInferAttnBackend(AttentionBackend):
         return True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        dllm_cache_key = self._make_dllm_denoise_plan_cache_key(forward_batch)
-        if self._reuse_dllm_denoise_plan(dllm_cache_key):
+        needs_dllm_denoise_geometry = bool(
+            self._dllm_denoise_plan_cache_enabled
+            or self._dllm_denoise_single_paged_enabled
+        )
+        dllm_denoise_geometry_key = (
+            self._make_dllm_denoise_geometry_key(forward_batch)
+            if needs_dllm_denoise_geometry
+            else None
+        )
+        dllm_denoise_single_paged = self._use_dllm_denoise_single_paged(
+            forward_batch, geometry_key=dllm_denoise_geometry_key
+        )
+        if dllm_denoise_single_paged:
+            self._validate_dllm_denoise_single_paged_layout(
+                forward_batch, dllm_denoise_geometry_key
+            )
+        else:
+            self._dllm_denoise_single_paged_layout_key = None
+        if dllm_denoise_single_paged and not getattr(
+            self, "_dllm_denoise_single_paged_logged", False
+        ):
+            logger.info("FlashInfer Dream single-paged denoise attention is active")
+            self._dllm_denoise_single_paged_logged = True
+        dllm_cache_key = self._make_dllm_denoise_plan_cache_key(
+            forward_batch,
+            single_paged=dllm_denoise_single_paged,
+            geometry_key=dllm_denoise_geometry_key,
+        )
+        if self._reuse_dllm_denoise_plan(
+            dllm_cache_key, single_paged=dllm_denoise_single_paged
+        ):
             return
         self._clear_dllm_denoise_plan_cache()
         if dllm_cache_key is not None:
@@ -1340,6 +1508,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     and not is_in_tc_piecewise_cuda_graph()
                     and not self.use_paged
                 )
+                if forward_batch.forward_mode.is_dllm_denoise():
+                    use_ragged = use_ragged and not dllm_denoise_single_paged
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             # Process multi-item scoring in attention backend instead of ForwardBatch
@@ -1393,6 +1563,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
                 force_causal=forward_batch.dllm_force_causal,
+                dllm_denoise_single_paged=dllm_denoise_single_paged,
             )
             if dllm_cache_key is not None:
                 self._dllm_denoise_plan_cache_key = dllm_cache_key
@@ -1405,6 +1576,7 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         self._clear_dllm_denoise_plan_cache()
+        self._dllm_denoise_single_paged_layout_key = None
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len,),
@@ -1699,6 +1871,36 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             kv_cache = pool.get_kv_buffer(layer.layer_id)
+
+        if self.forward_metadata.dllm_denoise_single_paged:
+            # Metadata planning has already selected the full-paged layout, so
+            # an unsafe runtime representation must fail loudly rather than
+            # silently falling back to a differently planned ragged path.
+            if (
+                not forward_batch.forward_mode.is_dllm_denoise()
+                or not self._dllm_denoise_single_paged_plain_kv
+                or layer.is_cross_attention
+                or layer.attn_type != AttentionType.ENCODER_ONLY
+                or self.forward_metadata.use_ragged
+                or self.forward_metadata.force_causal
+                or k is None
+                or v is None
+                or not save_kv_cache
+                or cache_loc is None
+                or cache_loc.numel() != k.shape[0]
+                or k.shape[0] != v.shape[0]
+                or k.dtype != v.dtype
+                or k.dtype != pool.dtype
+                or k.dtype != self.flashinfer_kv_cache_dtype
+                or kv_cache[0].dtype != k.dtype
+                or kv_cache[1].dtype != v.dtype
+                or layer.k_scale_float not in (None, 1.0)
+                or layer.v_scale_float not in (None, 1.0)
+            ):
+                raise RuntimeError(
+                    "Unsafe KV representation for FlashInfer Dream "
+                    "single-paged denoise attention"
+                )
 
         # use paged attention
         if not self.forward_metadata.use_ragged:

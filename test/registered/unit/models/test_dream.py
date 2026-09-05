@@ -295,6 +295,51 @@ class TestDreamRequestCanvas(CustomTestCase):
         self.assertTrue(config.flashinfer_denoise_plan_cache)
         self.assertEqual(config.flashinfer_denoise_plan_cache_max_batch_size, 8)
 
+    def test_flashinfer_denoise_single_paged_requires_stable_dual_cache(self):
+        default_config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={"dual_cache": True, "denoise_fast_path": True},
+        )
+        self.assertFalse(default_config.flashinfer_denoise_single_paged)
+        self.assertEqual(
+            default_config.flashinfer_denoise_single_paged_max_batch_size, 8
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires dual_cache"):
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={"flashinfer_denoise_single_paged": True},
+            )
+        with self.assertRaisesRegex(ValueError, "requires dual_cache"):
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "dual_cache": True,
+                    "flashinfer_denoise_single_paged": True,
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            _config(
+                algorithm="PrefillingDream",
+                algorithm_config={
+                    "dual_cache": True,
+                    "denoise_fast_path": True,
+                    "flashinfer_denoise_single_paged_max_batch_size": 0,
+                },
+            )
+
+        config = _config(
+            algorithm="PrefillingDream",
+            algorithm_config={
+                "dual_cache": True,
+                "denoise_fast_path": True,
+                "flashinfer_denoise_single_paged": True,
+                "flashinfer_denoise_single_paged_max_batch_size": 4,
+            },
+        )
+        self.assertTrue(config.flashinfer_denoise_single_paged)
+        self.assertEqual(config.flashinfer_denoise_single_paged_max_batch_size, 4)
+
     def test_partial_draft_initializes_request_specific_canvas(self):
         config = _config(
             algorithm="PrefillingDream",

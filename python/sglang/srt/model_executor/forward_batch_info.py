@@ -550,7 +550,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # FDFO result path can reuse the same D2H transfer used for completion.
     dllm_output_ids_cpu: Optional[torch.Tensor] = None
     # Host-only identity/version key for the retained Dream page-table layout.
-    # It is populated only by the opt-in dedicated denoise plan-cache path.
+    # It is populated by opt-in FlashInfer denoise paths that depend on the
+    # request row remaining stable across rounds.
     dllm_denoise_plan_key: Optional[tuple] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
@@ -1945,7 +1946,10 @@ def _build_dllm_denoise_plan_key(batch: ScheduleBatch) -> Optional[tuple]:
     if (
         not batch.forward_mode.is_dllm_denoise()
         or batch.dllm_config is None
-        or not getattr(batch.dllm_config, "flashinfer_denoise_plan_cache", False)
+        or not (
+            getattr(batch.dllm_config, "flashinfer_denoise_plan_cache", False)
+            or getattr(batch.dllm_config, "flashinfer_denoise_single_paged", False)
+        )
         or batch.req_to_token_pool is None
     ):
         return None

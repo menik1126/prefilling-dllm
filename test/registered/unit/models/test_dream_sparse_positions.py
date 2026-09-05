@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -232,7 +232,10 @@ def test_denoise_plan_key_tracks_retained_request_identity():
     )
     batch = SimpleNamespace(
         forward_mode=ForwardMode.DLLM_DENOISE,
-        dllm_config=SimpleNamespace(flashinfer_denoise_plan_cache=True),
+        dllm_config=SimpleNamespace(
+            flashinfer_denoise_plan_cache=True,
+            flashinfer_denoise_single_paged=False,
+        ),
         req_to_token_pool=SimpleNamespace(req_generation=torch.tensor([0, 7, 11])),
         reqs=[req_0, req_1],
     )
@@ -243,6 +246,15 @@ def test_denoise_plan_key_tracks_retained_request_identity():
         ("req-1", 2, 11, prefix_1.data_ptr(), canvas_1.data_ptr()),
     )
     assert _build_dllm_denoise_plan_key(batch) == key
+
+    # Either consumer needs the retained-layout identity. It is disabled only
+    # when both the plan cache and the single-paged route are disabled.
+    batch.dllm_config.flashinfer_denoise_plan_cache = False
+    batch.dllm_config.flashinfer_denoise_single_paged = True
+    assert _build_dllm_denoise_plan_key(batch) == key
+    batch.dllm_config.flashinfer_denoise_single_paged = False
+    assert _build_dllm_denoise_plan_key(batch) is None
+    batch.dllm_config.flashinfer_denoise_plan_cache = True
 
     batch.req_to_token_pool.req_generation[1] += 1
     assert _build_dllm_denoise_plan_key(batch) != key
@@ -262,11 +274,17 @@ def test_denoise_plan_key_tracks_retained_request_identity():
     assert _build_dllm_denoise_plan_key(batch) is None
     batch.forward_mode = ForwardMode.DLLM_DENOISE
     batch.dllm_config.flashinfer_denoise_plan_cache = False
+    batch.dllm_config.flashinfer_denoise_single_paged = False
     assert _build_dllm_denoise_plan_key(batch) is None
 
 
-def test_flashinfer_reuses_only_consecutive_stable_denoise_plans():
+def _make_flashinfer_denoise_backend(*, single_paged: bool):
     backend = object.__new__(FlashInferAttnBackend)
+    backend._model_dtype = torch.float16
+    backend._dllm_denoise_single_paged_enabled = single_paged
+    backend._dllm_denoise_single_paged_plain_kv = True
+    backend._dllm_denoise_single_paged_layout_key = None
+    backend._dllm_denoise_single_paged_offsets = None
     backend._dllm_denoise_plan_cache_enabled = True
     backend._dllm_denoise_plan_cache_key = None
     backend._dllm_denoise_plan_cache_metadata = None
@@ -291,14 +309,23 @@ def test_flashinfer_reuses_only_consecutive_stable_denoise_plans():
         needs_full_prefill=True,
         dual_cache=True,
         first_done_first_out_mode=True,
+        flashinfer_denoise_single_paged=single_paged,
+        flashinfer_denoise_single_paged_max_batch_size=8,
         flashinfer_denoise_plan_cache_max_batch_size=8,
     )
+    req_to_token = torch.zeros((8, 16), dtype=torch.int64)
+    req_to_token[3, 5:7] = torch.tensor([20, 21])
+    req_to_token[4, 7:9] = torch.tensor([30, 31])
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
     backend.prefill_wrappers_paged = [object()]
     backend.indices_updater_prefill = MagicMock()
     backend.prefill_split_tile_size = None
     backend.forward_metadata = None
+    return backend
 
-    batch = SimpleNamespace(
+
+def _make_flashinfer_denoise_batch():
+    return SimpleNamespace(
         forward_mode=ForwardMode.DLLM_DENOISE,
         batch_size=2,
         input_ids=torch.tensor([99, 99, 99, 99]),
@@ -330,6 +357,14 @@ def test_flashinfer_reuses_only_consecutive_stable_denoise_plans():
         lora_ids=[None, None],
     )
 
+
+def test_flashinfer_reuses_only_consecutive_stable_denoise_plans():
+    backend = _make_flashinfer_denoise_backend(single_paged=True)
+    # This test mutates artificial geometry without maintaining a page table;
+    # row-tail validation has a dedicated test below.
+    backend._validate_dllm_denoise_single_paged_layout = MagicMock()
+    batch = _make_flashinfer_denoise_batch()
+
     valid_input_ids = batch.input_ids
     batch.input_ids = None
     assert backend._make_dllm_denoise_plan_cache_key(batch) is None
@@ -337,6 +372,11 @@ def test_flashinfer_reuses_only_consecutive_stable_denoise_plans():
 
     backend.init_forward_metadata(batch)
     first_metadata = backend.forward_metadata
+    assert first_metadata.use_ragged is False
+    assert first_metadata.dllm_denoise_single_paged is True
+    assert (
+        backend.indices_updater_prefill.update.call_args.kwargs["use_ragged"] is False
+    )
     # Token/canvas contents are not part of attention planning.
     batch.input_ids = torch.tensor([1, 99, 2, 99])
     backend.init_forward_metadata(batch)
@@ -426,3 +466,110 @@ def test_flashinfer_reuses_only_consecutive_stable_denoise_plans():
     backend.init_forward_metadata(batch)
     assert backend.indices_updater_prefill.update.call_count == 10
     assert backend._dllm_denoise_plan_cache_misses == 9
+
+
+def test_flashinfer_denoise_plan_cache_isolated_by_attention_route():
+    backend = _make_flashinfer_denoise_backend(single_paged=False)
+    batch = _make_flashinfer_denoise_batch()
+
+    backend.init_forward_metadata(batch)
+    ragged_key = backend._dllm_denoise_plan_cache_key
+    assert backend.forward_metadata.use_ragged is True
+    assert backend.forward_metadata.dllm_denoise_single_paged is False
+
+    backend._dllm_denoise_single_paged_enabled = True
+    backend.dllm_config.flashinfer_denoise_single_paged = True
+    backend.init_forward_metadata(batch)
+    single_paged_key = backend._dllm_denoise_plan_cache_key
+    assert backend.indices_updater_prefill.update.call_count == 2
+    assert backend._dllm_denoise_plan_cache_hits == 0
+    assert backend._dllm_denoise_plan_cache_misses == 2
+    assert backend.forward_metadata.use_ragged is False
+    assert backend.forward_metadata.dllm_denoise_single_paged is True
+    assert single_paged_key != ragged_key
+    assert single_paged_key[-1] is True
+    assert ragged_key[-1] is False
+
+    backend.init_forward_metadata(batch)
+    assert backend.indices_updater_prefill.update.call_count == 2
+    assert backend._dllm_denoise_plan_cache_hits == 1
+
+    backend._dllm_denoise_single_paged_enabled = False
+    backend.dllm_config.flashinfer_denoise_single_paged = False
+    backend.init_forward_metadata(batch)
+    assert backend.indices_updater_prefill.update.call_count == 3
+    assert backend._dllm_denoise_plan_cache_misses == 3
+    assert backend.forward_metadata.use_ragged is True
+    assert backend.forward_metadata.dllm_denoise_single_paged is False
+
+
+def test_flashinfer_denoise_single_paged_requires_identity_and_plain_kv():
+    backend = _make_flashinfer_denoise_backend(single_paged=True)
+    batch = _make_flashinfer_denoise_batch()
+
+    assert backend._use_dllm_denoise_single_paged(batch) is True
+
+    scheduler_key = batch.dllm_denoise_plan_key
+    batch.dllm_denoise_plan_key = None
+    assert backend._use_dllm_denoise_single_paged(batch) is False
+    batch.dllm_denoise_plan_key = scheduler_key
+
+    backend._dllm_denoise_single_paged_plain_kv = False
+    assert backend._use_dllm_denoise_single_paged(batch) is False
+    backend.init_forward_metadata(batch)
+    assert backend.forward_metadata.use_ragged is True
+    assert backend.forward_metadata.dllm_denoise_single_paged is False
+
+
+def test_flashinfer_skips_denoise_geometry_when_both_consumers_are_disabled():
+    backend = _make_flashinfer_denoise_backend(single_paged=False)
+    backend._dllm_denoise_plan_cache_enabled = False
+    batch = _make_flashinfer_denoise_batch()
+
+    with patch.object(
+        backend,
+        "_make_dllm_denoise_geometry_key",
+        wraps=backend._make_dllm_denoise_geometry_key,
+    ) as make_geometry:
+        backend.init_forward_metadata(batch)
+
+    make_geometry.assert_not_called()
+    assert backend.forward_metadata.use_ragged is True
+
+
+def test_flashinfer_denoise_single_paged_requires_valid_geometry_and_dtype():
+    backend = _make_flashinfer_denoise_backend(single_paged=True)
+    batch = _make_flashinfer_denoise_batch()
+
+    geometry_key = backend._make_dllm_denoise_geometry_key(batch)
+    assert geometry_key is not None
+    assert backend._use_dllm_denoise_single_paged(batch, geometry_key=geometry_key)
+
+    input_ids = batch.input_ids
+    batch.input_ids = input_ids[:-1]
+    assert backend._make_dllm_denoise_geometry_key(batch) is None
+    assert backend._use_dllm_denoise_single_paged(batch) is False
+    batch.input_ids = input_ids
+
+    backend._model_dtype = torch.float32
+    assert backend._use_dllm_denoise_single_paged(batch) is False
+    backend._model_dtype = torch.float16
+    backend.dllm_config.flashinfer_denoise_single_paged_max_batch_size = 1
+    assert backend._use_dllm_denoise_single_paged(batch) is False
+
+
+def test_flashinfer_denoise_single_paged_validates_page_table_canvas_once():
+    backend = _make_flashinfer_denoise_backend(single_paged=True)
+    batch = _make_flashinfer_denoise_batch()
+    geometry_key = backend._make_dllm_denoise_geometry_key(batch)
+
+    backend._validate_dllm_denoise_single_paged_layout(batch, geometry_key)
+    assert backend._dllm_denoise_single_paged_layout_key == geometry_key
+
+    # A stable key deliberately skips the GPU comparison on later denoise rounds.
+    backend.req_to_token_pool.req_to_token[3, 5] = -1
+    backend._validate_dllm_denoise_single_paged_layout(batch, geometry_key)
+
+    backend._dllm_denoise_single_paged_layout_key = None
+    with pytest.raises(RuntimeError, match="page-table canvas"):
+        backend._validate_dllm_denoise_single_paged_layout(batch, geometry_key)

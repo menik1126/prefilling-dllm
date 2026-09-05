@@ -543,6 +543,45 @@ option remains disabled by default.
 Raw artifacts and the machine-readable analysis are under
 `/results/dream_plan_cache_ab_20260905` in the fixed experiment container.
 
+The fixed-width Dream denoise rounds can also replace the ragged-canvas plus
+paged-prefix attention and LSE merge with one non-causal paged attention over
+the complete retained `prefix + canvas` row. Enable this experimental route
+with `flashinfer_denoise_single_paged: true`; the validated configuration is
+`benchmark/dllm/prefilling_dream_longbench_single_paged.yaml`. The current
+canvas K/V is written to its retained slots before attention. The route is
+restricted to the exact `DLLM_DENOISE` path, FlashInfer FA2 with page size one,
+a single rank, Breakable prefill graphs, plain NHD FP16/BF16 KV whose storage
+dtype exactly matches the model, unit KV scales, and a configurable maximum
+batch size (eight in the validated config). On each new retained layout, an
+asynchronous device-side check also verifies that the request page table's
+canvas tail exactly matches `out_cache_loc`. Quantized KV, dynamic
+canvases, logprobs, ParallelComp, multimodal, speculative, SWA, LoRA, TBO, and
+other unsupported batches retain the split-attention path.
+
+A 150-example two-phase cross-over used the same manifests, generation
+microbatch eight, plan cache, graph shapes, random seed, and two independent
+H20 replicas as the preceding experiment. Each phase ran both variants on the
+same 75 examples concurrently, then the GPU assignments and dataset half were
+swapped:
+
+| Attention path | Phase 0 generation (s) | Phase 1 generation (s) | 150-example sum (s) | B=1 graph round (ms) | B=4 graph round (ms) | B=8 graph round (ms) | Raw F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ragged canvas + paged prefix + merge | 39.135 | 40.971 | 80.105 | 11.161 | 23.558 | 42.361 | 47.736176 |
+| Single paged prefix + canvas | 38.798 | 40.849 | 79.647 | 10.369 | 22.536 | 41.261 | 48.063498 |
+
+The single-paged kernel path improved the mean B=1, B=4, and B=8 graph rounds
+by 1.0763x, 1.0454x, and 1.0267x. Complete generation improved by 1.0058x;
+both GPU assignments were directionally positive. There were no request,
+CUDA, OOM, or retraction errors, and every input hash matched. The different
+softmax reduction order is not bit-exact: 20 of 150 raw predictions changed,
+14 changed per-example score, total completion tokens changed from 3,371 to
+3,364, and aggregate F1 increased by 0.3273 point. The option therefore remains
+disabled by default despite the repeatable local attention speedup; the F1
+difference is within the requested one-point tolerance but is not treated as a
+quality improvement. Raw
+artifacts and the machine-readable analysis are under
+`/results/dream_single_paged_ab_20260905_v1` in the fixed experiment container.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32

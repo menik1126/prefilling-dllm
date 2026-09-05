@@ -38,6 +38,15 @@ class DllmConfig:
         self.flashinfer_denoise_plan_cache = bool(
             algorithm_config.get("flashinfer_denoise_plan_cache", False)
         )
+        # Experimental FlashInfer path that writes the current Dream canvas into
+        # its retained KV slots before running one non-causal paged attention over
+        # prefix + canvas. Keep it opt-in until numerical parity is validated.
+        self.flashinfer_denoise_single_paged = bool(
+            algorithm_config.get("flashinfer_denoise_single_paged", False)
+        )
+        self.flashinfer_denoise_single_paged_max_batch_size = int(
+            algorithm_config.get("flashinfer_denoise_single_paged_max_batch_size", 8)
+        )
         self.flashinfer_denoise_plan_cache_max_batch_size = int(
             algorithm_config.get("flashinfer_denoise_plan_cache_max_batch_size", 8)
         )
@@ -45,11 +54,22 @@ class DllmConfig:
             raise ValueError(
                 "flashinfer_denoise_plan_cache_max_batch_size must be positive"
             )
+        if self.flashinfer_denoise_single_paged_max_batch_size < 1:
+            raise ValueError(
+                "flashinfer_denoise_single_paged_max_batch_size must be positive"
+            )
         if self.flashinfer_denoise_plan_cache and not (
             self.dual_cache and self.denoise_fast_path
         ):
             raise ValueError(
                 "flashinfer_denoise_plan_cache requires dual_cache and "
+                "denoise_fast_path"
+            )
+        if self.flashinfer_denoise_single_paged and not (
+            self.dual_cache and self.denoise_fast_path
+        ):
+            raise ValueError(
+                "flashinfer_denoise_single_paged requires dual_cache and "
                 "denoise_fast_path"
             )
 
