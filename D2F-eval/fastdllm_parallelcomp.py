@@ -979,6 +979,34 @@ class FastDLLMParallelComp:
                 mask[:, :, local_row, prefix_len + chunk_len:] = neg
         return mask
 
+    def _chunk_full_query_causal_mask(
+        self,
+        prefix_len: int,
+        chunk_len: int,
+        query_len: int,
+        *,
+        current_only: bool,
+    ) -> torch.Tensor:
+        key_len = prefix_len + chunk_len + query_len
+        q_len = chunk_len + query_len if current_only else key_len
+        row_offset = prefix_len if current_only else 0
+        mask = torch.full(
+            (1, 1, q_len, key_len),
+            torch.finfo(self._mask_dtype).min,
+            device=self.device,
+            dtype=self._mask_dtype,
+        )
+        chunk_end = prefix_len + chunk_len
+        for local_row in range(q_len):
+            row = row_offset + local_row
+            if row < prefix_len:
+                mask[:, :, local_row, :row + 1] = 0
+            elif row < chunk_end:
+                mask[:, :, local_row, :chunk_end] = 0
+            else:
+                mask[:, :, local_row, :row + 1] = 0
+        return mask
+
     def _attention_mask(
         self,
         mode: str,
@@ -1003,6 +1031,34 @@ class FastDLLMParallelComp:
                 current_only=current_only,
             )
         raise ValueError(f"Unsupported attention mask mode: {mode}")
+
+    def _score_attention_mask(
+        self,
+        mode: str,
+        *,
+        q_len: int,
+        key_len: Optional[int] = None,
+        prefix_len: int = 0,
+        chunk_len: int = 0,
+        query_len: int = 0,
+        current_only: bool = False,
+    ):
+        if (mode or "").lower() == "full":
+            return self._chunk_full_query_causal_mask(
+                prefix_len,
+                chunk_len,
+                query_len,
+                current_only=current_only,
+            )
+        return self._attention_mask(
+            mode,
+            q_len=q_len,
+            key_len=key_len,
+            prefix_len=prefix_len,
+            chunk_len=chunk_len,
+            query_len=query_len,
+            current_only=current_only,
+        )
 
     def _shift_logits(self, logits: torch.Tensor, last_logit: Optional[torch.Tensor] = None) -> torch.Tensor:
         shifted = torch.empty_like(logits)
@@ -1273,7 +1329,7 @@ class FastDLLMParallelComp:
         prefix_len = len(prefix_ids)
         chunk_len = len(chunk_ids)
         query_len = len(query_ids)
-        attention_mask = self._attention_mask(
+        attention_mask = self._score_attention_mask(
             self.config.score_attention_mask,
             q_len=len(joint_ids),
             key_len=len(joint_ids),
@@ -1353,7 +1409,7 @@ class FastDLLMParallelComp:
         batch_size = max(1, int(self.config.score_batch_size or 1))
         for chunk_len, group in groups.items():
             joint_len = prefix_len + chunk_len + query_len
-            attention_mask = self._attention_mask(
+            attention_mask = self._score_attention_mask(
                 self.config.score_attention_mask,
                 q_len=joint_len,
                 key_len=joint_len,
@@ -1465,7 +1521,7 @@ class FastDLLMParallelComp:
         prefix_len = len(prefix_ids)
         context_len = len(context_ids)
         query_len = len(query_ids)
-        attention_mask = self._attention_mask(
+        attention_mask = self._score_attention_mask(
             self.config.score_attention_mask,
             q_len=len(joint_ids),
             key_len=len(joint_ids),
