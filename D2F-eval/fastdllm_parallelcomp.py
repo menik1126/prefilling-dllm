@@ -1933,7 +1933,6 @@ class FastDLLMParallelComp:
         if (
             self.config.score_mode in {"self_information", "draft_self_information"}
             and self.config.score_context_mode == "single_chunk"
-            and int(self.config.score_batch_size or 1) > 1
         ):
             scores.update(
                 self.score_chunks_self_information_batched(
