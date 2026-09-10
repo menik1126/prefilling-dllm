@@ -26,6 +26,7 @@ SCORE_MODE="${SCORE_MODE:-draft_self_information}"
 SCORE_DRAFT_TOKENS="${SCORE_DRAFT_TOKENS:-4}"
 SCORE_DRAFT_PARTIAL_ROUNDS="${SCORE_DRAFT_PARTIAL_ROUNDS:-1}"
 SCORE_DRAFT_SCORE_ALL_SLOTS="${SCORE_DRAFT_SCORE_ALL_SLOTS:-0}"
+SCORE_BATCH_SIZE="${SCORE_BATCH_SIZE:-8}"
 SCORE_ATTENTION_MASK="${SCORE_ATTENTION_MASK:-causal}"
 SCORE_CONTEXT_MODE="${SCORE_CONTEXT_MODE:-single_chunk}"
 CACHE_BUILD_MODE="${CACHE_BUILD_MODE:-full_prompt_mask}"
@@ -84,7 +85,7 @@ export PYTHONPATH="$REPO_DIR:$D2F_EVAL_DIR:${PYTHONPATH:-}"
 
 export REPO_DIR D2F_VLLM_DIR D2F_EVAL_DIR DREAM_BASE DATA_DIR CONFIG_DIR TASK_NAME
 export START_INDEX LIMIT RUN_TS CHECK_ONLY DRY_RUN
-export PC_CHUNK_SIZE TOPK_CHUNKS SCORE_MODE SCORE_DRAFT_TOKENS SCORE_DRAFT_PARTIAL_ROUNDS SCORE_DRAFT_SCORE_ALL_SLOTS
+export PC_CHUNK_SIZE TOPK_CHUNKS SCORE_MODE SCORE_DRAFT_TOKENS SCORE_DRAFT_PARTIAL_ROUNDS SCORE_DRAFT_SCORE_ALL_SLOTS SCORE_BATCH_SIZE
 export SCORE_ATTENTION_MASK SCORE_CONTEXT_MODE CACHE_BUILD_MODE CHUNK_POSITION_MODE QUERY_POSITION_MODE KEEP_FIRST_CHUNK
 export SPLIT_FROM_TAIL CHUNK_BOS FORCE_KEEP_CHUNK_BOS
 export TOKEN_CAPACITY TOKEN_SCORE_QUERY_WINDOW TOKEN_SCORE_LAYERS TOKEN_SCORE_LAYER_MODE TOKEN_SCORE_REDUCE
@@ -109,7 +110,7 @@ echo "Model               : $DREAM_BASE"
 echo "CUDA devices        : $CUDA_VISIBLE_DEVICES"
 echo "Master port         : $MASTER_PORT"
 echo "Run timestamp       : $RUN_TS"
-echo "Chunk selection     : backend=engine topk=$TOPK_CHUNKS chunk=$PC_CHUNK_SIZE score=$SCORE_MODE draft=$SCORE_DRAFT_TOKENS partial_rounds=$SCORE_DRAFT_PARTIAL_ROUNDS mask=$SCORE_ATTENTION_MASK"
+echo "Chunk selection     : backend=engine topk=$TOPK_CHUNKS chunk=$PC_CHUNK_SIZE score=$SCORE_MODE draft=$SCORE_DRAFT_TOKENS partial_rounds=$SCORE_DRAFT_PARTIAL_ROUNDS batch=$SCORE_BATCH_SIZE mask=$SCORE_ATTENTION_MASK"
 echo "Token eviction      : capacity=$TOKEN_CAPACITY granularity=$TOKEN_EVICTION_GRANULARITY backend=engine score_backend=$TOKEN_SCORE_BACKEND layers=$TOKEN_SCORE_LAYER_MODE:$TOKEN_SCORE_LAYERS pool=$TOKEN_SCORE_POOLING/$TOKEN_SCORE_POOL_KERNEL"
 echo "Prefill sparse      : mode=$PREFILL_SPARSE_MODE delta=$PREFILL_DELTA_MODE stride=$PREFILL_DELTA_STRIDE left=$PREFILL_DELTA_LEFT scale=$PREFILL_DELTA_SCALE debug=$PREFILL_DELTA_DEBUG"
 echo "Decode setting      : FastDLLMDreamEngine block=$BLOCK_LENGTH max_new=$MAX_NEW_TOKENS delta=$DECODE_DELTA_MODE stride=$DECODE_DELTA_STRIDE left=$DECODE_DELTA_LEFT scale=$DECODE_DELTA_SCALE debug=$DECODE_DELTA_DEBUG"
@@ -275,6 +276,7 @@ score_mode = os.environ.get("SCORE_MODE", "draft_self_information")
 score_draft_tokens = env_int("SCORE_DRAFT_TOKENS", 4)
 score_draft_partial_rounds = env_int("SCORE_DRAFT_PARTIAL_ROUNDS", 1)
 score_draft_score_all_slots = env_bool("SCORE_DRAFT_SCORE_ALL_SLOTS", False)
+score_batch_size = env_int("SCORE_BATCH_SIZE", 8)
 score_attention_mask = os.environ.get("SCORE_ATTENTION_MASK", "causal")
 score_context_mode = os.environ.get("SCORE_CONTEXT_MODE", "single_chunk")
 chunk_position_mode = os.environ.get("CHUNK_POSITION_MODE", "continuous")
@@ -469,6 +471,7 @@ try:
             score_draft_score_all_slots=score_draft_score_all_slots,
             score_attention_mask=score_attention_mask,
             score_context_mode=score_context_mode,
+            score_batch_size=score_batch_size,
             keep_first_chunk=keep_first_chunk,
         )
         eviction_query_ids = token_eviction_query_ids(
@@ -604,6 +607,7 @@ try:
                 "score_mode": score_mode,
                 "score_draft_tokens": score_draft_tokens,
                 "score_draft_partial_rounds": score_draft_partial_rounds,
+                "score_batch_size": score_batch_size,
                 "score_attention_mask": score_attention_mask,
                 "score_context_mode": score_context_mode,
                 "cache_build_mode_label": os.environ["CACHE_BUILD_MODE"],
@@ -698,6 +702,7 @@ try:
                     "score_mode": score_mode,
                     "score_draft_tokens": score_draft_tokens,
                     "score_draft_partial_rounds": score_draft_partial_rounds,
+                    "score_batch_size": score_batch_size,
                     "score_attention_mask": score_attention_mask,
                     "score_context_mode": score_context_mode,
                     "token_capacity": token_capacity,

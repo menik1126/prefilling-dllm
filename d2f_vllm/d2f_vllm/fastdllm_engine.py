@@ -938,8 +938,21 @@ class FastDLLMDreamEngine:
     ) -> torch.Tensor:
         mode = (mode or "full").lower()
         device = torch.cuda.current_device()
-        if mode in {"full", "none"}:
+        if mode in {"none", "raw_full"}:
             return torch.ones((seq_len, seq_len), dtype=torch.bool, device=device)
+        if mode == "full":
+            mask = torch.zeros((seq_len, seq_len), dtype=torch.bool, device=device)
+            prefix_len = int(prefix_len)
+            chunk_len = int(chunk_len)
+            chunk_end = prefix_len + chunk_len
+            for row in range(seq_len):
+                if row < prefix_len:
+                    mask[row, :row + 1] = True
+                elif row < chunk_end:
+                    mask[row, :chunk_end] = True
+                else:
+                    mask[row, :row + 1] = True
+            return mask
         if mode == "causal":
             return torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
         if mode == "query_to_chunk":
@@ -978,6 +991,36 @@ class FastDLLMDreamEngine:
             need_kv_cache_store=need_kv_cache_store,
         )
 
+    def _set_prefill_context_from_masks(
+        self,
+        attention_masks: Sequence[torch.Tensor],
+        slot_mapping: torch.Tensor,
+        *,
+        need_kv_cache_store: bool = False,
+    ) -> None:
+        seq_lens = [int(mask.shape[0]) for mask in attention_masks]
+        cu = [0]
+        for seq_len in seq_lens:
+            cu.append(cu[-1] + seq_len)
+        seqs = [_StaticMaskSeq(mask, self.block_length) for mask in attention_masks]
+        seq_lens_ts = torch.tensor(seq_lens, dtype=torch.int32, device=torch.cuda.current_device())
+        cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=torch.cuda.current_device())
+        set_context_diffusion_lm(
+            True,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max(seq_lens) if seq_lens else 0,
+            max_seqlen_k=max(seq_lens) if seq_lens else 0,
+            slot_mapping=slot_mapping.to(dtype=torch.int32),
+            context_lens=torch.zeros(len(seq_lens), dtype=torch.int32, device=torch.cuda.current_device()),
+            block_tables=None,
+            seqs=seqs,
+            seq_lens=seq_lens,
+            seq_lens_ts=seq_lens_ts,
+            kv_cache_layout=self.config.kv_cache_layout,
+            need_kv_cache_store=need_kv_cache_store,
+        )
+
     def _forward_prefill_for_selection(
         self,
         ids: Sequence[int],
@@ -1010,6 +1053,45 @@ class FastDLLMDreamEngine:
         finally:
             reset_context_diffusion_lm()
 
+    def _forward_prefill_batch_for_selection(
+        self,
+        rows: Sequence[Sequence[int]],
+        *,
+        attention_mask: str = "full",
+        prefix_len: int = 0,
+        chunk_len: int = 0,
+        query_len: Optional[int] = None,
+    ) -> List[torch.Tensor]:
+        rows = [[int(x) for x in row] for row in rows if row]
+        if not rows:
+            return []
+        seq_len = len(rows[0])
+        if any(len(row) != seq_len for row in rows):
+            raise ValueError("Batched selection prefill requires equal-length rows.")
+        if query_len is None:
+            query_len = max(0, seq_len - int(prefix_len) - int(chunk_len))
+        flat_ids = [token_id for row in rows for token_id in row]
+        input_ids = self._ids_tensor(flat_ids)
+        positions = torch.cat([self._positions(seq_len, 0) for _ in rows], dim=0)
+        slot_mapping = torch.arange(len(flat_ids), dtype=torch.int32, device=torch.cuda.current_device())
+        masks = [
+            self._selection_prefill_mask(
+                attention_mask,
+                seq_len=seq_len,
+                prefix_len=int(prefix_len),
+                chunk_len=int(chunk_len),
+                query_len=int(query_len),
+            )
+            for _ in rows
+        ]
+        self._set_prefill_context_from_masks(masks, slot_mapping, need_kv_cache_store=False)
+        try:
+            hidden = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden)
+            return list(torch.split(logits, [seq_len] * len(rows), dim=0))
+        finally:
+            reset_context_diffusion_lm()
+
     @torch.inference_mode()
     def generate_partial_draft_rounds_for_selection(
         self,
@@ -1028,7 +1110,7 @@ class FastDLLMDreamEngine:
 
         logits = self._forward_prefill_for_selection(
             prompt_ids + block_ids,
-            attention_mask="full",
+            attention_mask="raw_full",
             prefix_len=prompt_len,
             chunk_len=0,
             query_len=draft_len,
@@ -1044,7 +1126,7 @@ class FastDLLMDreamEngine:
                 break
             logits = self._forward_prefill_for_selection(
                 prompt_ids + block_ids,
-                attention_mask="full",
+                attention_mask="raw_full",
                 prefix_len=prompt_len,
                 chunk_len=0,
                 query_len=draft_len,
@@ -1151,6 +1233,91 @@ class FastDLLMDreamEngine:
         token_nll = -log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
         return float(-token_nll.mean().item())
 
+    @torch.inference_mode()
+    def score_chunks_self_information_engine_batched(
+        self,
+        prefix_ids: Sequence[int],
+        candidate_chunks: Sequence[Sequence[int]],
+        query_ids: Sequence[int],
+        *,
+        score_token_count: Optional[int] = None,
+        score_token_mask: Optional[Sequence[bool]] = None,
+        score_attention_mask: str = "causal",
+        score_batch_size: int = 8,
+    ) -> Dict[int, float]:
+        prefix_ids = [int(x) for x in prefix_ids]
+        query_ids = [int(x) for x in query_ids]
+        if not query_ids:
+            return {idx: float("-inf") for idx in range(len(candidate_chunks))}
+
+        prefix_len = len(prefix_ids)
+        query_len = len(query_ids)
+        groups: Dict[int, List[Tuple[int, List[int]]]] = {}
+        scores: Dict[int, float] = {}
+        for idx, chunk_ids in enumerate(candidate_chunks):
+            chunk_ids = [int(x) for x in chunk_ids]
+            if not chunk_ids:
+                scores[idx] = float("-inf")
+                continue
+            groups.setdefault(len(chunk_ids), []).append((idx, chunk_ids))
+
+        batch_size = max(1, int(score_batch_size or 1))
+        for chunk_len, group in groups.items():
+            if score_token_mask is not None:
+                if len(score_token_mask) != query_len:
+                    for idx, _ in group:
+                        scores[idx] = float("-inf")
+                    continue
+                local_indices = [idx for idx, keep in enumerate(score_token_mask) if keep]
+                if not local_indices:
+                    for idx, _ in group:
+                        scores[idx] = float("-inf")
+                    continue
+                label_positions = [prefix_len + chunk_len + idx for idx in local_indices]
+                label_ids = [query_ids[idx] for idx in local_indices]
+            elif score_token_count is None:
+                start = prefix_len + chunk_len
+                end = prefix_len + chunk_len + query_len
+                label_positions = list(range(start, end))
+                label_ids = query_ids
+            else:
+                target_len = min(query_len, max(0, int(score_token_count)))
+                if target_len <= 0:
+                    for idx, _ in group:
+                        scores[idx] = float("-inf")
+                    continue
+                start = prefix_len + chunk_len
+                end = start + target_len
+                label_positions = list(range(start, end))
+                label_ids = query_ids[:target_len]
+            if not label_positions or min(label_positions) <= 0:
+                for idx, _ in group:
+                    scores[idx] = float("-inf")
+                continue
+
+            positions = torch.tensor(label_positions, device=torch.cuda.current_device(), dtype=torch.long)
+            labels = torch.tensor(label_ids, device=torch.cuda.current_device(), dtype=torch.long)
+            for offset in range(0, len(group), batch_size):
+                batch = group[offset:offset + batch_size]
+                rows = [prefix_ids + chunk_ids + query_ids for _, chunk_ids in batch]
+                batch_logits = self._forward_prefill_batch_for_selection(
+                    rows,
+                    attention_mask=score_attention_mask,
+                    prefix_len=prefix_len,
+                    chunk_len=chunk_len,
+                    query_len=query_len,
+                )
+                for (idx, _), logits in zip(batch, batch_logits):
+                    if int(positions.max().item()) - 1 >= logits.shape[0]:
+                        scores[idx] = float("-inf")
+                        continue
+                    query_logits = logits.index_select(0, positions - 1)
+                    log_probs = F.log_softmax(query_logits.float(), dim=-1)
+                    token_nll = -log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+                    value = float(-token_nll.mean().item())
+                    scores[idx] = value if math.isfinite(value) else float("-inf")
+        return scores
+
     def select_chunks_by_engine(
         self,
         prefix_ids: Sequence[int],
@@ -1164,6 +1331,7 @@ class FastDLLMDreamEngine:
         score_draft_score_all_slots: bool = False,
         score_attention_mask: str = "causal",
         score_context_mode: str = "single_chunk",
+        score_batch_size: int = 8,
         keep_first_chunk: bool = False,
     ) -> Tuple[List[int], Dict[int, float], List[int], Optional[List[bool]]]:
         if not candidate_chunks:
@@ -1186,17 +1354,15 @@ class FastDLLMDreamEngine:
         mode = (score_mode or "").lower()
         if mode not in {"self_information", "draft_self_information"}:
             raise ValueError(f"Engine chunk selection currently supports self_information/draft_self_information, got {score_mode!r}.")
-        scores: Dict[int, float] = {}
-        for idx, chunk_ids in enumerate(candidate_chunks):
-            score = self.score_chunk_self_information_engine(
-                prefix_ids,
-                chunk_ids,
-                selection_query_ids,
-                score_token_count=score_token_count,
-                score_token_mask=score_token_mask,
-                score_attention_mask=score_attention_mask,
-            )
-            scores[idx] = score if math.isfinite(score) else float("-inf")
+        scores = self.score_chunks_self_information_engine_batched(
+            prefix_ids,
+            candidate_chunks,
+            selection_query_ids,
+            score_token_count=score_token_count,
+            score_token_mask=score_token_mask,
+            score_attention_mask=score_attention_mask,
+            score_batch_size=score_batch_size,
+        )
         forced = [0] if keep_first_chunk and candidate_chunks else []
         remaining = [idx for idx in range(len(candidate_chunks)) if idx not in forced]
         ranked = sorted(remaining, key=lambda idx: scores.get(idx, float("-inf")), reverse=True)
