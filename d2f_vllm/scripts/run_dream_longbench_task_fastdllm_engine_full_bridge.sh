@@ -446,212 +446,221 @@ def generate_with_optional_pd(compressed):
 result_path = log_dir / f"longbench_{task}_fastdllm_engine_full_bridge_results_{run_ts}.json"
 compressed_path = log_dir / f"longbench_{task}_fastdllm_engine_full_bridge_compressed_{run_ts}.json"
 compressed_records = []
+results = []
 selection_t0 = time.time()
+selection_seconds = None
+decode_t0 = None
 template = prompt_templates[task]
 
-try:
-    for idx, example in enumerate(examples):
-        torch.cuda.set_device(0)
-        parts = render_prompt_parts(template, example, "\n")
-        prefix_ids = bos_ids(engine.tokenizer) + encode_fragment(engine.tokenizer, parts.get("prefix", ""))
-        context_ids = encode_fragment(engine.tokenizer, parts.get("context", ""))
-        query_ids = encode_fragment(engine.tokenizer, parts.get("query", ""))
-        scoring_query_ids = encode_fragment(engine.tokenizer, parts.get("scoring_query", "")) or list(query_ids)
 
-        candidate_chunks = split_token_chunks(context_ids, pc_chunk_size, split_from_tail=split_from_tail)
-        candidate_chunks = [maybe_prepend_bos_to_chunk(engine.tokenizer, chunk, pc_chunk_size, chunk_bos=chunk_bos) for chunk in candidate_chunks]
-        selected_indices, chunk_scores, selection_query_ids, score_token_mask = engine.select_chunks_by_engine(
-            prefix_ids,
-            candidate_chunks,
-            scoring_query_ids,
-            topk_chunks=topk_chunks,
-            score_mode=score_mode,
-            score_draft_tokens=score_draft_tokens,
-            score_draft_partial_rounds=score_draft_partial_rounds,
-            score_draft_score_all_slots=score_draft_score_all_slots,
-            score_attention_mask=score_attention_mask,
-            score_context_mode=score_context_mode,
-            score_batch_size=score_batch_size,
-            keep_first_chunk=keep_first_chunk,
-        )
-        eviction_query_ids = token_eviction_query_ids(
-            scoring_query_ids,
-            selection_query_ids,
-            score_token_mask,
-            token_score_use_generated,
-        )
+def current_selection_seconds():
+    return selection_seconds if selection_seconds is not None else time.time() - selection_t0
 
-        prompt_ids = list(prefix_ids)
-        prompt_positions = range_positions(0, len(prefix_ids))
-        active_prompt_positions = list(prompt_positions)
-        kept_context_tokens = 0
-        removed_context_tokens = 0
-        chunk_keep_counts = []
-        engine_per_head_chunk_spans = []
-        for chunk_order, chunk_idx in enumerate(selected_indices):
-            original_chunk_ids = list(candidate_chunks[chunk_idx])
-            chunk_start = chunk_rope_start(len(prefix_ids), chunk_order, chunk_idx, pc_chunk_size, chunk_position_mode)
-            original_chunk_positions = range_positions(chunk_start, len(original_chunk_ids))
-            full_span_start = len(prompt_ids)
-            kept_count = min(max(1, token_capacity), len(original_chunk_ids)) if token_capacity > 0 and original_chunk_ids else len(original_chunk_ids)
-            chunk_ids = list(original_chunk_ids)
-            chunk_positions = list(original_chunk_positions)
-            active_chunk_positions = original_chunk_positions[:kept_count]
-            full_span_end = full_span_start + len(chunk_ids)
-            engine_per_head_chunk_spans.append({"start": full_span_start, "end": full_span_end, "chunk_ids": original_chunk_ids})
-            kept_context_tokens += kept_count
-            removed_context_tokens += max(0, len(original_chunk_ids) - kept_count)
-            chunk_keep_counts.append(
-                {
-                    "chunk_index": int(chunk_idx),
-                    "original_tokens": len(original_chunk_ids),
-                    "kept_tokens": kept_count,
-                    "removed_tokens": max(0, len(original_chunk_ids) - kept_count),
-                    "union_kept_tokens": None,
-                    "chunk_selection_backend": "engine",
-                    "token_score_backend": f"engine:{token_score_backend}",
-                }
-            )
-            prompt_ids.extend(chunk_ids)
-            prompt_positions.extend(chunk_positions)
-            active_prompt_positions.extend(active_chunk_positions)
 
-        active_query_rope_start = final_query_rope_start(
-            len(prefix_ids), active_prompt_positions, len(selected_indices), pc_chunk_size, query_position_mode
-        )
-        full_query_rope_start = final_query_rope_start(
-            len(prefix_ids), prompt_positions, len(selected_indices), pc_chunk_size, query_position_mode
-        )
-        query_positions = range_positions(active_query_rope_start, len(query_ids))
-        full_query_positions = range_positions(full_query_rope_start, len(query_ids))
-        prompt_ids.extend(query_ids)
-        prompt_positions.extend(full_query_positions)
-        active_prompt_positions.extend(query_positions)
+def setting_payload():
+    return {
+        "chunk_selection_backend": "engine",
+        "token_score_backend": token_score_backend,
+        "topk_chunks": topk_chunks,
+        "parallelcomp_chunk_size": pc_chunk_size,
+        "score_mode": score_mode,
+        "score_draft_tokens": score_draft_tokens,
+        "score_draft_partial_rounds": score_draft_partial_rounds,
+        "score_batch_size": score_batch_size,
+        "score_attention_mask": score_attention_mask,
+        "score_context_mode": score_context_mode,
+        "cache_build_mode_label": os.environ["CACHE_BUILD_MODE"],
+        "chunk_position_mode": chunk_position_mode,
+        "query_position_mode": query_position_mode,
+        "token_capacity": token_capacity,
+        "token_score_query_window": token_score_query_window,
+        "token_score_layers": token_score_layers,
+        "token_score_layer_mode": token_score_layer_mode,
+        "token_score_reduce": token_score_reduce,
+        "token_score_pooling": token_score_pooling,
+        "token_score_pool_kernel": token_score_pool_kernel,
+        "token_score_direction": token_score_direction,
+        "token_score_keep": token_score_keep,
+        "token_attention_mask": token_attention_mask,
+        "token_score_backend": token_score_backend,
+        "token_eviction_granularity": token_eviction_granularity,
+        "max_model_len": max_model_len,
+        "max_new_tokens": max_new_tokens,
+        "block_length": block_length,
+        "threshold": threshold,
+        "pd_remote_engine": pd_remote_engine,
+        "pd_pipeline_overlap": pd_pipeline_overlap,
+        "pd_decode_device_start": pd_decode_device_start,
+        "prefill_sparse_mode": prefill_sparse_mode,
+        "prefill_delta_mode": prefill_delta_mode,
+        "prefill_delta_stride": prefill_delta_stride,
+        "prefill_delta_left": prefill_delta_left,
+        "prefill_delta_scale": prefill_delta_scale,
+        "prefill_delta_debug": prefill_delta_debug,
+        "decode_delta_mode": decode_delta_mode,
+        "decode_delta_stride": decode_delta_stride,
+        "decode_delta_left": decode_delta_left,
+        "decode_delta_scale": decode_delta_scale,
+        "decode_delta_debug": decode_delta_debug,
+    }
 
-        if len(prompt_ids) + max_new_tokens > max_model_len:
-            raise ValueError(
-                f"Compressed prompt too long for max_model_len={max_model_len}: idx={idx}, prompt={len(prompt_ids)}, max_new={max_new_tokens}"
-            )
-        keep_indices, engine_chunk_meta = engine.compute_prompt_keep_indices_per_layer_per_head(
-            full_prompt_len=len(prompt_ids),
-            prefix_ids=prefix_ids,
-            chunk_spans=engine_per_head_chunk_spans,
-            query_ids=eviction_query_ids,
-            token_capacity=token_capacity,
-            token_score_query_window=token_score_query_window,
-            token_score_layers=token_score_layers,
-            token_score_layer_mode=token_score_layer_mode,
-            token_score_reduce=token_score_reduce,
-            token_score_pooling=token_score_pooling,
-            token_score_pool_kernel=token_score_pool_kernel,
-            token_score_direction=token_score_direction,
-            token_score_keep=token_score_keep,
-            token_score_include_prefix=token_score_include_prefix,
-            token_attention_mask=token_attention_mask,
-            token_score_backend=token_score_backend,
-        )
-        active_len = len(keep_indices[0][0]) if keep_indices and keep_indices[0] else 0
-        if active_len != len(active_prompt_positions):
-            raise ValueError(f"engine active length mismatch: keep={active_len}, positions={len(active_prompt_positions)}")
-        for chunk_count, engine_meta in zip(chunk_keep_counts, engine_chunk_meta):
-            chunk_count["union_kept_tokens"] = int(engine_meta["union_kept_tokens"])
 
-        compressed_records.append(
-            {
-                "idx": start_index + idx,
-                "example_id": example.get("_id", idx),
-                "prompt_ids": prompt_ids,
-                "prompt_positions": prompt_positions,
-                "active_prompt_positions": active_prompt_positions,
-                "prompt_keep_indices_per_layer_per_head": keep_indices,
-                "engine_token_eviction": None,
-                "selected_chunk_indices": selected_indices,
-                "chunk_scores": {str(k): float(v) for k, v in chunk_scores.items()},
-                "prompt_meta": {
-                    "prefix_tokens": len(prefix_ids),
-                    "context_tokens": len(context_ids),
-                    "kept_context_tokens": kept_context_tokens,
-                    "removed_context_tokens": removed_context_tokens,
-                    "query_tokens": len(query_ids),
-                    "scoring_query_tokens": len(scoring_query_ids),
-                    "candidate_chunks": len(candidate_chunks),
-                    "chunk_keep_counts": chunk_keep_counts,
-                    "compressed_prompt_tokens": len(prompt_ids),
-                    "active_prompt_tokens": len(active_prompt_positions),
-                    "max_position": max(prompt_positions) if prompt_positions else -1,
-                    "query_rope_start": active_query_rope_start,
-                    "full_query_rope_start": full_query_rope_start,
-                    "selection_query_tokens": len(selection_query_ids),
-                    "score_token_mask_true": sum(1 for x in score_token_mask if x) if score_token_mask is not None else None,
-                    "chunk_selection_backend": "engine",
-                    "token_score_backend": f"engine:{token_score_backend}",
-                },
-            }
-        )
-        if (idx + 1) % 10 == 0 or idx + 1 == len(examples):
-            print(f"  selected+kept {idx + 1}/{len(examples)}", flush=True)
-
-    selection_seconds = time.time() - selection_t0
+def save_compressed_records():
     save_json(
         compressed_path,
         {
             "task": task,
             "run_ts": run_ts,
             "bridge_mode": bridge_mode,
-            "selection_seconds": selection_seconds,
-            "setting": {
-                "chunk_selection_backend": "engine",
-                "token_score_backend": token_score_backend,
-                "topk_chunks": topk_chunks,
-                "parallelcomp_chunk_size": pc_chunk_size,
-                "score_mode": score_mode,
-                "score_draft_tokens": score_draft_tokens,
-                "score_draft_partial_rounds": score_draft_partial_rounds,
-                "score_batch_size": score_batch_size,
-                "score_attention_mask": score_attention_mask,
-                "score_context_mode": score_context_mode,
-                "cache_build_mode_label": os.environ["CACHE_BUILD_MODE"],
-                "chunk_position_mode": chunk_position_mode,
-                "query_position_mode": query_position_mode,
-                "token_capacity": token_capacity,
-                "token_score_query_window": token_score_query_window,
-                "token_score_layers": token_score_layers,
-                "token_score_layer_mode": token_score_layer_mode,
-                "token_score_reduce": token_score_reduce,
-                "token_score_pooling": token_score_pooling,
-                "token_score_pool_kernel": token_score_pool_kernel,
-                "token_score_direction": token_score_direction,
-                "token_score_keep": token_score_keep,
-                "token_attention_mask": token_attention_mask,
-                "token_score_backend": token_score_backend,
-                "token_eviction_granularity": token_eviction_granularity,
-                "pd_remote_engine": pd_remote_engine,
-                "pd_pipeline_overlap": pd_pipeline_overlap,
-                "pd_decode_device_start": pd_decode_device_start,
-                "prefill_sparse_mode": prefill_sparse_mode,
-                "prefill_delta_mode": prefill_delta_mode,
-                "prefill_delta_stride": prefill_delta_stride,
-                "prefill_delta_left": prefill_delta_left,
-                "prefill_delta_scale": prefill_delta_scale,
-                "prefill_delta_debug": prefill_delta_debug,
-                "decode_delta_mode": decode_delta_mode,
-                "decode_delta_stride": decode_delta_stride,
-                "decode_delta_left": decode_delta_left,
-                "decode_delta_scale": decode_delta_scale,
-                "decode_delta_debug": decode_delta_debug,
-            },
+            "selection_seconds": current_selection_seconds(),
+            "setting": setting_payload(),
             "records": compressed_records,
         },
     )
-    print(f"Compressed prompts saved to: {compressed_path}", flush=True)
-    print(f"Engine selection+keep time: {selection_seconds:.2f}s", flush=True)
 
-    if dry_run:
-        print("DRY_RUN=1, stopping after engine selection+keep.", flush=True)
-        raise SystemExit(0)
 
-    results = []
-    decode_t0 = time.time()
+def build_compressed_record(idx, example):
+    torch.cuda.set_device(0)
+    parts = render_prompt_parts(template, example, "\n")
+    prefix_ids = bos_ids(engine.tokenizer) + encode_fragment(engine.tokenizer, parts.get("prefix", ""))
+    context_ids = encode_fragment(engine.tokenizer, parts.get("context", ""))
+    query_ids = encode_fragment(engine.tokenizer, parts.get("query", ""))
+    scoring_query_ids = encode_fragment(engine.tokenizer, parts.get("scoring_query", "")) or list(query_ids)
+
+    candidate_chunks = split_token_chunks(context_ids, pc_chunk_size, split_from_tail=split_from_tail)
+    candidate_chunks = [maybe_prepend_bos_to_chunk(engine.tokenizer, chunk, pc_chunk_size, chunk_bos=chunk_bos) for chunk in candidate_chunks]
+    selected_indices, chunk_scores, selection_query_ids, score_token_mask = engine.select_chunks_by_engine(
+        prefix_ids,
+        candidate_chunks,
+        scoring_query_ids,
+        topk_chunks=topk_chunks,
+        score_mode=score_mode,
+        score_draft_tokens=score_draft_tokens,
+        score_draft_partial_rounds=score_draft_partial_rounds,
+        score_draft_score_all_slots=score_draft_score_all_slots,
+        score_attention_mask=score_attention_mask,
+        score_context_mode=score_context_mode,
+        score_batch_size=score_batch_size,
+        keep_first_chunk=keep_first_chunk,
+    )
+    eviction_query_ids = token_eviction_query_ids(
+        scoring_query_ids,
+        selection_query_ids,
+        score_token_mask,
+        token_score_use_generated,
+    )
+
+    prompt_ids = list(prefix_ids)
+    prompt_positions = range_positions(0, len(prefix_ids))
+    active_prompt_positions = list(prompt_positions)
+    kept_context_tokens = 0
+    removed_context_tokens = 0
+    chunk_keep_counts = []
+    engine_per_head_chunk_spans = []
+    for chunk_order, chunk_idx in enumerate(selected_indices):
+        original_chunk_ids = list(candidate_chunks[chunk_idx])
+        chunk_start = chunk_rope_start(len(prefix_ids), chunk_order, chunk_idx, pc_chunk_size, chunk_position_mode)
+        original_chunk_positions = range_positions(chunk_start, len(original_chunk_ids))
+        full_span_start = len(prompt_ids)
+        kept_count = min(max(1, token_capacity), len(original_chunk_ids)) if token_capacity > 0 and original_chunk_ids else len(original_chunk_ids)
+        chunk_ids = list(original_chunk_ids)
+        chunk_positions = list(original_chunk_positions)
+        active_chunk_positions = original_chunk_positions[:kept_count]
+        full_span_end = full_span_start + len(chunk_ids)
+        engine_per_head_chunk_spans.append({"start": full_span_start, "end": full_span_end, "chunk_ids": original_chunk_ids})
+        kept_context_tokens += kept_count
+        removed_context_tokens += max(0, len(original_chunk_ids) - kept_count)
+        chunk_keep_counts.append(
+            {
+                "chunk_index": int(chunk_idx),
+                "original_tokens": len(original_chunk_ids),
+                "kept_tokens": kept_count,
+                "removed_tokens": max(0, len(original_chunk_ids) - kept_count),
+                "union_kept_tokens": None,
+                "chunk_selection_backend": "engine",
+                "token_score_backend": f"engine:{token_score_backend}",
+            }
+        )
+        prompt_ids.extend(chunk_ids)
+        prompt_positions.extend(chunk_positions)
+        active_prompt_positions.extend(active_chunk_positions)
+
+    active_query_rope_start = final_query_rope_start(
+        len(prefix_ids), active_prompt_positions, len(selected_indices), pc_chunk_size, query_position_mode
+    )
+    full_query_rope_start = final_query_rope_start(
+        len(prefix_ids), prompt_positions, len(selected_indices), pc_chunk_size, query_position_mode
+    )
+    query_positions = range_positions(active_query_rope_start, len(query_ids))
+    full_query_positions = range_positions(full_query_rope_start, len(query_ids))
+    prompt_ids.extend(query_ids)
+    prompt_positions.extend(full_query_positions)
+    active_prompt_positions.extend(query_positions)
+
+    if len(prompt_ids) + max_new_tokens > max_model_len:
+        raise ValueError(
+            f"Compressed prompt too long for max_model_len={max_model_len}: idx={idx}, prompt={len(prompt_ids)}, max_new={max_new_tokens}"
+        )
+    keep_indices, engine_chunk_meta = engine.compute_prompt_keep_indices_per_layer_per_head(
+        full_prompt_len=len(prompt_ids),
+        prefix_ids=prefix_ids,
+        chunk_spans=engine_per_head_chunk_spans,
+        query_ids=eviction_query_ids,
+        token_capacity=token_capacity,
+        token_score_query_window=token_score_query_window,
+        token_score_layers=token_score_layers,
+        token_score_layer_mode=token_score_layer_mode,
+        token_score_reduce=token_score_reduce,
+        token_score_pooling=token_score_pooling,
+        token_score_pool_kernel=token_score_pool_kernel,
+        token_score_direction=token_score_direction,
+        token_score_keep=token_score_keep,
+        token_score_include_prefix=token_score_include_prefix,
+        token_attention_mask=token_attention_mask,
+        token_score_backend=token_score_backend,
+    )
+    active_len = len(keep_indices[0][0]) if keep_indices and keep_indices[0] else 0
+    if active_len != len(active_prompt_positions):
+        raise ValueError(f"engine active length mismatch: keep={active_len}, positions={len(active_prompt_positions)}")
+    for chunk_count, engine_meta in zip(chunk_keep_counts, engine_chunk_meta):
+        chunk_count["union_kept_tokens"] = int(engine_meta["union_kept_tokens"])
+
+    if (idx + 1) % 10 == 0 or idx + 1 == len(examples):
+        print(f"  selected+kept {idx + 1}/{len(examples)}", flush=True)
+
+    return {
+        "idx": start_index + idx,
+        "example_id": example.get("_id", idx),
+        "prompt_ids": prompt_ids,
+        "prompt_positions": prompt_positions,
+        "active_prompt_positions": active_prompt_positions,
+        "prompt_keep_indices_per_layer_per_head": keep_indices,
+        "engine_token_eviction": None,
+        "selected_chunk_indices": selected_indices,
+        "chunk_scores": {str(k): float(v) for k, v in chunk_scores.items()},
+        "prompt_meta": {
+            "prefix_tokens": len(prefix_ids),
+            "context_tokens": len(context_ids),
+            "kept_context_tokens": kept_context_tokens,
+            "removed_context_tokens": removed_context_tokens,
+            "query_tokens": len(query_ids),
+            "scoring_query_tokens": len(scoring_query_ids),
+            "candidate_chunks": len(candidate_chunks),
+            "chunk_keep_counts": chunk_keep_counts,
+            "compressed_prompt_tokens": len(prompt_ids),
+            "active_prompt_tokens": len(active_prompt_positions),
+            "max_position": max(prompt_positions) if prompt_positions else -1,
+            "query_rope_start": active_query_rope_start,
+            "full_query_rope_start": full_query_rope_start,
+            "selection_query_tokens": len(selection_query_ids),
+            "score_token_mask_true": sum(1 for x in score_token_mask if x) if score_token_mask is not None else None,
+            "chunk_selection_backend": "engine",
+            "token_score_backend": f"engine:{token_score_backend}",
+        },
+    }
+
+
+try:
 
     def append_result(idx, example, compressed, output):
         raw_prediction = output.text
@@ -691,70 +700,70 @@ try:
                 "bridge_mode": bridge_mode,
                 "completed": len(results),
                 "total": len(examples),
-                "selection_seconds": selection_seconds,
-                "decode_seconds": time.time() - decode_t0,
+                "selection_seconds": current_selection_seconds(),
+                "decode_seconds": time.time() - decode_t0 if decode_t0 is not None else 0.0,
                 "metrics": metrics,
-                "setting": {
-                    "chunk_selection_backend": "engine",
-                    "token_score_backend": token_score_backend,
-                    "topk_chunks": topk_chunks,
-                    "parallelcomp_chunk_size": pc_chunk_size,
-                    "score_mode": score_mode,
-                    "score_draft_tokens": score_draft_tokens,
-                    "score_draft_partial_rounds": score_draft_partial_rounds,
-                    "score_batch_size": score_batch_size,
-                    "score_attention_mask": score_attention_mask,
-                    "score_context_mode": score_context_mode,
-                    "token_capacity": token_capacity,
-                    "token_score_layer_mode": token_score_layer_mode,
-                    "token_score_layers": token_score_layers,
-                    "max_model_len": max_model_len,
-                    "max_new_tokens": max_new_tokens,
-                    "block_length": block_length,
-                    "threshold": threshold,
-                    "pd_remote_engine": pd_remote_engine,
-                    "pd_pipeline_overlap": pd_pipeline_overlap,
-                    "pd_decode_device_start": pd_decode_device_start,
-                    "prefill_sparse_mode": prefill_sparse_mode,
-                    "prefill_delta_mode": prefill_delta_mode,
-                    "prefill_delta_stride": prefill_delta_stride,
-                    "prefill_delta_left": prefill_delta_left,
-                    "prefill_delta_scale": prefill_delta_scale,
-                    "prefill_delta_debug": prefill_delta_debug,
-                    "decode_delta_mode": decode_delta_mode,
-                    "decode_delta_stride": decode_delta_stride,
-                    "decode_delta_left": decode_delta_left,
-                    "decode_delta_scale": decode_delta_scale,
-                    "decode_delta_debug": decode_delta_debug,
-                },
+                "setting": setting_payload(),
                 "results": results,
             }
             save_json(result_path, payload)
+            save_compressed_records()
             print(f"completed={len(results)}/{len(examples)} score={metrics['score']:.2f} decode_seconds={time.time() - decode_t0:.2f}", flush=True)
 
-    if pd_remote_engine and pd_pipeline_overlap:
+    if pd_remote_engine and pd_pipeline_overlap and not dry_run:
         def prepare_item(item):
-            _idx, _example, compressed = item
-            return prepare_pd_decode_record(compressed)
+            global selection_seconds
+            idx, example = item
+            compressed = build_compressed_record(idx, example)
+            record = prepare_pd_decode_record(compressed)
+            if idx + 1 == len(examples):
+                selection_seconds = time.time() - selection_t0
+            return compressed, record
 
-        def consume_item(item, record):
-            _idx, _example, _compressed = item
-            return decode_prepared_pd_record(record)
+        def consume_item(item, prepared):
+            compressed, record = prepared
+            return compressed, decode_prepared_pd_record(record)
 
-        decode_items = list(zip(range(len(examples)), examples, compressed_records))
-        for item, output in zip(
+        def release_prepared_item(prepared):
+            _compressed, record = prepared
+            release_prepared_pd_record(record)
+
+        decode_t0 = time.time()
+        decode_items = list(enumerate(examples))
+        print("Streaming PD overlap enabled: selection+prefill records overlap with decode.", flush=True)
+        for item, prepared_output in zip(
             decode_items,
             ordered_prefetch_map(
                 decode_items,
                 prepare=prepare_item,
                 consume=consume_item,
-                release_prepared=release_prepared_pd_record,
+                release_prepared=release_prepared_item,
             ),
         ):
-            idx, example, compressed = item
+            idx, example = item
+            compressed, output = prepared_output
+            compressed_records.append(compressed)
             append_result(idx, example, compressed, output)
             save_progress(idx)
+
+        if selection_seconds is None:
+            selection_seconds = time.time() - selection_t0
+        save_compressed_records()
+        print(f"Compressed prompts saved to: {compressed_path}", flush=True)
+        print(f"Streaming selection+decode time: {selection_seconds:.2f}s", flush=True)
     else:
+        for idx, example in enumerate(examples):
+            compressed_records.append(build_compressed_record(idx, example))
+        selection_seconds = time.time() - selection_t0
+        save_compressed_records()
+        print(f"Compressed prompts saved to: {compressed_path}", flush=True)
+        print(f"Engine selection+keep time: {selection_seconds:.2f}s", flush=True)
+
+        if dry_run:
+            print("DRY_RUN=1, stopping after engine selection+keep.", flush=True)
+            raise SystemExit(0)
+
+        decode_t0 = time.time()
         for idx, (example, compressed) in enumerate(zip(examples, compressed_records)):
             output = generate_with_optional_pd(compressed)
             append_result(idx, example, compressed, output)
