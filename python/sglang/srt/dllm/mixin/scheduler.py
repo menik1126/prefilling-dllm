@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.head_token_eviction import compact_prompt_kv_per_head
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.dllm.token_eviction import (
+    parallelcomp_chunk_query_len,
+    split_kept_kv_indices,
+)
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -19,6 +24,12 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+
+
+def _round_cache_loc(batch: ScheduleBatch, idx: int) -> torch.Tensor:
+    """KV slots the forward wrote for batch row ``idx``."""
+    cache_offset = sum(batch.extend_lens[:idx])
+    return batch.out_cache_loc[cache_offset : cache_offset + batch.extend_lens[idx]]
 
 
 class SchedulerDllmMixin:
@@ -83,6 +94,11 @@ class SchedulerDllmMixin:
             raise RuntimeError(
                 "dllm_parallelcomp currently requires KV cache page size 1"
             )
+        has_token_eviction = any(
+            req.dllm_token_eviction_state is not None for req in batch.reqs
+        )
+        if has_token_eviction and self.token_to_kv_pool_allocator.page_size != 1:
+            raise RuntimeError("dllm_token_eviction requires KV cache page size 1")
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
         if fdfo_mode:
@@ -107,6 +123,13 @@ class SchedulerDllmMixin:
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
+                if req.is_scoring_token_eviction():
+                    self._finish_token_eviction_score_round(
+                        req,
+                        round_cache_loc=_round_cache_loc(batch, idx),
+                        keep=result.dllm_head_keep_per_req[idx],
+                    )
+                    continue
                 parallelcomp = req.dllm_parallelcomp_state
                 if parallelcomp is not None and parallelcomp["stage"] != "decode":
                     cache_offset = sum(batch.extend_lens[:idx])
@@ -127,9 +150,11 @@ class SchedulerDllmMixin:
                         req.dllm_phase = DllmReqPhase.STAGING_PREFILL
                     else:
                         query_len = parallelcomp["query_len"]
+                        chunk_query_len = parallelcomp_chunk_query_len(parallelcomp)
+                        eviction = parallelcomp["token_eviction"]
                         chunk_batch = list(req.parallelcomp_chunk_batch_range())
                         expected_kv_len = sum(
-                            parallelcomp["chunk_lens"][cursor] + query_len
+                            parallelcomp["chunk_lens"][cursor] + chunk_query_len
                             for cursor in chunk_batch
                         )
                         if len(round_cache_loc) != expected_kv_len:
@@ -137,17 +162,26 @@ class SchedulerDllmMixin:
                                 "ParallelComp batched chunk KV span mismatch: "
                                 f"kv={len(round_cache_loc)}, "
                                 f"expected={expected_kv_len}, "
-                                f"chunks={chunk_batch}, query={query_len}"
+                                f"chunks={chunk_batch}, query={chunk_query_len}"
                             )
                         cache_cursor = 0
-                        for cursor in chunk_batch:
+                        for chunk_order, cursor in enumerate(chunk_batch):
                             chunk_len = parallelcomp["chunk_lens"][cursor]
                             chunk_end = cache_cursor + chunk_len
-                            query_end = chunk_end + query_len
+                            query_end = chunk_end + chunk_query_len
+                            chunk_kv_indices = round_cache_loc[cache_cursor:chunk_end]
+                            if eviction is not None:
+                                kept = result.dllm_token_keep_per_req[idx][chunk_order]
+                                chunk_kv_indices, evicted = split_kept_kv_indices(
+                                    chunk_kv_indices, kept
+                                )
+                                eviction.kept_positions.append(kept)
+                                if len(evicted):
+                                    self.token_to_kv_pool_allocator.free(evicted)
                             parallelcomp["chunk_kv_indices"].append(
-                                round_cache_loc[cache_cursor:chunk_end].clone()
+                                chunk_kv_indices.clone()
                             )
-                            if query_len:
+                            if chunk_query_len:
                                 self.token_to_kv_pool_allocator.free(
                                     round_cache_loc[chunk_end:query_end]
                                 )
@@ -183,6 +217,7 @@ class SchedulerDllmMixin:
                             )
                             parallelcomp["chunk_kv_indices"] = []
                             parallelcomp["stage"] = "decode"
+                            req.compact_parallelcomp_input_ids()
                             req.dllm_algo_state = {
                                 # The first decode forward contains only query
                                 # plus masks; cached chunks are in the page table.
@@ -434,6 +469,8 @@ class SchedulerDllmMixin:
                                     req.dllm_kv_indices = round_cache_loc[
                                         prompt_len:
                                     ].clone()
+                                    if req.dllm_token_eviction_state is not None:
+                                        self._evict_prompt_tokens_per_head(req)
                         else:
                             release_kv_cache(req, self.tree_cache, is_insert=False)
                     continue
@@ -511,6 +548,62 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _finish_token_eviction_score_round(
+        self: Scheduler,
+        req: Req,
+        *,
+        round_cache_loc: torch.Tensor,
+        keep: torch.Tensor,
+    ) -> None:
+        """Store one chunk's keep table and drop the scoring forward's KV."""
+        eviction = req.dllm_token_eviction_state
+        eviction.keep_positions[eviction.chunk_cursor] = keep
+        self.token_to_kv_pool_allocator.free(round_cache_loc)
+        req.prefix_indices = round_cache_loc[:0].clone()
+        req.kv.kv_allocated_len = 0
+        req.kv_committed_len = 0
+        eviction.advance()
+        if req.is_scoring_token_eviction():
+            req.dllm_phase = DllmReqPhase.STAGING_PREFILL
+            return
+        req.dllm_algo_state = {"prompt_len": len(req.origin_input_ids), "step": 0}
+        req.dllm_initialized = False
+        req.dllm_canvas_output_len = -1
+        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+
+    def _evict_prompt_tokens_per_head(self: Scheduler, req: Req) -> None:
+        """Compact the freshly prefilled prompt KV to each head's kept tokens."""
+        eviction = req.dllm_token_eviction_state
+        if not any(keep is not None for keep in eviction.keep_positions):
+            return
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        retained, evicted = compact_prompt_kv_per_head(
+            kv_buffers=[
+                kv_pool.get_kv_buffer(layer_id)
+                for layer_id in range(
+                    kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num
+                )
+            ],
+            prompt_slots=req.prefix_indices,
+            state=eviction,
+        )
+        self.token_to_kv_pool_allocator.free(evicted)
+
+        canvas_slots = req.dllm_kv_indices
+        prompt_len = len(retained)
+        seq_len = prompt_len + len(canvas_slots)
+        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        req_row[:prompt_len] = retained
+        req_row[prompt_len:seq_len] = canvas_slots
+        req.prefix_indices = retained
+        req.kv.kv_allocated_len = seq_len
+        req.kv_committed_len = seq_len
+
+        canvas = req.dllm_incomplete_ids
+        req.compact_token_eviction_input_ids()
+        req.full_untruncated_fill_ids = req.origin_input_ids + canvas
+        req.dllm_algo_state["prompt_len"] = prompt_len
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
@@ -695,7 +788,9 @@ class SchedulerDllmMixin:
             req.init_next_round_input(self.tree_cache)
             if self.dllm_config.needs_full_prefill and req.dllm_algo_state is not None:
                 parallelcomp = req.dllm_parallelcomp_state
-                if parallelcomp is not None and parallelcomp["stage"] != "decode":
+                if (
+                    parallelcomp is not None and parallelcomp["stage"] != "decode"
+                ) or req.is_scoring_token_eviction():
                     req.dllm_algo_state["prompt_len"] = len(
                         req.full_untruncated_fill_ids
                     )

@@ -5,11 +5,16 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
+from sglang.srt.dllm.head_token_eviction import accumulate_head_eviction_layer
+from sglang.srt.dllm.token_eviction import accumulate_token_eviction_layer
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    make_dream_score_full_attention_mask,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -17,6 +22,8 @@ if TYPE_CHECKING:
 
 
 class TorchNativeAttnBackend(AttentionBackend):
+    supports_dllm_attention_override: bool = True
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.forward_metadata = None
@@ -32,6 +39,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         # full->SWA translated out_cache_loc, computed once per forward
         self.swa_out_cache_loc = None
         self.parallelcomp_masks = None
+        self.score_full_masks = None
 
     @staticmethod
     def _make_sliding_window_mask(
@@ -101,6 +109,28 @@ class TorchNativeAttnBackend(AttentionBackend):
                 )
                 for prefix_len, item_lens in zip(prefix_lens, item_groups)
             ]
+        score_spans = forward_batch.dllm_score_full_spans
+        if score_spans is None:
+            self.score_full_masks = None
+        else:
+            if self.parallelcomp_masks is not None:
+                raise RuntimeError(
+                    "full Dream scoring cannot share a batch with ParallelComp"
+                )
+            if len(score_spans) != forward_batch.batch_size:
+                raise RuntimeError(
+                    "full Dream scoring spans do not match the request batch"
+                )
+            self.score_full_masks = [
+                make_dream_score_full_attention_mask(
+                    prefix_len,
+                    chunk_len,
+                    query_len,
+                    draft_len,
+                    device=forward_batch.input_ids.device,
+                )
+                for prefix_len, chunk_len, query_len, draft_len in score_spans
+            ]
 
     def _run_sdpa_forward_extend(
         self,
@@ -120,6 +150,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         is_cross_attn=False,
         sliding_window_size: Optional[int] = None,
         parallelcomp_masks: Optional[list[torch.Tensor]] = None,
+        score_full_masks: Optional[list[torch.Tensor]] = None,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -210,6 +241,15 @@ class TorchNativeAttnBackend(AttentionBackend):
                         f"kv={int(seq_len_kv)}"
                     )
                 attn_mask = parallelcomp_mask
+                is_causal = False
+            if score_full_masks is not None:
+                score_mask = score_full_masks[seq_idx]
+                if score_mask.shape != (int(seq_len_kv), int(seq_len_kv)):
+                    raise RuntimeError(
+                        "full Dream scoring torch attention layout mismatch: "
+                        f"mask={score_mask.shape}, kv={int(seq_len_kv)}"
+                    )
+                attn_mask = score_mask
                 is_causal = False
 
             per_req_out_redudant = (
@@ -361,6 +401,32 @@ class TorchNativeAttnBackend(AttentionBackend):
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        if forward_batch.dllm_token_eviction is not None and not (
+            layer.is_cross_attention
+        ):
+            accumulate_token_eviction_layer(
+                forward_batch.dllm_token_eviction,
+                q=q,
+                k=k,
+                key_buffer=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                num_q_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                head_dim=layer.qk_head_dim,
+                scaling=layer.scaling,
+            )
+        if forward_batch.dllm_head_eviction is not None and not (
+            layer.is_cross_attention
+        ):
+            accumulate_head_eviction_layer(
+                forward_batch.dllm_head_eviction,
+                q=q,
+                k=k,
+                num_q_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                head_dim=layer.qk_head_dim,
+                scaling=layer.scaling,
+            )
+
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -391,6 +457,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 else None
             ),
             parallelcomp_masks=self.parallelcomp_masks,
+            score_full_masks=self.score_full_masks,
         )
         return o
 

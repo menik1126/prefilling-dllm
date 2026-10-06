@@ -1,17 +1,49 @@
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from sglang.srt.dllm.head_token_eviction import (
+    STAGE_GENERATE,
+    STAGE_SCORE,
+    DllmHeadEvictionCapture,
+    DllmHeadEvictionConfig,
+    DllmHeadEvictionRequest,
+    accumulate_head_eviction_layer,
+    build_head_eviction_capture,
+    compact_input_ids,
+    compact_prompt_kv_per_head,
+    parse_head_token_eviction,
+    score_stage_input_ids,
+    stack_head_eviction_keep,
+)
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.dllm.token_eviction import (
+    DllmTokenEvictionCapture,
+    DllmTokenEvictionConfig,
+    DllmTokenEvictionRequest,
+    accumulate_token_eviction_layer,
+    select_kept_token_positions,
+    select_token_eviction_keep,
+    split_kept_kv_indices,
+)
+from sglang.srt.layers.attention.flashinfer_backend import (
+    FlashInferAttnBackend,
+    FlashInferIndicesUpdaterPrefill,
+)
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     _build_dllm_denoise_plan_key,
     _compute_dllm_positions,
+    _dllm_attention_override,
     _parallelcomp_force_causal,
+    _require_dllm_attention_override_backend,
+    _require_whole_score_rows,
+    make_dream_score_full_attention_mask,
 )
 
 
@@ -25,6 +57,7 @@ def test_sparse_query_positions_preserve_fixed_chunk_slots():
         ),
         origin_input_ids=list(range(7)),
         extend_range=SimpleNamespace(start=0, end=9),
+        dllm_token_eviction_state=None,
     )
 
     assert _compute_dllm_positions(req) == [0, 1, 2, 3, 4, 8, 9, 10, 11]
@@ -35,6 +68,7 @@ def test_sparse_query_positions_default_to_contiguous():
         sampling_params=SimpleNamespace(custom_params=None),
         origin_input_ids=list(range(7)),
         extend_range=SimpleNamespace(start=2, end=6),
+        dllm_token_eviction_state=None,
     )
 
     assert _compute_dllm_positions(req) == [2, 3, 4, 5]
@@ -45,6 +79,7 @@ def test_sparse_query_positions_reject_partial_metadata():
         sampling_params=SimpleNamespace(custom_params={"dllm_position_start": 5}),
         origin_input_ids=list(range(7)),
         extend_range=SimpleNamespace(start=0, end=7),
+        dllm_token_eviction_state=None,
     )
 
     with pytest.raises(ValueError, match="must be integers"):
@@ -87,6 +122,7 @@ def test_parallelcomp_retraction_restarts_from_common_prefix():
         dllm_parallelcomp_state={
             "stage": "decode",
             "prefix_len": 9,
+            "token_eviction": None,
             "chunk_cursor": 3,
             "common_prefix_indices": torch.tensor([1, 2]),
             "chunk_kv_indices": [torch.tensor([3])],
@@ -125,12 +161,96 @@ def test_causal_override_covers_chunk_stage_and_prompt_scoring():
         _parallelcomp_force_causal([score_req, ordinary_req])
 
 
+def test_score_mask_shows_the_query_but_not_the_draft_to_prefix_and_chunk():
+    """Query and draft rows must stay causal, or scored tokens see themselves."""
+    mask = make_dream_score_full_attention_mask(1, 2, 2, 2, device=torch.device("cpu"))
+    expected = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    assert torch.equal(mask, expected)
+
+
+def test_segmented_scoring_rejects_rows_not_computed_whole():
+    """A radix hit reuses KV built for another chunk, and chunked prefill
+    computes a row's head before its query is in the forward."""
+    _require_whole_score_rows(None, prefix_lens=[5], extend_lens=[3])
+    _require_whole_score_rows([(2, 3, 2, 0)], prefix_lens=[0], extend_lens=[7])
+    with pytest.raises(RuntimeError, match="disable-radix-cache"):
+        _require_whole_score_rows(
+            [(2, 3, 2, 0), (2, 3, 2, 0)], prefix_lens=[0, 2], extend_lens=[7, 5]
+        )
+    with pytest.raises(RuntimeError, match="chunked-prefill-size"):
+        _require_whole_score_rows(
+            [(2, 3, 2, 0), (2, 3, 2, 0)], prefix_lens=[0, 0], extend_lens=[7, 4]
+        )
+
+
+def test_full_score_attention_does_not_force_causal():
+    full_req = SimpleNamespace(
+        dllm_parallelcomp_state=None,
+        origin_input_ids=list(range(7)),
+        sampling_params=SimpleNamespace(
+            custom_params={
+                "dream_score_attention_mask": "full",
+                "dream_score_prefix_len": 2,
+                "dream_score_chunk_len": 3,
+                "dream_score_query_len": 1,
+                "dream_score_draft_len": 1,
+            }
+        ),
+    )
+    causal_req = SimpleNamespace(
+        dllm_parallelcomp_state=None,
+        origin_input_ids=list(range(4)),
+        sampling_params=SimpleNamespace(
+            custom_params={"dream_causal_prompt_logprob": True}
+        ),
+    )
+    ordinary_req = SimpleNamespace(
+        dllm_parallelcomp_state=None,
+        sampling_params=SimpleNamespace(custom_params=None),
+    )
+
+    force_causal, spans = _dllm_attention_override([full_req])
+    assert force_causal is False
+    assert spans == [(2, 3, 1, 1)]
+    with pytest.raises(RuntimeError, match="cannot share a batch"):
+        _dllm_attention_override([full_req, ordinary_req])
+    with pytest.raises(RuntimeError, match="cannot share a batch"):
+        _dllm_attention_override([full_req, causal_req])
+
+
+def test_attention_override_rejects_backends_that_ignore_it():
+    supported = SimpleNamespace(
+        attn_backend=SimpleNamespace(supports_dllm_attention_override=True)
+    )
+    unsupported = SimpleNamespace(
+        attn_backend=SimpleNamespace(supports_dllm_attention_override=False)
+    )
+
+    _require_dllm_attention_override_backend(supported)
+    with pytest.raises(RuntimeError, match="flashinfer and torch_native"):
+        _require_dllm_attention_override_backend(unsupported)
+    with pytest.raises(RuntimeError, match="flashinfer and torch_native"):
+        _require_dllm_attention_override_backend(SimpleNamespace())
+
+
 def test_parallelcomp_chunk_batch_has_independent_items_and_positions():
     req = SimpleNamespace(
         dllm_parallelcomp_state={
             "stage": "chunk",
             "prefix_len": 2,
             "query_len": 2,
+            "token_eviction": None,
             "chunk_lens": [3, 4, 2],
             "chunk_batch_size": 2,
             "chunk_cursor": 1,
@@ -175,6 +295,7 @@ def test_parallelcomp_torch_mask_is_cached_once_per_forward():
     forward_batch = SimpleNamespace(
         out_cache_loc=None,
         dllm_parallelcomp_item_lens=[[3, 2]],
+        dllm_score_full_spans=None,
         extend_prefix_lens_cpu=[2],
         input_ids=torch.arange(5),
     )
@@ -573,3 +694,549 @@ def test_flashinfer_denoise_single_paged_validates_page_table_canvas_once():
     backend._dllm_denoise_single_paged_layout_key = None
     with pytest.raises(RuntimeError, match="page-table canvas"):
         backend._validate_dllm_denoise_single_paged_layout(batch, geometry_key)
+
+
+def _dense_query_to_chunk_scores(
+    *, q, keys, prefix_len, chunk_len, scaling, pool_kernel
+):
+    """Reference: full causal attention over prefix + chunk + query, per head."""
+    num_q_heads, num_kv_heads = q.shape[1], keys.shape[1]
+    query_len = q.shape[0] - prefix_len - chunk_len
+    total = torch.zeros(chunk_len)
+    for head in range(num_q_heads):
+        head_keys = keys[:, head // (num_q_heads // num_kv_heads)].float()
+        logits = q[:, head].float() @ head_keys.T * scaling
+        logits = logits.masked_fill(
+            ~torch.ones_like(logits, dtype=torch.bool).tril(), float("-inf")
+        )
+        attention = torch.softmax(logits, dim=-1)
+        received = attention[-query_len:, prefix_len : prefix_len + chunk_len].sum(0)
+        pooled = torch.nn.functional.max_pool1d(
+            received[None, None],
+            kernel_size=pool_kernel,
+            padding=pool_kernel // 2,
+            stride=1,
+        )
+        total += pooled[0, 0, :chunk_len]
+    return total
+
+
+def test_token_eviction_scores_match_dense_causal_attention_per_item():
+    """Two chunks packed after a plain row must each score against only the
+    shared prefix and their own chunk + query rows."""
+    torch.manual_seed(0)
+    num_q_heads, num_kv_heads, head_dim, scaling = 4, 2, 8, 0.35
+    prefix_len, chunk_lens, query_len, plain_len = 3, [6, 4], 2, 5
+    prefix_slots = torch.tensor([9, 2, 7])
+    key_buffer = torch.randn(12, num_kv_heads, head_dim)
+    item_lens = [chunk_len + query_len for chunk_len in chunk_lens]
+    extend_len = sum(item_lens)
+    q = torch.randn(plain_len + extend_len, num_q_heads, head_dim)
+    k = torch.randn(plain_len + extend_len, num_kv_heads, head_dim)
+    prefix_q = torch.randn(prefix_len, num_q_heads, head_dim)
+
+    request = DllmTokenEvictionRequest(
+        config=DllmTokenEvictionConfig(capacity=3, pool_kernel=3),
+        prefix_kv_indices=prefix_slots,
+        chunk_lens=chunk_lens,
+        query_len=query_len,
+    )
+    capture = DllmTokenEvictionCapture(
+        requests=[None, request], extend_lens=[plain_len, extend_len]
+    )
+    for _ in range(2):
+        accumulate_token_eviction_layer(
+            capture,
+            q=q.reshape(-1, num_q_heads * head_dim),
+            k=k.reshape(-1, num_kv_heads * head_dim),
+            key_buffer=key_buffer,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            scaling=scaling,
+        )
+
+    item_start = plain_len
+    for chunk_order, chunk_len in enumerate(chunk_lens):
+        item_end = item_start + item_lens[chunk_order]
+        expected = _dense_query_to_chunk_scores(
+            q=torch.cat([prefix_q, q[item_start:item_end]]),
+            keys=torch.cat([key_buffer[prefix_slots], k[item_start:item_end]]),
+            prefix_len=prefix_len,
+            chunk_len=chunk_len,
+            scaling=scaling,
+            pool_kernel=3,
+        )
+        torch.testing.assert_close(
+            request.score_sums[chunk_order], 2 * expected, rtol=1e-5, atol=1e-6
+        )
+        item_start = item_end
+
+    keep = select_token_eviction_keep(capture)
+    assert keep[0] is None
+    assert [len(kept) for kept in keep[1]] == [3, 3]
+    assert all(kept[0] == 0 and kept == sorted(kept) for kept in keep[1])
+
+
+def test_token_eviction_keeps_bos_then_highest_scores_in_source_order():
+    scores = torch.tensor([0.0, 5.0, 1.0, 9.0, 3.0, 7.0])
+
+    assert select_kept_token_positions(
+        scores, capacity=3, force_keep_first=True
+    ).tolist() == [0, 3, 5]
+    assert select_kept_token_positions(
+        scores, capacity=3, force_keep_first=False
+    ).tolist() == [1, 3, 5]
+    assert select_kept_token_positions(
+        scores, capacity=1, force_keep_first=True
+    ).tolist() == [0]
+    # A chunk that already fits the budget is never reordered or trimmed.
+    assert select_kept_token_positions(
+        scores, capacity=6, force_keep_first=True
+    ).tolist() == [0, 1, 2, 3, 4, 5]
+
+
+def test_token_eviction_compacts_ids_kv_and_positions_consistently():
+    """After eviction the decode stage must see one id, one KV slot, and one
+    RoPE position per surviving token, and retraction must undo all of it."""
+    prefix_len, chunk_lens, query_len, max_new_tokens = 2, [4, 3], 3, 2
+    req = SimpleNamespace(
+        dllm_config=SimpleNamespace(
+            needs_full_prefill=True, dual_cache=True, first_done_first_out_mode=True
+        ),
+        origin_input_ids=list(
+            range(100, 100 + prefix_len + sum(chunk_lens) + query_len)
+        ),
+        sampling_params=SimpleNamespace(
+            max_new_tokens=max_new_tokens,
+            custom_params={
+                "dllm_parallelcomp": {
+                    "prefix_len": prefix_len,
+                    "chunk_lens": chunk_lens,
+                    "query_len": query_len,
+                    "chunk_batch_size": 2,
+                    "chunk_position_starts": [2, 1026],
+                    "query_position_start": 2050,
+                    "token_eviction": {"capacity": 2, "score_query_ids": [7, 8]},
+                }
+            },
+        ),
+    )
+    req.dllm_parallelcomp_state = ReqDllmMixin._parse_parallelcomp_state(req)
+    req.parallelcomp_chunk_batch_range = lambda: (
+        ReqDllmMixin.parallelcomp_chunk_batch_range(req)
+    )
+    state = req.dllm_parallelcomp_state
+    state["stage"] = "chunk"
+
+    # Chunk items carry the 2-token scoring query, not the 3-token real query.
+    assert ReqDllmMixin.parallelcomp_item_lens(req) == [6, 5]
+
+    kept_per_chunk = [[0, 2], [0, 1]]
+    chunk_slots = [torch.tensor([40, 41, 42, 43]), torch.tensor([50, 51, 52])]
+    retained = []
+    for slots, kept in zip(chunk_slots, kept_per_chunk):
+        kept_slots, evicted = split_kept_kv_indices(slots, kept)
+        assert len(kept_slots) + len(evicted) == len(slots)
+        retained.extend(kept_slots.tolist())
+        state["token_eviction"].kept_positions.append(kept)
+    assert retained == [40, 42, 50, 51]
+
+    state["stage"] = "decode"
+    ReqDllmMixin.compact_parallelcomp_input_ids(req)
+    assert list(req.origin_input_ids) == [100, 101, 102, 104, 106, 107, 109, 110, 111]
+    req.extend_range = SimpleNamespace(
+        start=0, end=len(req.origin_input_ids) + max_new_tokens
+    )
+    assert ReqDllmMixin.parallelcomp_position_values(req) == [
+        0,
+        1,
+        2,
+        4,
+        1026,
+        1027,
+        2050,
+        2051,
+        2052,
+        2053,
+        2054,
+    ]
+
+    ReqDllmMixin.reset_parallelcomp_prefill_state(req)
+    assert list(req.origin_input_ids) == list(range(100, 112))
+    assert state["token_eviction"].kept_positions == []
+
+
+def test_token_eviction_decode_stage_keeps_the_full_query_as_prompt():
+    """Chunk forwards append only the scoring window, but the decode stage must
+    still count the whole official query as prompt, or query tokens are
+    denoised as if they were generation slots."""
+    chunk_lens, query_len, window = [4, 3], 3, [7, 8]
+    req = SimpleNamespace(
+        dllm_config=SimpleNamespace(
+            needs_full_prefill=True, dual_cache=True, first_done_first_out_mode=True
+        ),
+        origin_input_ids=list(range(100, 100 + sum(chunk_lens) + query_len)),
+        sampling_params=SimpleNamespace(
+            max_new_tokens=2,
+            custom_params={
+                "dllm_parallelcomp": {
+                    "prefix_len": 0,
+                    "chunk_lens": chunk_lens,
+                    "query_len": query_len,
+                    "chunk_batch_size": 2,
+                    "token_eviction": {"capacity": 2, "score_query_ids": window},
+                }
+            },
+        ),
+        req_pool_idx=0,
+        kv=SimpleNamespace(kv_allocated_len=0),
+        kv_committed_len=0,
+        prefix_indices=torch.empty(0, dtype=torch.long),
+        dllm_token_eviction_state=None,
+        is_scoring_token_eviction=lambda: False,
+    )
+    req.dllm_parallelcomp_state = ReqDllmMixin._parse_parallelcomp_state(req)
+    req.parallelcomp_chunk_batch_range = lambda: (
+        ReqDllmMixin.parallelcomp_chunk_batch_range(req)
+    )
+    req.compact_parallelcomp_input_ids = lambda: (
+        ReqDllmMixin.compact_parallelcomp_input_ids(req)
+    )
+    freed = []
+    scheduler = SimpleNamespace(
+        dllm_config=req.dllm_config,
+        token_to_kv_pool_allocator=SimpleNamespace(
+            page_size=1,
+            free=lambda indices: freed.extend(indices.tolist()),
+            free_group_begin=MagicMock(),
+            free_group_end=MagicMock(),
+        ),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros((1, 16), dtype=torch.long)
+        ),
+        output_streamer=SimpleNamespace(stream_output=MagicMock()),
+        metrics_reporter=SimpleNamespace(report_prefill_stats=MagicMock()),
+    )
+    extend_len = sum(chunk_len + len(window) for chunk_len in chunk_lens)
+    batch = SimpleNamespace(
+        batch_size=lambda: 1,
+        reqs=[req],
+        extend_lens=[extend_len],
+        out_cache_loc=torch.arange(20, 20 + extend_len),
+        return_logprob=False,
+        prefill_stats=None,
+        dp_cooperation_info=None,
+    )
+    result = SimpleNamespace(
+        copy_done=None,
+        accept_length_per_req_cpu=None,
+        dllm_done_per_req_cpu=[False],
+        dllm_algo_state=[None],
+        dllm_token_keep_per_req=[[[0, 2], [0, 1]]],
+        next_token_ids=[[]],
+        can_run_cuda_graph=False,
+    )
+
+    SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, result)
+
+    assert req.dllm_parallelcomp_state["stage"] == "decode"
+    assert req.prefix_indices.tolist() == [20, 22, 26, 27]
+    # Evicted chunk slots and both scoring-window copies go back to the pool.
+    assert sorted(freed) == [21, 23, 24, 25, 28, 29, 30]
+    assert req.dllm_algo_state["prompt_len"] == query_len
+    assert req.dllm_algo_state["full_prompt_len"] == 4 + query_len
+    assert list(req.origin_input_ids) == [100, 102, 104, 105, 107, 108, 109]
+
+
+def test_flashinfer_single_wrapper_plans_with_the_dream_scoring_mask():
+    """The scoring mask must reach the paged planner; dropping it leaves Dream's
+    plain bidirectional attention, where every scored token sees itself."""
+    updater = object.__new__(FlashInferIndicesUpdaterPrefill)
+    updater.kv_indptr = [torch.zeros(4, dtype=torch.int32)]
+    updater.qo_indptr = [torch.zeros(4, dtype=torch.int32)]
+    updater._oversized_kv_indptr = None
+    updater._oversized_qo_indptr = None
+    updater.prefill_wrapper_ragged = None
+    planned = {}
+    updater.call_begin_forward = lambda *args, **kwargs: planned.update(kwargs)
+    mask = torch.ones(4, dtype=torch.uint8)
+    update_args = dict(
+        req_pool_indices=torch.tensor([0]),
+        seq_lens=torch.tensor([2]),
+        seq_lens_cpu=None,
+        seq_lens_sum=2,
+        prefix_lens=torch.tensor([0]),
+        prefill_wrappers=[object(), object()],
+        use_ragged=False,
+        encoder_lens=None,
+        spec_info=None,
+        self_attention_custom_mask=mask,
+    )
+
+    FlashInferIndicesUpdaterPrefill.update_single_wrapper(updater, **update_args)
+    assert planned["cross_attention_custom_mask"] is mask
+
+    with pytest.raises(RuntimeError, match="sliding-window"):
+        FlashInferIndicesUpdaterPrefill.update_sliding_window(updater, **update_args)
+    with pytest.raises(RuntimeError, match="cross-attention"):
+        FlashInferIndicesUpdaterPrefill.update_cross_attention(updater, **update_args)
+
+
+def _head_eviction_state(*, capacity=2, chunk_lens=(4, 2, 5), bidirectional=True):
+    # prefix [0, 1], chunks, query [90, 91, 92].
+    input_ids = array("q", [0, 1])
+    for chunk_order, chunk_len in enumerate(chunk_lens):
+        input_ids.extend(10 * (chunk_order + 1) + offset for offset in range(chunk_len))
+    input_ids.extend([90, 91, 92])
+    state = parse_head_token_eviction(
+        {
+            "capacity": capacity,
+            "prefix_len": 2,
+            "chunk_lens": list(chunk_lens),
+            "query_len": 3,
+            "score_query_window": 2,
+            "pool_kernel": 1,
+            "bidirectional": bidirectional,
+        },
+        input_ids=input_ids,
+    )
+    return state, input_ids
+
+
+def test_head_eviction_scores_only_oversized_chunks_then_generates():
+    state, input_ids = _head_eviction_state()
+
+    assert state.stage == STAGE_SCORE and state.chunk_cursor == 0
+    assert list(score_stage_input_ids(state, input_ids)) == [
+        0, 1, 10, 11, 12, 13, 91, 92,
+    ]  # fmt: skip
+
+    # The 2-token chunk already fits the capacity and is never scored.
+    state.advance()
+    assert state.stage == STAGE_SCORE and state.chunk_cursor == 2
+    assert list(score_stage_input_ids(state, input_ids)) == [
+        0, 1, 30, 31, 32, 33, 34, 91, 92,
+    ]  # fmt: skip
+
+    state.advance()
+    assert state.stage == STAGE_GENERATE
+
+    with pytest.raises(ValueError, match="do not cover the input"):
+        parse_head_token_eviction(
+            {"capacity": 2, "prefix_len": 2, "chunk_lens": [4], "query_len": 3},
+            input_ids=input_ids,
+        )
+
+
+@pytest.mark.parametrize("bidirectional", [True, False])
+def test_head_eviction_keeps_match_dense_unmasked_attention(bidirectional):
+    torch.manual_seed(0)
+    prefix_len, chunk_len, query_len = 2, 6, 2
+    seq_len = prefix_len + chunk_len + query_len
+    num_q_heads, num_kv_heads, head_dim, scaling = 4, 2, 8, 0.5
+    config = DllmHeadEvictionConfig(
+        capacity=3, pool_kernel=3, bidirectional=bidirectional
+    )
+    q = torch.randn(seq_len, num_q_heads * head_dim)
+    k = torch.randn(seq_len, num_kv_heads * head_dim)
+    capture = DllmHeadEvictionCapture(
+        requests=[
+            None,
+            DllmHeadEvictionRequest(
+                config=config,
+                prefix_len=prefix_len,
+                chunk_len=chunk_len,
+                query_len=query_len,
+            ),
+        ],
+        extend_lens=[5, seq_len],
+    )
+
+    accumulate_head_eviction_layer(
+        capture,
+        q=torch.cat([torch.randn(5, num_q_heads * head_dim), q]),
+        k=torch.cat([torch.randn(5, num_kv_heads * head_dim), k]),
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        scaling=scaling,
+    )
+    keep = stack_head_eviction_keep(capture, num_layers=1)
+
+    # Dense reference: every attention head attends the whole sequence.
+    q_heads = q.view(seq_len, num_q_heads, head_dim).permute(1, 0, 2)
+    k_heads = k.view(seq_len, num_kv_heads, head_dim).permute(1, 0, 2)
+    k_heads = k_heads.repeat_interleave(num_q_heads // num_kv_heads, dim=0)
+    probs = torch.softmax(q_heads @ k_heads.transpose(1, 2) * scaling, dim=-1)
+    chunk = slice(prefix_len, prefix_len + chunk_len)
+    tail = slice(prefix_len + chunk_len, seq_len)
+    scores = probs[:, tail, chunk].sum(dim=1)
+    if bidirectional:
+        scores = scores + probs[:, chunk, tail].sum(dim=2)
+    scores = torch.nn.functional.max_pool1d(
+        scores.unsqueeze(1), kernel_size=3, padding=1, stride=1
+    ).squeeze(1)
+    scores = scores.view(num_kv_heads, -1, chunk_len).mean(dim=1)
+    expected = torch.stack(
+        [
+            torch.cat(
+                [torch.zeros(1, dtype=torch.long), scores[head, 1:].topk(2).indices + 1]
+            )
+            .sort()
+            .values
+            for head in range(num_kv_heads)
+        ]
+    )
+
+    assert keep[0] is None
+    assert keep[1].shape == (1, num_kv_heads, 3)
+    assert torch.equal(keep[1][0], expected)
+    with pytest.raises(RuntimeError, match="scored 1 of 2 attention layers"):
+        stack_head_eviction_keep(capture, num_layers=2)
+
+
+def test_head_eviction_rejects_a_scoring_row_split_across_forwards():
+    state, _ = _head_eviction_state()
+
+    assert build_head_eviction_capture(states=[None, None], extend_lens=[4, 4]) is None
+    with pytest.raises(RuntimeError, match="chunked-prefill-size"):
+        build_head_eviction_capture(states=[state], extend_lens=[5])
+
+
+def test_head_eviction_gives_each_head_its_own_tokens_and_keeps_rope_positions():
+    state, input_ids = _head_eviction_state()
+    num_layers, num_kv_heads, head_dim = 2, 2, 1
+    # Layer 0: head 0 keeps chunk tokens {0, 3}, head 1 keeps {0, 1}.
+    first_chunk_keep = torch.tensor([[[0, 3], [0, 1]], [[0, 2], [0, 3]]])
+    last_chunk_keep = torch.tensor([[[0, 4], [0, 2]], [[0, 1], [0, 3]]])
+    state.keep_positions = [first_chunk_keep, None, last_chunk_keep]
+    state.stage = STAGE_GENERATE
+
+    # Prompt token i lives in slot 100 + i; a slot stores 1000 * layer +
+    # 100 * head + token index so every moved entry names its origin.
+    prompt_len = len(input_ids)
+    prompt_slots = torch.arange(100, 100 + prompt_len)
+    kv_buffers = []
+    for layer in range(num_layers):
+        buffer = torch.zeros(200, num_kv_heads, head_dim)
+        for head in range(num_kv_heads):
+            buffer[100 : 100 + prompt_len, head, 0] = (
+                1000 * layer + 100 * head + torch.arange(prompt_len)
+            )
+        kv_buffers.append((buffer, buffer.clone() + 0.5))
+
+    retained, evicted = compact_prompt_kv_per_head(
+        kv_buffers=kv_buffers, prompt_slots=prompt_slots, state=state
+    )
+
+    # prefix(2) + chunk0 -> 2 slots + whole 2-token chunk + chunk2 -> 2 slots + query(3)
+    assert retained.tolist() == [100, 101, 102, 103, 106, 107, 108, 109, 113, 114, 115]
+    assert sorted(evicted.tolist()) == [104, 105, 110, 111, 112]
+    key_buffer, value_buffer = kv_buffers[0]
+    assert key_buffer[[102, 103], 0, 0].tolist() == [2, 5]
+    assert key_buffer[[102, 103], 1, 0].tolist() == [102, 103]
+    assert key_buffer[[108, 109], 0, 0].tolist() == [8, 12]
+    assert value_buffer[[108, 109], 1, 0].tolist() == [108.5, 110.5]
+    assert kv_buffers[1][0][[102, 103], 1, 0].tolist() == [1102, 1105]
+    # Prefix, the short chunk, and the query stay where they were.
+    assert key_buffer[[100, 106, 113], 0, 0].tolist() == [0, 6, 13]
+
+    req = SimpleNamespace(
+        dllm_token_eviction_state=state,
+        origin_input_ids=input_ids,
+        sampling_params=SimpleNamespace(custom_params=None),
+        is_scoring_token_eviction=lambda: False,
+    )
+    ReqDllmMixin.compact_token_eviction_input_ids(req)
+    assert list(req.origin_input_ids) == list(compact_input_ids(state, input_ids))
+    assert len(req.origin_input_ids) == len(retained)
+    # The generation canvas follows the compacted prompt in storage but
+    # keeps the positions it had after the full 16-token prompt.
+    req.extend_range = SimpleNamespace(start=len(retained), end=len(retained) + 3)
+    assert _compute_dllm_positions(req) == [16, 17, 18]
+    req.extend_range = SimpleNamespace(start=0, end=len(retained))
+    assert _compute_dllm_positions(req) == [0, 1, 2, 3, 6, 7, 8, 9, 13, 14, 15]
+
+    ReqDllmMixin.reset_token_eviction_state(req)
+    assert list(req.origin_input_ids) == list(input_ids)
+    assert state.stage == STAGE_SCORE and state.chunk_cursor == 0
+    assert state.keep_positions == [None, None, None]
+
+
+def test_head_eviction_leaves_the_request_ready_for_dual_cache_denoising():
+    state, input_ids = _head_eviction_state()
+    block_size = 3
+    freed = []
+    scheduler = SimpleNamespace(
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free=lambda indices: freed.extend(indices.tolist()),
+            get_kvcache=lambda: SimpleNamespace(
+                start_layer=0,
+                layer_num=1,
+                get_kv_buffer=lambda layer_id: (
+                    torch.zeros(64, 2, 1),
+                    torch.zeros(64, 2, 1),
+                ),
+            ),
+        ),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros(1, 32, dtype=torch.int32)
+        ),
+    )
+    req = SimpleNamespace(
+        dllm_token_eviction_state=state,
+        origin_input_ids=input_ids,
+        req_pool_idx=0,
+        kv=SimpleNamespace(kv_allocated_len=8),
+        kv_committed_len=8,
+        prefix_indices=torch.arange(8),
+        dllm_algo_state={"prompt_len": 8, "step": 0},
+        dllm_phase=None,
+    )
+    req.is_scoring_token_eviction = lambda: ReqDllmMixin.is_scoring_token_eviction(req)
+    req.compact_token_eviction_input_ids = lambda: (
+        ReqDllmMixin.compact_token_eviction_input_ids(req)
+    )
+
+    # Two scoring rounds (the middle chunk is skipped) free all their KV.
+    SchedulerDllmMixin._finish_token_eviction_score_round(
+        scheduler,
+        req,
+        round_cache_loc=torch.arange(40, 48),
+        keep=torch.tensor([[[0, 3], [0, 1]]]),
+    )
+    assert req.is_scoring_token_eviction() and state.chunk_cursor == 2
+    assert (req.kv.kv_allocated_len, req.kv_committed_len) == (0, 0)
+    SchedulerDllmMixin._finish_token_eviction_score_round(
+        scheduler,
+        req,
+        round_cache_loc=torch.arange(48, 57),
+        keep=torch.tensor([[[0, 4], [0, 2]]]),
+    )
+    assert freed == list(range(40, 57))
+    assert not req.is_scoring_token_eviction()
+    assert req.dllm_algo_state == {"prompt_len": len(input_ids), "step": 0}
+    assert len(req.prefix_indices) == 0
+
+    # The first full pass wrote prompt slots 0..15 and canvas slots 16..18.
+    freed.clear()
+    prompt_len = len(input_ids)
+    req.prefix_indices = torch.arange(prompt_len)
+    req.dllm_kv_indices = torch.arange(prompt_len, prompt_len + block_size)
+    req.dllm_incomplete_ids = array("q", [7, 8, 9])
+    req.dllm_algo_state = {"prompt_len": prompt_len, "dual_cache_ready": True}
+    SchedulerDllmMixin._evict_prompt_tokens_per_head(scheduler, req)
+
+    compact_len = prompt_len - 5
+    assert sorted(freed) == [4, 5, 10, 11, 12]
+    assert req.prefix_indices.tolist() == [0, 1, 2, 3, 6, 7, 8, 9, 13, 14, 15]
+    row = scheduler.req_to_token_pool.req_to_token[0]
+    assert row[: compact_len + block_size].tolist() == (
+        req.prefix_indices.tolist() + [16, 17, 18]
+    )
+    # The DLLM_DENOISE fast path requires prompt, prefix, and KV row to agree.
+    assert req.dllm_algo_state["prompt_len"] == compact_len
+    assert req.kv.kv_allocated_len == req.kv_committed_len == compact_len + block_size
+    assert len(req.origin_input_ids) == compact_len
+    assert list(req.full_untruncated_fill_ids[compact_len:]) == [7, 8, 9]

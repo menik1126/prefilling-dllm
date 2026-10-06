@@ -96,7 +96,9 @@ class TestPrefillAdder(CustomTestCase):
         req.prefix_indices = []
         req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
-        req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+        req.sampling_params = SimpleNamespace(
+            max_new_tokens=max_new_tokens, custom_params=None
+        )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.host_hit_length = 0
@@ -899,6 +901,43 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_range.assert_called_once_with(0, 200)
         self.assertIn(req, adder.can_run_list)
+
+    def _create_prefill_req(self, rid, input_len, *, segmented_score):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=0)
+        req.full_untruncated_fill_ids = list(range(input_len))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        if segmented_score:
+            req.sampling_params.custom_params = {"dream_score_attention_mask": "full"}
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def test_segmented_score_row_is_deferred_whole_not_truncated(self):
+        """Chunked prefill may split an ordinary row across forwards, but a
+        segmented Dream scoring row must wait for a batch that holds all of it."""
+        self.mock_token_allocator.available_size.return_value = 1000
+
+        def second_row_result(segmented_score):
+            adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=10)
+            first = self._create_prefill_req("a", 6, segmented_score=segmented_score)
+            second = self._create_prefill_req("b", 6, segmented_score=segmented_score)
+            self.assertEqual(
+                adder.add_one_req(first, False, None), AddReqResult.CONTINUE
+            )
+            return adder, second, adder.add_one_req(second, False, None)
+
+        adder, second, result = second_row_result(segmented_score=True)
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertNotIn(second, adder.can_run_list)
+        second.set_extend_range.assert_not_called()
+
+        adder, second, result = second_row_result(segmented_score=False)
+        self.assertIn(second, adder.can_run_list)
+        second.set_extend_range.assert_called_once_with(0, 4)
 
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)

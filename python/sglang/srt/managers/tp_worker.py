@@ -24,6 +24,8 @@ import torch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.dllm.head_token_eviction import stack_head_eviction_keep
+from sglang.srt.dllm.token_eviction import select_token_eviction_keep
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -591,6 +593,13 @@ class TpModelWorker(BaseTpWorker):
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             dllm_algo_state=dllm_algo_state,
             dllm_done_per_req_cpu=dllm_done_per_req_cpu,
+            dllm_token_keep_per_req=select_token_eviction_keep(
+                forward_batch.dllm_token_eviction
+            ),
+            dllm_head_keep_per_req=stack_head_eviction_keep(
+                forward_batch.dllm_head_eviction,
+                num_layers=self.model_runner.token_to_kv_pool.layer_num,
+            ),
             can_run_cuda_graph=can_run_cuda_graph,
         )
 

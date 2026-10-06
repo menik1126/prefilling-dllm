@@ -201,7 +201,9 @@ FlashInfer batch therefore improves the complete run by 2.44%; the unchanged
 denoising majority remains the limiting factor.
 
 End-to-end selection from the original long text is now available through a
-separate causal Dream prompt-logprob endpoint. Candidate chunks are sent in
+separate Dream prompt-logprob endpoint (causal in the runs below; see
+"Query-conditioned chunk scoring" for the current default). Candidate chunks
+are sent in
 request batches controlled by `--score-batch-size`; the selected top-four
 chunks are then passed to the ordinary PrefillingDream endpoint as one
 compressed prompt. The scoring endpoint must use
@@ -582,6 +584,115 @@ quality improvement. Raw
 artifacts and the machine-readable analysis are under
 `/results/dream_single_paged_ab_20260905_v1` in the fixed experiment container.
 
+#### Query-conditioned chunk scoring
+
+Chunk scoring now defaults to `--score-attention-mask full` in
+`bench_multifieldqa_chunk_selection.py`. Each scoring row is still one forward
+over `prefix + chunk + query + draft`, but prefix and chunk positions attend to
+the prefix, the chunk, and the query (not the draft), while query and draft
+positions stay causal. The score is unchanged: the mean log-probability of the
+query tokens plus the confirmed draft tokens, each predicted from its left
+context. This differs from Prefilling-dLLM's `SCORE_ATTENTION_MASK=full`, which
+keeps the prefix causal and hides the query from the chunk. Passing
+`--score-attention-mask causal` keeps the previous whole-row causal scoring.
+
+The scoring server must be launched with `--disable-radix-cache`. Prefix and
+chunk KV now depend on each row's own chunk and query, so reusing a cached
+prefix or splitting a row across forwards would be wrong. The scheduler defers
+a scoring row that does not fit the remaining chunked-prefill budget to the
+next batch instead of truncating it, and the server raises if a row is cached
+or is longer than `--chunked-prefill-size` on its own. The mask is
+applied by the `flashinfer` and `torch_native` attention backends only, and
+other backends reject scoring and ParallelComp requests instead of silently
+running plain bidirectional attention.
+
+On LongBench MultiFieldQA-en (150 examples, top-4 chunks of 1024 tokens, four
+draft tokens, one partial round), the Hugging Face reference runtime with the
+same mask scores 49.72 in BF16, versus 48.17 with the reference's own `full`
+mask and 47.28 with causal scoring. SGLang with FlashInfer for both servers
+scores 48.48 in FP16 and 48.36 in BF16, up from 47.37 with causal scoring. The
+scoring half matches the reference: chunk scores differ by 0.039 on average
+with the `flashinfer` scorer (129/150 identical selections) and 0.016 with the
+`torch_native` scorer (138/150).
+
+The remaining gap is in generation, not scoring. Generating from the
+reference's own chunk selections for all 150 examples gives:
+
+| Generation attention backend | Raw F1 | Predictions equal to reference |
+| --- | ---: | ---: |
+| Reference runtime (PyTorch, BF16) | 49.72 | - |
+| SGLang `torch_native` (BF16) | 49.55 | 115 / 150 |
+| SGLang `flashinfer`, deterministic (BF16) | 48.67 | 96 / 150 |
+| SGLang `flashinfer` (BF16) | 48.12 | 89 / 150 |
+
+The decoding logic and inputs are identical across the three SGLang rows, and
+FP16 versus BF16 does not change the FlashInfer result (48.63 versus 48.67), so
+the roughly one-point loss comes from the FlashInfer attention path; its cause
+has not been isolated yet. `torch_native` cannot be combined with
+`--enable-deterministic-inference`.
+
+#### Per-head token eviction on the full-prompt path
+
+`--token-capacity N` without `--server-chunk-prefill` ports Prefilling-dLLM's
+`token_eviction_granularity=per_head` on `cache_build_mode=full_prompt_mask`.
+The generation request carries a `dllm_token_eviction` custom param
+(`capacity`, `prefix_len`, `chunk_lens`, `query_len`) and the server runs it in
+three steps:
+
+1. For every selected chunk longer than `N`, one bidirectional forward over
+   `prefix + chunk + last 8 query tokens`. Each layer scores chunk tokens per
+   attention head as query-to-chunk plus chunk-to-query attention
+   (`--token-score-direction`), max-pools over the chunk axis, averages the heads
+   that share a KV head, and keeps that KV head's top `N` tokens plus the chunk
+   BOS. This forward's KV is freed.
+2. The usual bidirectional prefill of the whole prompt plus the mask canvas.
+3. Each layer's KV head gathers its own kept tokens into the chunk's first `N`
+   KV slots and the rest are freed. Keys already carry their RoPE rotation, so
+   one slot can hold a different token per head; the query and canvas keep the
+   positions of the uncompacted prompt.
+
+Requirements: `--dllm-fdfo`, Dream dual cache, `max_new_tokens == block_size`,
+KV page size 1, tensor parallel size 1, the `flashinfer` or `torch_native`
+attention backend, and a `--chunked-prefill-size` large enough for one scoring
+row.
+
+MF-en (150 examples, BF16, chunk 1024, top-4, reference chunk selection,
+`N = 512`, bidirectional score):
+
+| Runtime | No eviction | Per-head 512 |
+| --- | ---: | ---: |
+| Reference HF runtime | 49.72 | 47.83 |
+| SGLang `torch_native` | 49.55 | 48.33 |
+| SGLang `flashinfer` | 48.67 | 47.92 |
+
+On the first six examples (22 chunks), SGLang's per-layer, per-head keep sets
+share 91.5% of their tokens with the reference's (50% is chance): 97% at layer
+0, about 89% at the last layers.
+
+With SGLang doing its own chunk scoring and selection as well (query-conditioned
+mask, separate scoring server), the same setting scores 49.07 without eviction
+and 48.36 with it on `torch_native`, and 48.36 / 47.55 on `flashinfer`.
+
+#### Token eviction for server chunk prefill
+
+`--server-chunk-prefill` can now drop low-relevance tokens from each selected
+chunk with `--token-capacity N`. During the chunk stage the server appends the
+last `--token-score-query-window` query tokens (default 8) to each chunk, sums
+the attention those rows give every chunk token over heads after a per-head max
+pool of width `--token-score-pool-kernel` (default 7), averages over layers, and
+keeps the `N` highest-scoring tokens plus the chunk BOS. Evicted KV pages are
+freed, kept tokens retain their original RoPE positions, and the decode stage
+runs on the compacted prompt. This ports Prefilling-dLLM's global-granularity
+`query_to_chunk` eviction and requires tensor parallel size 1; per-head eviction
+with the bidirectional score is the full-prompt path above.
+
+A real-model check with three ~240-token chunks confirmed the plumbing on both
+attention backends: a capacity above the chunk length reproduces the
+no-eviction output exactly, capacities 96, 32, and 8 leave `9 + 3N + 18` prompt
+tokens, and chunk batch sizes 1 and 3 agree. No LongBench score has been
+measured with eviction enabled, and this path builds causal chunk KV, so it is
+not the accuracy-aligned `full_prompt_mask` route.
+
 #### GPU failure observed during alignment
 
 With `--mem-fraction-static 0.70`, a long prompt needed a temporary FP32
@@ -606,6 +717,36 @@ isolation, and confirm that the GPU remains visible. If a card enters
 `Unknown Error`, reset it from the host with
 `nvidia-smi --gpu-reset -i <index>` or PCI FLR. A container with read-only
 `/sys` cannot perform PCI reset; a host reboot may be required.
+
+#### TODO
+
+Not done yet for the Dream Prefilling-dLLM path, roughly in priority order:
+
+- [ ] **Prefill-decode disaggregation.** Prefill and denoising still run in one
+      server. Stock SGLang PD (prefill server, decode server, router, NIXL
+      transfer) was smoke-tested on two H20s with the Dream weights in plain
+      causal mode, but dLLM batches bypass it. Needed: send the prompt and canvas
+      KV after the first full pass (after per-head compaction), resume the
+      request on the decode server directly in dual-cache denoising, and carry
+      the canvas tokens, prompt length, and eviction position offsets with the KV.
+- [ ] **YaRN x64 (128K) RoPE** for Dream, the paper's main-table setting; only
+      native RoPE has been run.
+- [ ] **Other benchmarks.** Only LongBench MF-en is validated; the other
+      LongBench tasks and InfiniteBench have not been run on SGLang.
+- [ ] **Multi-block generation.** Everything assumes
+      `max_new_tokens == block_size == 32`.
+- [ ] **Server-side orchestration.** Chunking, drafting, chunk scoring, top-k
+      selection, and prompt assembly live in the benchmark client, and scoring
+      needs a second server without `--dllm-algorithm`.
+- [ ] **Speed.** No throughput or latency numbers; eviction scores one chunk per
+      forward; every run so far used `--disable-cuda-graph`.
+- [ ] **FlashInfer generation gap.** `flashinfer` is 0.7-1 F1 below
+      `torch_native` on identical inputs; the cause is not isolated.
+- [ ] **More attention backends** for the scoring mask (Triton, FA3).
+- [ ] **Token eviction with tensor parallelism** or a KV page size above 1.
+- [ ] **Request validation.** Malformed custom params raise inside the scheduler
+      instead of returning HTTP 400.
+- [ ] **LLaDA / UltraLLaDA.**
 
 ## Adoption and Sponsorship
 SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, NVIDIA, AMD, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, RunPod, InnoMatrix, Modal, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Baseten, Baidu, AntGroup, Alibaba, Tencent, and other major technology organizations.

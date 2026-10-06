@@ -59,6 +59,12 @@ class HybridAttnBackend(AttentionBackend):
         )
         return backend.supports_ragged_verify_graph
 
+    @property
+    def supports_dllm_attention_override(self) -> bool:
+        # Dream scoring and ParallelComp forwards are extends, which
+        # _select_backend routes to the prefill backend.
+        return self.prefill_backend.supports_dllm_attention_override
+
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
         Select the appropriate attention backend based on the forward mode.

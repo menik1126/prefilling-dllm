@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.score_attention import uses_segmented_score_mask
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import (
@@ -1335,6 +1336,17 @@ class PrefillAdder:
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
+            return AddReqResult.OTHER
+
+        if (
+            chunk_tokens_limit is not None
+            and len(self.can_run_list) != 0
+            and cand_extend_input_len > chunk_tokens_limit
+            and uses_segmented_score_mask(req.sampling_params)
+        ):
+            # Chunked prefill would compute this row's head before its query is
+            # in the forward, so leave the whole row for the next batch. A row
+            # that is alone still falls through; ForwardBatch rejects the split.
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):

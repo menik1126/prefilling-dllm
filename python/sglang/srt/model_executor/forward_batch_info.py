@@ -38,6 +38,14 @@ import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.dllm.head_token_eviction import (
+    DllmHeadEvictionCapture,
+    build_head_eviction_capture,
+)
+from sglang.srt.dllm.token_eviction import (
+    DllmTokenEvictionCapture,
+    build_token_eviction_capture,
+)
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -540,12 +548,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # ParallelComp retains causal chunk KV even though Dream's generation
     # canvas itself uses bidirectional attention.
     dllm_force_causal: bool = False
+    # Query-conditioned Dream scoring spans: prefix and chunk see
+    # prefix + chunk + query, query and draft are causal.
+    # Each entry is (prefix_len, chunk_len, query_len, draft_len) on the row.
+    dllm_score_full_spans: Optional[List[Tuple[int, int, int, int]]] = None
     # Multi-stage dLLM requests whose attention topology changes between
     # forwards must stay out of the prefill CUDA Graph runner.
     dllm_disable_prefill_cuda_graph: bool = False
     # Per request, lengths of independently masked ``chunk + query`` items
     # packed into the current ParallelComp chunk forward.
     dllm_parallelcomp_item_lens: Optional[List[Optional[List[int]]]] = None
+    # Set on ParallelComp chunk forwards that evict tokens: the attention
+    # backend adds each layer's query-to-chunk scores to it during the forward.
+    dllm_token_eviction: Optional[DllmTokenEvictionCapture] = None
+    # Per-head keep tables to capture from Dream chunk-scoring forwards.
+    dllm_head_eviction: Optional[DllmHeadEvictionCapture] = None
     # Optional packed CPU token result produced by a dLLM algorithm so the
     # FDFO result path can reuse the same D2H transfer used for completion.
     dllm_output_ids_cpu: Optional[torch.Tensor] = None
@@ -847,7 +864,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dllm_canvas_lens_cpu = canvas_lens
                 if any(raw_last_logits):
                     dllm_raw_last_logits_cpu = raw_last_logits
-        dllm_force_causal = _parallelcomp_force_causal(batch.reqs)
+        dllm_force_causal, dllm_score_full_spans = _dllm_attention_override(batch.reqs)
+        _require_whole_score_rows(
+            dllm_score_full_spans,
+            prefix_lens=batch.prefix_lens,
+            extend_lens=batch.extend_lens,
+        )
         dllm_parallelcomp_item_lens = [
             (
                 req.parallelcomp_item_lens()
@@ -858,6 +880,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ]
         if not any(items is not None for items in dllm_parallelcomp_item_lens):
             dllm_parallelcomp_item_lens = None
+        if (
+            dllm_force_causal
+            or dllm_score_full_spans is not None
+            or dllm_parallelcomp_item_lens is not None
+        ):
+            _require_dllm_attention_override_backend(model_runner)
+        dllm_token_eviction = build_token_eviction_capture(
+            parallelcomp_states=parallelcomp_states, extend_lens=batch.extend_lens
+        )
+        dllm_head_eviction = None
+        if batch.dllm_config is not None:
+            dllm_head_eviction = build_head_eviction_capture(
+                states=[req.dllm_token_eviction_state for req in batch.reqs],
+                extend_lens=batch.extend_lens,
+            )
+        if (
+            dllm_token_eviction is not None or dllm_head_eviction is not None
+        ) and model_runner.ps.tp_size > 1:
+            # Scores are summed over this rank's heads only, so ranks would
+            # disagree on which KV slots survive.
+            raise RuntimeError("Dream token eviction requires tensor parallel size 1")
+        if dllm_head_eviction is not None:
+            _require_dllm_attention_override_backend(model_runner)
 
         dllm_denoise_plan_key = _build_dllm_denoise_plan_key(batch)
 
@@ -898,12 +943,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
             dllm_force_causal=dllm_force_causal,
+            dllm_score_full_spans=dllm_score_full_spans,
+            # The chunk-scoring hook reads q and k eagerly in every layer.
             dllm_disable_prefill_cuda_graph=any(
                 state is not None for state in parallelcomp_states
-            ),
+            )
+            or dllm_score_full_spans is not None
+            or dllm_head_eviction is not None,
             dllm_canvas_lens_cpu=dllm_canvas_lens_cpu,
             dllm_raw_last_logits_cpu=dllm_raw_last_logits_cpu,
             dllm_parallelcomp_item_lens=dllm_parallelcomp_item_lens,
+            dllm_token_eviction=dllm_token_eviction,
+            dllm_head_eviction=dllm_head_eviction,
             dllm_denoise_plan_key=dllm_denoise_plan_key,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
@@ -1908,32 +1959,176 @@ class PPProxyTensors:
         return f"PPProxyTensors(tensors={self.tensors})"
 
 
-def _parallelcomp_force_causal(reqs) -> bool:
-    chunk_flags = [
-        (
+def make_dream_score_full_attention_mask(
+    prefix_len: int,
+    chunk_len: int,
+    query_len: int,
+    draft_len: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the query-conditioned Dream scoring mask for one scoring row.
+
+    Prefix and chunk rows see the prefix, the chunk, and the query, but not
+    the draft. Query and draft rows are causal over everything to their left,
+    so each scored token is still predicted from its left context only.
+    Prefilling-dLLM's ``SCORE_ATTENTION_MASK=full`` is stricter: it keeps
+    prefix rows causal and hides the query from the chunk.
+    """
+    context_end = int(prefix_len) + int(chunk_len)
+    query_end = context_end + int(query_len)
+    seq_len = query_end + int(draft_len)
+    if seq_len <= 0:
+        return torch.empty((0, 0), dtype=torch.bool, device=device)
+    rows = torch.arange(seq_len, device=device).unsqueeze(1)
+    cols = torch.arange(seq_len, device=device).unsqueeze(0)
+    in_context = rows < context_end
+    return (in_context & (cols < query_end)) | (~in_context & (cols <= rows))
+
+
+def _require_whole_score_rows(
+    spans: Optional[List[Tuple[int, int, int, int]]],
+    *,
+    prefix_lens: List[int],
+    extend_lens: List[int],
+) -> None:
+    """Segmented scoring needs every row computed whole in one forward."""
+    if spans is None:
+        return
+    # Prefix and chunk KV depend on this request's chunk and query, so a radix
+    # hit would reuse KV built for another chunk; the backends also lay the
+    # mask out for full rows.
+    if any(prefix_lens):
+        raise RuntimeError(
+            "Segmented Dream scoring matched a cached prefix; launch the scoring "
+            "server with --disable-radix-cache"
+        )
+    # The scheduler defers rows that do not fit a batch, so a split row here is
+    # longer than the chunked-prefill budget on its own.
+    if any(extend_len != sum(span) for span, extend_len in zip(spans, extend_lens)):
+        raise RuntimeError(
+            "Segmented Dream scoring row is longer than --chunked-prefill-size; "
+            "raise it or pass --chunked-prefill-size -1 on the scoring server"
+        )
+
+
+def _parse_dream_score_attention(req) -> Optional[tuple]:
+    """Return ``('causal', None)``, ``('full', (p, c, q))``, or ``None``."""
+    sampling_params = getattr(req, "sampling_params", None)
+    custom_params = getattr(sampling_params, "custom_params", None)
+    if not isinstance(custom_params, dict):
+        return None
+
+    raw_mask = custom_params.get("dream_score_attention_mask")
+    if raw_mask is None and custom_params.get("dream_causal_prompt_logprob") is True:
+        raw_mask = "causal"
+    if raw_mask is None:
+        return None
+    if not isinstance(raw_mask, str):
+        raise ValueError(
+            f"dream_score_attention_mask must be a string, got {type(raw_mask)}"
+        )
+    mask = raw_mask.lower()
+    if mask not in {"causal", "full"}:
+        raise ValueError(
+            "dream_score_attention_mask must be 'causal' or 'full', "
+            f"got {raw_mask!r}"
+        )
+    if mask == "causal":
+        return ("causal", None)
+
+    origin_ids = getattr(req, "origin_input_ids", None)
+    seq_len = len(origin_ids) if origin_ids is not None else None
+
+    def _require_nonneg_int(name: str) -> int:
+        value = custom_params.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(
+                f"{name} must be a non-negative int for full Dream scoring"
+            )
+        return value
+
+    prefix_len = _require_nonneg_int("dream_score_prefix_len")
+    chunk_len = _require_nonneg_int("dream_score_chunk_len")
+    query_len = _require_nonneg_int("dream_score_query_len")
+    draft_len = (
+        _require_nonneg_int("dream_score_draft_len")
+        if "dream_score_draft_len" in custom_params
+        else 0
+    )
+    span_len = prefix_len + chunk_len + query_len + draft_len
+    if span_len <= 0:
+        raise ValueError("full Dream scoring spans must cover at least one token")
+    if seq_len is not None and span_len != seq_len:
+        raise ValueError(
+            "full Dream scoring spans do not cover the input: "
+            f"prefix={prefix_len}, chunk={chunk_len}, query={query_len}, "
+            f"draft={draft_len}, input={seq_len}"
+        )
+    return ("full", (prefix_len, chunk_len, query_len, draft_len))
+
+
+def _dllm_attention_override(
+    reqs,
+) -> tuple[bool, Optional[List[Tuple[int, int, int, int]]]]:
+    """Decide causal vs segmented-full scoring attention for a batch."""
+    kinds: List[Optional[str]] = []
+    spans: List[Optional[Tuple[int, int, int, int]]] = []
+    for req in reqs:
+        chunk_stage = (
             getattr(req, "dllm_parallelcomp_state", None) is not None
             and req.dllm_parallelcomp_state["stage"] == "chunk"
         )
-        for req in reqs
-    ]
-    score_flags = []
-    for req in reqs:
-        sampling_params = getattr(req, "sampling_params", None)
-        custom_params = getattr(sampling_params, "custom_params", None)
-        score_flags.append(
-            isinstance(custom_params, dict)
-            and custom_params.get("dream_causal_prompt_logprob") is True
-        )
-    causal_flags = [
-        chunk_flag or score_flag
-        for chunk_flag, score_flag in zip(chunk_flags, score_flags)
-    ]
-    if any(causal_flags) and not all(causal_flags):
+        parsed = _parse_dream_score_attention(req)
+        if chunk_stage and parsed is not None:
+            raise RuntimeError(
+                "Dream scoring attention cannot share a request with "
+                "ParallelComp chunk prefill"
+            )
+        if chunk_stage:
+            kinds.append("causal")
+            spans.append(None)
+        elif parsed is None:
+            kinds.append(None)
+            spans.append(None)
+        else:
+            kinds.append(parsed[0])
+            spans.append(parsed[1])
+
+    if not any(kind is not None for kind in kinds):
+        return False, None
+    if any(kind is None for kind in kinds):
         raise RuntimeError(
-            "Causal Dream scoring or ParallelComp chunk prefill cannot share "
+            "Dream scoring or ParallelComp chunk prefill cannot share "
             "a batch with ordinary Dream forwards"
         )
-    return bool(causal_flags) and all(causal_flags)
+    unique = set(kinds)
+    if unique == {"causal"}:
+        return True, None
+    if unique == {"full"}:
+        return False, [span for span in spans if span is not None]
+    raise RuntimeError(
+        "Causal Dream scoring and full-mask Dream scoring cannot share a batch"
+    )
+
+
+def _parallelcomp_force_causal(reqs) -> bool:
+    force_causal, _ = _dllm_attention_override(reqs)
+    return force_causal
+
+
+def _require_dllm_attention_override_backend(model_runner) -> None:
+    """Reject backends that would ignore the Dream attention overrides."""
+    backend = getattr(model_runner, "attn_backend", None)
+    if getattr(backend, "supports_dllm_attention_override", False):
+        return
+    raise RuntimeError(
+        "Dream scoring and ParallelComp prefill need a per-request attention "
+        "mask that only the flashinfer and torch_native attention backends "
+        f"apply; got {type(backend).__name__}, which would silently run "
+        "plain bidirectional attention. Relaunch with "
+        "--attention-backend flashinfer or torch_native."
+    )
 
 
 def _build_dllm_denoise_plan_key(batch: ScheduleBatch) -> Optional[tuple]:
@@ -1998,14 +2193,27 @@ def _compute_dllm_positions(req) -> List[int]:
     if parallelcomp_positions is not None:
         return parallelcomp_positions
 
+    token_indices = range(req.extend_range.start, req.extend_range.end)
+    eviction = req.dllm_token_eviction_state
+    if eviction is not None:
+        if req.is_scoring_token_eviction():
+            # The scoring row is its own contiguous sequence.
+            return list(token_indices)
+        if eviction.compacted:
+            # Tokens after an evicted chunk keep the RoPE position of the
+            # full prompt their KV was built at.
+            token_indices = [
+                eviction.full_token_index(index) for index in token_indices
+            ]
+
     custom_params = getattr(req.sampling_params, "custom_params", None)
     if not isinstance(custom_params, dict):
-        return list(range(req.extend_range.start, req.extend_range.end))
+        return list(token_indices)
 
     position_start = custom_params.get("dllm_position_start")
     position_offset = custom_params.get("dllm_position_offset")
     if position_start is None and position_offset is None:
-        return list(range(req.extend_range.start, req.extend_range.end))
+        return list(token_indices)
     if (
         not isinstance(position_start, int)
         or isinstance(position_start, bool)
@@ -2013,7 +2221,10 @@ def _compute_dllm_positions(req) -> List[int]:
         or isinstance(position_offset, bool)
     ):
         raise ValueError("Dream sparse position start and offset must be integers")
-    if not 0 <= position_start <= len(req.origin_input_ids):
+    prompt_len = len(req.origin_input_ids)
+    if eviction is not None and eviction.compacted:
+        prompt_len = len(eviction.full_input_ids)
+    if not 0 <= position_start <= prompt_len:
         raise ValueError(
             f"Dream sparse position start is outside the prompt: {position_start}"
         )
@@ -2024,7 +2235,7 @@ def _compute_dllm_positions(req) -> List[int]:
 
     return [
         position + position_offset if position >= position_start else position
-        for position in range(req.extend_range.start, req.extend_range.end)
+        for position in token_indices
     ]
 
 

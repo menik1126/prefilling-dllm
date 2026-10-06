@@ -149,6 +149,7 @@ class SGLangClient:
         timeout: float,
         *,
         causal_prompt_logprobs: bool = False,
+        score_attention_mask: str = "full",
     ):
         base_url = base_url.rstrip("/")
         if base_url.endswith("/v1"):
@@ -156,6 +157,15 @@ class SGLangClient:
         self.generate_url = f"{base_url}/generate"
         self.timeout = timeout
         self.causal_prompt_logprobs = causal_prompt_logprobs
+        mask = (score_attention_mask or "full").lower()
+        if mask not in {"causal", "full"}:
+            raise ValueError(
+                "score_attention_mask must be 'causal' or 'full', "
+                f"got {score_attention_mask!r}"
+            )
+        if causal_prompt_logprobs and mask == "full":
+            mask = "causal"
+        self.score_attention_mask = mask
 
     def post(self, payload: dict[str, Any]) -> Any:
         request = urllib.request.Request(
@@ -175,26 +185,66 @@ class SGLangClient:
         self,
         input_ids: Sequence[Sequence[int]],
         logprob_start_lens: Sequence[int],
+        *,
+        prefix_lens: Sequence[int] | None = None,
+        chunk_lens: Sequence[int] | None = None,
+        query_lens: Sequence[int] | None = None,
+        draft_lens: Sequence[int] | None = None,
     ) -> list[list[Any]]:
-        sampling_params: dict[str, Any] = {
-            "temperature": 0,
-            "max_new_tokens": 0,
-        }
-        if self.causal_prompt_logprobs:
-            sampling_params["custom_params"] = {
-                "dream_causal_prompt_logprob": True,
+        rows = [list(ids) for ids in input_ids]
+        if self.score_attention_mask == "full":
+            if prefix_lens is None or chunk_lens is None or query_lens is None:
+                raise ValueError(
+                    "full Dream scoring requires prefix_lens, chunk_lens, and query_lens"
+                )
+            if draft_lens is None:
+                draft_lens = [0] * len(rows)
+            if not (
+                len(rows)
+                == len(prefix_lens)
+                == len(chunk_lens)
+                == len(query_lens)
+                == len(draft_lens)
+            ):
+                raise ValueError(
+                    "full Dream scoring spans must match the number of scoring rows"
+                )
+            sampling_params = [
+                {
+                    "temperature": 0,
+                    "max_new_tokens": 0,
+                    "custom_params": {
+                        "dream_score_attention_mask": "full",
+                        "dream_score_prefix_len": int(prefix_len),
+                        "dream_score_chunk_len": int(chunk_len),
+                        "dream_score_query_len": int(query_len),
+                        "dream_score_draft_len": int(draft_len),
+                    },
+                }
+                for prefix_len, chunk_len, query_len, draft_len in zip(
+                    prefix_lens, chunk_lens, query_lens, draft_lens
+                )
+            ]
+        else:
+            sampling_params = {
+                "temperature": 0,
+                "max_new_tokens": 0,
+                "custom_params": {
+                    "dream_causal_prompt_logprob": True,
+                    "dream_score_attention_mask": "causal",
+                },
             }
         result = self.post(
             {
-                "input_ids": [list(ids) for ids in input_ids],
+                "input_ids": rows,
                 "sampling_params": sampling_params,
                 "return_logprob": True,
                 "return_text_in_logprobs": False,
                 "logprob_start_len": list(logprob_start_lens),
             }
         )
-        rows = result if isinstance(result, list) else [result]
-        return [row["meta_info"]["input_token_logprobs"] for row in rows]
+        payloads = result if isinstance(result, list) else [result]
+        return [row["meta_info"]["input_token_logprobs"] for row in payloads]
 
     def generate(
         self,
@@ -568,6 +618,7 @@ def score_chunks(
     scoring_query_ids: Sequence[int],
     batch_size: int,
     score_token_mask: Sequence[bool] | None = None,
+    draft_len: int = 0,
 ) -> list[float]:
     return score_chunk_groups(
         client,
@@ -576,6 +627,7 @@ def score_chunks(
         score_token_masks=(
             [score_token_mask] if score_token_mask is not None else None
         ),
+        draft_lens=[draft_len],
     )[0]
 
 
@@ -584,7 +636,16 @@ def score_chunk_groups(
     groups: Sequence[tuple[Sequence[int], Sequence[Sequence[int]], Sequence[int]]],
     batch_size: int,
     score_token_masks: Sequence[Sequence[bool] | None] | None = None,
+    draft_lens: Sequence[int] | None = None,
 ) -> list[list[float]]:
+    # Trailing draft tokens of each scoring query; the scorer hides them from
+    # the prefix and chunk rows.
+    group_draft_lens = [0] * len(groups) if draft_lens is None else list(draft_lens)
+    if len(group_draft_lens) != len(groups) or any(
+        draft_len < 0 or draft_len > len(scoring_query_ids)
+        for (_, _, scoring_query_ids), draft_len in zip(groups, group_draft_lens)
+    ):
+        raise ValueError("draft lengths do not match the scoring query groups")
     if score_token_masks is None:
         group_score_token_masks: list[Sequence[bool] | None] = [None] * len(groups)
     else:
@@ -619,17 +680,33 @@ def score_chunk_groups(
         logprob_starts = []
         expected_tokens = []
         batch_score_token_masks = []
+        prefix_lens = []
+        chunk_lens = []
+        query_lens = []
+        batch_draft_lens = []
         for group_index, chunk_index in batch_coordinates:
             prefix_ids, chunks, scoring_query_ids = groups[group_index]
             chunk = chunks[chunk_index]
             rows.append(list(prefix_ids) + list(chunk) + list(scoring_query_ids))
-            # SGLang's causal prompt-logprob path consumes the hidden state at
+            # SGLang's prompt-logprob path consumes the hidden state at
             # logprob_start_len and then shifts labels by one position.  Start
             # one token earlier so the first scoring-query token is included.
             logprob_starts.append(len(prefix_ids) + len(chunk) - 1)
             expected_tokens.append(len(scoring_query_ids))
             batch_score_token_masks.append(group_score_token_masks[group_index])
-        logprob_rows = client.prompt_logprobs(rows, logprob_starts)
+            prefix_lens.append(len(prefix_ids))
+            chunk_lens.append(len(chunk))
+            draft_len = group_draft_lens[group_index]
+            query_lens.append(len(scoring_query_ids) - draft_len)
+            batch_draft_lens.append(draft_len)
+        logprob_rows = client.prompt_logprobs(
+            rows,
+            logprob_starts,
+            prefix_lens=prefix_lens,
+            chunk_lens=chunk_lens,
+            query_lens=query_lens,
+            draft_lens=batch_draft_lens,
+        )
         if len(logprob_rows) != len(batch_coordinates):
             raise RuntimeError(
                 "Chunk selector returned "
@@ -657,7 +734,7 @@ def score_chunk_groups(
     if invalid:
         raise RuntimeError(
             "Chunk selector received non-finite prompt logprobs for candidate "
-            f"coordinates {invalid}; Dream scoring requires a causal prompt-logprob "
+            f"coordinates {invalid}; Dream scoring requires a prompt-logprob "
             "server passed through --score-base-url."
         )
     return [[float(score) for score in group_scores] for group_scores in scores]
@@ -692,9 +769,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--score-base-url",
         help=(
-            "Separate SGLang endpoint for causal Dream prompt logprobs; required "
+            "Separate SGLang endpoint for Dream prompt logprobs; required "
             "by --selection-mode=query_logprob. The generation endpoint remains "
             "--base-url."
+        ),
+    )
+    parser.add_argument(
+        "--score-attention-mask",
+        choices=["full", "causal"],
+        default="full",
+        help=(
+            "Attention used while scoring prefix+chunk+query+draft. full lets "
+            "the prefix and chunk see prefix+chunk+query while the query and "
+            "draft stay causal; it needs a scoring server launched with "
+            "--disable-radix-cache. causal keeps the previous all-triangle path."
         ),
     )
     parser.add_argument("--model-path", required=True)
@@ -792,6 +880,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of independently masked chunks packed into one server forward.",
     )
     parser.add_argument(
+        "--token-capacity",
+        type=int,
+        default=0,
+        help=(
+            "Per-chunk KV budget for server-side token eviction; chunks longer "
+            "than this keep only their highest query-attention tokens. 0 keeps "
+            "every token. The default full-prompt path evicts per KV head; "
+            "--server-chunk-prefill evicts whole tokens."
+        ),
+    )
+    parser.add_argument(
+        "--token-score-direction",
+        choices=("bidirectional", "query_to_chunk"),
+        default="bidirectional",
+        help=(
+            "Attention scored by per-head token eviction: query-to-chunk only, "
+            "or query-to-chunk plus chunk-to-query. Ignored by "
+            "--server-chunk-prefill."
+        ),
+    )
+    parser.add_argument(
+        "--token-score-query-window",
+        type=int,
+        default=8,
+        help="Trailing query tokens whose attention scores chunk tokens.",
+    )
+    parser.add_argument(
+        "--token-score-pool-kernel",
+        type=int,
+        default=7,
+        help="Max-pool width over the chunk axis of each head's scores; 1 disables.",
+    )
+    parser.add_argument(
         "--selection-only",
         action="store_true",
         help=(
@@ -809,6 +930,12 @@ def main() -> None:
         raise ValueError("--server-chunk-prefill-batch-size must be positive")
     if args.score_batch_size <= 0:
         raise ValueError("score_batch_size must be positive")
+    if args.token_capacity < 0:
+        raise ValueError("--token-capacity must be non-negative")
+    if args.token_score_query_window <= 0 or args.token_score_pool_kernel <= 0:
+        raise ValueError(
+            "--token-score-query-window and --token-score-pool-kernel must be positive"
+        )
     if args.selector_microbatch_size <= 0:
         raise ValueError("selector_microbatch_size must be positive")
     if args.generation_microbatch_size <= 0:
@@ -859,7 +986,8 @@ def main() -> None:
         else SGLangClient(
             args.score_base_url or args.base_url,
             args.timeout,
-            causal_prompt_logprobs=args.selection_mode == "query_logprob",
+            causal_prompt_logprobs=args.score_attention_mask == "causal",
+            score_attention_mask=args.score_attention_mask,
         )
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -980,6 +1108,7 @@ def main() -> None:
                 ],
                 args.score_batch_size,
                 score_token_masks=score_token_masks,
+                draft_lens=[len(draft_ids) for draft_ids in draft_groups],
             )
             chunk_score_seconds = time.perf_counter() - chunk_score_start
             candidate_count = sum(len(state["chunks"]) for state in scoring_group)
@@ -1106,6 +1235,30 @@ def main() -> None:
                         "query_position_start": query_rope_start,
                     }
                 }
+                if args.token_capacity > 0:
+                    custom_params["dllm_parallelcomp"]["token_eviction"] = {
+                        "capacity": args.token_capacity,
+                        "score_query_ids": query_ids[-args.token_score_query_window :],
+                        "pool_kernel": args.token_score_pool_kernel,
+                        "force_keep_first": args.chunk_bos,
+                    }
+            elif args.token_capacity > 0:
+                custom_params = {
+                    "dllm_token_eviction": {
+                        "capacity": args.token_capacity,
+                        "prefix_len": len(prefix_ids),
+                        "chunk_lens": [
+                            len(chunks[chunk_index]) for chunk_index in selected
+                        ],
+                        "query_len": len(query_ids),
+                        "score_query_window": args.token_score_query_window,
+                        "pool_kernel": args.token_score_pool_kernel,
+                        "force_keep_first": args.chunk_bos,
+                        "bidirectional": (
+                            args.token_score_direction == "bidirectional"
+                        ),
+                    }
+                }
             state["query_position_offset"] = position_offset
             state["generation_position_start"] = (
                 None if args.server_chunk_prefill else query_start
@@ -1209,6 +1362,8 @@ def main() -> None:
                 ],
                 "chunk_bos": args.chunk_bos,
                 "server_chunk_prefill": args.server_chunk_prefill,
+                "token_capacity": args.token_capacity,
+                "token_score_direction": args.token_score_direction,
                 "server_chunk_prefill_batch_size": (
                     args.server_chunk_prefill_batch_size
                 ),
@@ -1299,6 +1454,8 @@ def main() -> None:
             )
         },
         "server_chunk_prefill": args.server_chunk_prefill,
+        "token_capacity": args.token_capacity,
+        "token_score_direction": args.token_score_direction,
         "server_chunk_prefill_batch_size": args.server_chunk_prefill_batch_size,
         "draft_tokens": args.draft_tokens,
         "draft_partial_rounds": (

@@ -57,6 +57,12 @@ class GenerationBatchResult:
     dllm_algo_state: Optional[List[Any]] = None
     # Full-prefill dLLM (e.g. Dream): per-request canvas completion status.
     dllm_done_per_req_cpu: Optional[List[bool]] = None
+    # Dream token eviction: per request, per chunk built this forward, the
+    # chunk-local positions whose KV is retained. None entries keep everything.
+    dllm_token_keep_per_req: Optional[List[Optional[List[List[int]]]]] = None
+    # Dream per-head token eviction: per request, the scored chunk's
+    # [num_layers, num_kv_heads, capacity] kept chunk-local positions.
+    dllm_head_keep_per_req: Optional[List[Optional[torch.Tensor]]] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and

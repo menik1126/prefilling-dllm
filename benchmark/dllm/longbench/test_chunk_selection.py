@@ -62,7 +62,36 @@ def test_causal_prompt_logprob_marker():
     assert client.prompt_logprobs([[1, 7]], [1]) == [[[-1.0, 7, None]]]
     assert payloads[0]["sampling_params"]["custom_params"] == {
         "dream_causal_prompt_logprob": True,
+        "dream_score_attention_mask": "causal",
     }
+
+
+def test_full_score_prompt_logprob_sends_spans():
+    client = MODULE.SGLangClient("http://example.invalid", timeout=1)
+    payloads = []
+    client.post = lambda payload: payloads.append(payload) or {
+        "meta_info": {"input_token_logprobs": [[-1.0, 7, None]]}
+    }
+    assert client.prompt_logprobs(
+        [[1, 2, 3, 7]],
+        [2],
+        prefix_lens=[1],
+        chunk_lens=[2],
+        query_lens=[1],
+    ) == [[[-1.0, 7, None]]]
+    assert payloads[0]["sampling_params"] == [
+        {
+            "temperature": 0,
+            "max_new_tokens": 0,
+            "custom_params": {
+                "dream_score_attention_mask": "full",
+                "dream_score_prefix_len": 1,
+                "dream_score_chunk_len": 2,
+                "dream_score_query_len": 1,
+                "dream_score_draft_len": 0,
+            },
+        }
+    ]
 
 
 def test_single_generate_batch_preserves_scalar_request_shape():
@@ -385,7 +414,7 @@ def test_score_chunk_groups_flattens_and_scatters_variable_groups():
     client = MODULE.SGLangClient("http://example.invalid", timeout=1)
     batch_shapes = []
 
-    def prompt_logprobs(rows, starts):
+    def prompt_logprobs(rows, starts, **kwargs):
         batch_shapes.append((len(rows), list(starts)))
         return [[[float(token_id), token_id, None] for token_id in row] for row in rows]
 
@@ -410,7 +439,7 @@ def test_score_chunk_groups_keeps_partial_slots_but_masks_their_logprobs():
     client = MODULE.SGLangClient("http://example.invalid", timeout=1)
     seen_rows = []
 
-    def prompt_logprobs(rows, starts):
+    def prompt_logprobs(rows, starts, **kwargs):
         seen_rows.extend(rows)
         assert starts == [1, 1, 2]
         return [[[float(token_id), token_id, None] for token_id in row] for row in rows]
@@ -768,6 +797,7 @@ def test_selection_only_writes_selector_artifacts_without_generation(
             self.score_rows = []
             self.generate_calls = 0
             self.causal_prompt_logprobs = kwargs.get("causal_prompt_logprobs", False)
+            self.score_attention_mask = kwargs.get("score_attention_mask", "full")
             self.instances.append(self)
 
         def partial_draft_batch(
@@ -782,7 +812,7 @@ def test_selection_only_writes_selector_artifacts_without_generation(
                 for _ in input_ids
             ]
 
-        def prompt_logprobs(self, rows, starts):
+        def prompt_logprobs(self, rows, starts, **kwargs):
             self.score_rows.extend(rows)
             return [
                 [
@@ -870,7 +900,8 @@ def test_selection_only_writes_selector_artifacts_without_generation(
     assert all(record["generation_active_microbatch_size"] == 0 for record in records)
     assert FakeClient.instances[0].partial_calls == [([[1, 20, 21]], 4, 1)]
     assert not FakeClient.instances[0].causal_prompt_logprobs
-    assert FakeClient.instances[1].causal_prompt_logprobs
+    assert not FakeClient.instances[1].causal_prompt_logprobs
+    assert FakeClient.instances[1].score_attention_mask == "full"
     assert len(FakeClient.instances[1].score_rows) == 2
     assert all(client.generate_calls == 0 for client in FakeClient.instances)
 

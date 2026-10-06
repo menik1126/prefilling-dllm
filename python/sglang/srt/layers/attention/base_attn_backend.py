@@ -61,6 +61,12 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Whether extend honors the per-request Dream attention overrides carried
+    # on ForwardBatch (dllm_force_causal, dllm_score_full_spans, ParallelComp
+    # item lens). Backends that leave this False run those requests with the
+    # layer's plain bidirectional attention, so ForwardBatch.init_new rejects
+    # them instead of returning silently wrong logprobs.
+    supports_dllm_attention_override: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set

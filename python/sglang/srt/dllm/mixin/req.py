@@ -5,6 +5,17 @@ from array import array
 from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.head_token_eviction import (
+    STAGE_SCORE,
+    DllmHeadEvictionState,
+    compact_input_ids,
+    parse_head_token_eviction,
+    score_stage_input_ids,
+)
+from sglang.srt.dllm.token_eviction import (
+    parallelcomp_chunk_query_len,
+    parse_token_eviction,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -40,6 +51,7 @@ class ReqDllmMixin:
             raise ValueError(
                 "dllm_partial_draft cannot be combined with dllm_parallelcomp"
             )
+        self.dllm_token_eviction_state = self._parse_token_eviction_state()
         if self.dllm_partial_draft_state is not None:
             # Keep request-specific algorithm controls in the state that FDFO
             # already carries across denoising rounds.  The server-wide Dream
@@ -50,6 +62,7 @@ class ReqDllmMixin:
             if (
                 self.dllm_parallelcomp_state is not None
                 or self.dllm_partial_draft_state is not None
+                or self.is_scoring_token_eviction()
             ):
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
             elif self.dllm_config.needs_full_prefill:
@@ -151,6 +164,60 @@ class ReqDllmMixin:
         self.dllm_incomplete_ids = array("q")
         self.dllm_kv_indices = None
 
+    def _parse_token_eviction_state(self: Req) -> Optional[DllmHeadEvictionState]:
+        if self.dllm_config is None or not self.dllm_config.needs_full_prefill:
+            return None
+        custom_params = self.sampling_params.custom_params
+        if not isinstance(custom_params, dict):
+            return None
+        config = custom_params.get("dllm_token_eviction")
+        if config is None:
+            return None
+        if (
+            self.dllm_parallelcomp_state is not None
+            or self.dllm_partial_draft_state is not None
+        ):
+            raise ValueError(
+                "dllm_token_eviction cannot be combined with dllm_parallelcomp "
+                "or dllm_partial_draft"
+            )
+        if not self.dllm_config.dual_cache:
+            raise ValueError("dllm_token_eviction requires Dream dual_cache")
+        if not self.dllm_config.first_done_first_out_mode:
+            raise ValueError("dllm_token_eviction requires --dllm-fdfo")
+        if self.sampling_params.max_new_tokens != self.dllm_config.block_size:
+            # Later blocks would re-prefill a prompt whose KV no longer
+            # corresponds to one token per slot.
+            raise ValueError(
+                "dllm_token_eviction requires max_new_tokens == block_size: "
+                f"{self.sampling_params.max_new_tokens} != "
+                f"{self.dllm_config.block_size}"
+            )
+        return parse_head_token_eviction(config, input_ids=self.origin_input_ids)
+
+    def is_scoring_token_eviction(self: Req) -> bool:
+        state = self.dllm_token_eviction_state
+        return state is not None and state.stage == STAGE_SCORE
+
+    def reset_token_eviction_state(self: Req) -> None:
+        """Restart a retracted request from its first chunk-scoring forward."""
+        state = self.dllm_token_eviction_state
+        if state is None:
+            return
+        if state.full_input_ids is not None:
+            self.origin_input_ids = state.full_input_ids
+        state.restart()
+        self.dllm_algo_state = {"prompt_len": len(self.origin_input_ids), "step": 0}
+        self.dllm_incomplete_ids = array("q")
+        self.dllm_kv_indices = None
+
+    def compact_token_eviction_input_ids(self: Req) -> None:
+        """Shrink the prompt ids to the per-head compacted KV layout."""
+        state = self.dllm_token_eviction_state
+        full_ids = self.origin_input_ids
+        self.origin_input_ids = compact_input_ids(state, full_ids)
+        state.full_input_ids = full_ids
+
     def _parse_parallelcomp_state(self: Req) -> Optional[dict[str, Any]]:
         if self.dllm_config is None or not self.dllm_config.needs_full_prefill:
             return None
@@ -228,10 +295,16 @@ class ReqDllmMixin:
                 "dllm_parallelcomp position starts must be non-negative integers"
             )
 
+        token_eviction = parse_token_eviction(
+            config.get("token_eviction"),
+            query_ids=self.origin_input_ids[len(self.origin_input_ids) - query_len :],
+        )
+
         return {
             "stage": "prefix" if prefix_len else "chunk",
             "prefix_len": prefix_len,
             "query_len": query_len,
+            "token_eviction": token_eviction,
             "chunk_lens": list(chunk_lens),
             "chunk_batch_size": chunk_batch_size,
             "chunk_offsets": [
@@ -257,7 +330,7 @@ class ReqDllmMixin:
         state = self.dllm_parallelcomp_state
         if state is None or state["stage"] != "chunk":
             return None
-        query_len = state["query_len"]
+        query_len = parallelcomp_chunk_query_len(state)
         return [
             state["chunk_lens"][cursor] + query_len
             for cursor in self.parallelcomp_chunk_batch_range()
@@ -284,6 +357,26 @@ class ReqDllmMixin:
         state["common_prefix_indices"] = None
         state["chunk_kv_indices"] = []
         state.pop("assembled_prefix_indices", None)
+        eviction = state["token_eviction"]
+        if eviction is not None:
+            eviction.kept_positions = []
+            if eviction.full_input_ids is not None:
+                self.origin_input_ids = eviction.full_input_ids
+                eviction.full_input_ids = None
+
+    def compact_parallelcomp_input_ids(self: Req) -> None:
+        """Drop evicted chunk tokens from the input ids before decoding."""
+        state = self.dllm_parallelcomp_state
+        eviction = state["token_eviction"]
+        if eviction is None:
+            return
+        full_ids = self.origin_input_ids
+        compact_ids = array("q", full_ids[: state["prefix_len"]])
+        for chunk_offset, kept in zip(state["chunk_offsets"], eviction.kept_positions):
+            compact_ids.extend(full_ids[chunk_offset + position] for position in kept)
+        compact_ids.extend(full_ids[len(full_ids) - state["query_len"] :])
+        eviction.full_input_ids = full_ids
+        self.origin_input_ids = compact_ids
 
     def parallelcomp_position_values(self: Req) -> Optional[list[int]]:
         state = self.dllm_parallelcomp_state
@@ -299,13 +392,25 @@ class ReqDllmMixin:
                 chunk_len = state["chunk_lens"][cursor]
                 query_start = state["chunk_query_position_starts"][cursor]
                 values.extend(range(chunk_start, chunk_start + chunk_len))
-                values.extend(range(query_start, query_start + state["query_len"]))
+                values.extend(
+                    range(
+                        query_start, query_start + parallelcomp_chunk_query_len(state)
+                    )
+                )
         else:
             values = list(range(state["prefix_len"]))
-            for chunk_start, chunk_len in zip(
-                state["chunk_position_starts"], state["chunk_lens"]
+            eviction = state["token_eviction"]
+            for chunk_order, (chunk_start, chunk_len) in enumerate(
+                zip(state["chunk_position_starts"], state["chunk_lens"])
             ):
-                values.extend(range(chunk_start, chunk_start + chunk_len))
+                if eviction is None:
+                    values.extend(range(chunk_start, chunk_start + chunk_len))
+                else:
+                    # Kept tokens retain the RoPE position their KV was built at.
+                    values.extend(
+                        chunk_start + position
+                        for position in eviction.kept_positions[chunk_order]
+                    )
             query_start = state["query_position_start"]
             values.extend(range(query_start, query_start + state["query_len"]))
             generation_start = query_start + state["query_len"]
@@ -321,7 +426,7 @@ class ReqDllmMixin:
         if (
             self.dllm_parallelcomp_state is not None
             and self.dllm_parallelcomp_state["stage"] != "decode"
-        ):
+        ) or self.is_scoring_token_eviction():
             if self.dllm_phase not in (
                 DllmReqPhase.INCOMING_PREFILL,
                 DllmReqPhase.STAGING_PREFILL,
@@ -386,6 +491,16 @@ class ReqDllmMixin:
                     self.dllm_initialized = True
                     return
 
+            if self.is_scoring_token_eviction():
+                self.prefix_indices = self.prefix_indices[:0]
+                self.full_untruncated_fill_ids = score_stage_input_ids(
+                    self.dllm_token_eviction_state, self.origin_input_ids
+                )
+                # Mask-free, so the algorithm runs one forward and no denoising.
+                self.dllm_algo_state["prompt_len"] = len(self.full_untruncated_fill_ids)
+                self.dllm_initialized = True
+                return
+
             parallelcomp = self.dllm_parallelcomp_state
             if parallelcomp is not None and parallelcomp["stage"] != "decode":
                 if parallelcomp["stage"] == "prefix":
@@ -394,7 +509,14 @@ class ReqDllmMixin:
                         "q", self.origin_input_ids[: parallelcomp["prefix_len"]]
                     )
                 else:
-                    query_start = len(self.origin_input_ids) - parallelcomp["query_len"]
+                    eviction = parallelcomp["token_eviction"]
+                    chunk_query_ids = (
+                        self.origin_input_ids[
+                            len(self.origin_input_ids) - parallelcomp["query_len"] :
+                        ]
+                        if eviction is None
+                        else eviction.score_query_ids
+                    )
                     common_prefix_indices = parallelcomp["common_prefix_indices"]
                     self.prefix_indices = (
                         common_prefix_indices
@@ -408,7 +530,7 @@ class ReqDllmMixin:
                         chunk_start = parallelcomp["chunk_offsets"][cursor]
                         chunk_end = chunk_start + parallelcomp["chunk_lens"][cursor]
                         batch_ids.extend(self.origin_input_ids[chunk_start:chunk_end])
-                        batch_ids.extend(self.origin_input_ids[query_start:])
+                        batch_ids.extend(chunk_query_ids)
                     self.full_untruncated_fill_ids = batch_ids
                 # A mask-free intermediate stage makes DllmAlgorithm perform
                 # exactly one model forward without entering denoising.

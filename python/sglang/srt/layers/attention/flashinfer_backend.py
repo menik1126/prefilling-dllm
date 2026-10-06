@@ -27,6 +27,8 @@ from sglang.kernels.ops.attention.utils import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.head_token_eviction import accumulate_head_eviction_layer
+from sglang.srt.dllm.token_eviction import accumulate_token_eviction_layer
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -41,7 +43,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    make_dream_score_full_attention_mask,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -180,6 +186,7 @@ class PrefillMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     force_causal: bool = False
     dllm_denoise_single_paged: bool = False
+    dllm_score_full_mask: bool = False
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -315,6 +322,7 @@ class FlashInferAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
+    supports_dllm_attention_override: bool = True
 
     def __init__(
         self,
@@ -1213,6 +1221,7 @@ class FlashInferAttnBackend(AttentionBackend):
             or getattr(forward_batch, "encoder_lens", None) is not None
             or getattr(forward_batch, "dllm_parallelcomp_item_lens", None) is not None
             or getattr(forward_batch, "dllm_force_causal", False)
+            or getattr(forward_batch, "dllm_score_full_spans", None) is not None
             or getattr(forward_batch, "cross_attention_custom_mask", None) is not None
             or getattr(forward_batch, "dllm_raw_last_logits_cpu", None) is not None
             or getattr(forward_batch, "dllm_canvas_lens_cpu", None) is not None
@@ -1486,6 +1495,31 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
             parallelcomp_items = forward_batch.dllm_parallelcomp_item_lens is not None
+            score_full_spans = getattr(forward_batch, "dllm_score_full_spans", None)
+            score_full_custom_mask = None
+            if score_full_spans is not None:
+                if parallelcomp_items:
+                    raise RuntimeError(
+                        "full Dream scoring cannot share a batch with ParallelComp"
+                    )
+                if len(score_full_spans) != forward_batch.batch_size:
+                    raise RuntimeError(
+                        "full Dream scoring spans do not match the request batch"
+                    )
+                score_full_custom_mask = torch.cat(
+                    [
+                        make_dream_score_full_attention_mask(
+                            prefix_len,
+                            chunk_len,
+                            query_len,
+                            draft_len,
+                            device=forward_batch.input_ids.device,
+                        )
+                        .to(dtype=torch.uint8)
+                        .reshape(-1)
+                        for prefix_len, chunk_len, query_len, draft_len in score_full_spans
+                    ]
+                )
             parallelcomp_virtual_batch = (
                 self._build_parallelcomp_virtual_batch(forward_batch)
                 if parallelcomp_items
@@ -1493,7 +1527,12 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
-            if self.is_multimodal or self.enable_mis or parallelcomp_items:
+            if (
+                self.is_multimodal
+                or self.enable_mis
+                or parallelcomp_items
+                or score_full_custom_mask is not None
+            ):
                 # use_ragged = False: Multi-item scoring requires the paged wrapper because:
                 # 1. Ragged wrapper doesn't support the specialized multi-item parameters
                 #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
@@ -1553,6 +1592,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
+                self_attention_custom_mask=score_full_custom_mask,
                 extend_prefix_lens_cpu=plan_prefix_lens_cpu,
                 custom_kv_indices=plan_kv_indices,
             )
@@ -1564,6 +1604,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 swa_out_cache_loc=swa_out_cache_loc,
                 force_causal=forward_batch.dllm_force_causal,
                 dllm_denoise_single_paged=dllm_denoise_single_paged,
+                dllm_score_full_mask=score_full_custom_mask is not None,
             )
             if dllm_cache_key is not None:
                 self._dllm_denoise_plan_cache_key = dllm_cache_key
@@ -1850,6 +1891,32 @@ class FlashInferAttnBackend(AttentionBackend):
 
         q = q.contiguous()
 
+        if forward_batch.dllm_token_eviction is not None and not (
+            layer.is_cross_attention
+        ):
+            accumulate_token_eviction_layer(
+                forward_batch.dllm_token_eviction,
+                q=q,
+                k=k,
+                key_buffer=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                num_q_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                head_dim=layer.head_dim,
+                scaling=layer.scaling,
+            )
+        if forward_batch.dllm_head_eviction is not None and not (
+            layer.is_cross_attention
+        ):
+            accumulate_head_eviction_layer(
+                forward_batch.dllm_head_eviction,
+                q=q,
+                k=k,
+                num_q_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                head_dim=layer.head_dim,
+                scaling=layer.scaling,
+            )
+
         assert not (
             self.prefill_uses_dequant_workspace and layer.is_cross_attention
         ), "FP4 dequant KV cache is not supported for cross-attention"
@@ -1919,6 +1986,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
             causal = causal or self.forward_metadata.force_causal
+            if self.forward_metadata.dllm_score_full_mask:
+                causal = False
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 kv_cache,
@@ -2438,6 +2507,7 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        self_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
             assert prefix_lens is not None
@@ -2487,6 +2557,8 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            # call_begin_forward applies this as the paged wrapper's generic mask.
+            cross_attention_custom_mask=self_attention_custom_mask,
             seq_lens_cpu=seq_lens_cpu,
             custom_kv_indices=custom_kv_indices,
         )
@@ -2507,7 +2579,12 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        self_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
+        if self_attention_custom_mask is not None:
+            raise RuntimeError(
+                "Dream scoring masks are not supported with sliding-window wrappers"
+            )
         if custom_kv_indices is not None:
             raise RuntimeError(
                 "NVFP4 custom KV indices are only supported by the single-wrapper FlashInfer path."
@@ -2641,7 +2718,12 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        self_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
+        if self_attention_custom_mask is not None:
+            raise RuntimeError(
+                "Dream scoring masks are not supported with cross-attention wrappers"
+            )
         if custom_kv_indices is not None:
             raise RuntimeError(
                 "NVFP4 custom KV indices are not supported for cross-attention."

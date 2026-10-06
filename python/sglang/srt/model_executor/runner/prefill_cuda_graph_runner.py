@@ -1662,6 +1662,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             dllm_canvas_lens_cpu=forward_batch.dllm_canvas_lens_cpu,
             dllm_raw_last_logits_cpu=forward_batch.dllm_raw_last_logits_cpu,
             dllm_force_causal=forward_batch.dllm_force_causal,
+            dllm_score_full_spans=forward_batch.dllm_score_full_spans,
             dllm_disable_prefill_cuda_graph=(
                 forward_batch.dllm_disable_prefill_cuda_graph
             ),
