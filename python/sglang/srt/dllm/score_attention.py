@@ -1,6 +1,19 @@
-"""Request-level predicate for Dream's query-conditioned scoring mask."""
+"""Request-level predicates for Dream chunk-scoring requests."""
 
 from typing import Any
+
+
+def is_score_request(sampling_params: Any) -> bool:
+    """Whether a request asks for prompt logprobs under a Dream scoring mask.
+
+    Such a request is one ordinary forward, not a denoising generation, even
+    on a server that runs a dLLM algorithm.
+    """
+    custom_params = sampling_params.custom_params
+    return (
+        isinstance(custom_params, dict)
+        and "dream_score_attention_mask" in custom_params
+    )
 
 
 def uses_segmented_score_mask(sampling_params: Any) -> bool:

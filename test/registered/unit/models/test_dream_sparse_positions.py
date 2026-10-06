@@ -20,6 +20,7 @@ from sglang.srt.dllm.head_token_eviction import (
     stack_head_eviction_keep,
 )
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
+from sglang.srt.dllm.score_attention import is_score_request
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.dllm.token_eviction import (
     DllmTokenEvictionCapture,
@@ -1378,3 +1379,43 @@ def test_transferred_draft_resumes_at_suffix_initialization():
     # The masked suffix is built behind the cached prompt on the next round.
     req.init_next_round_input.assert_called_once_with()
     assert ReqDllmMixin.has_partial_draft_prompt_cache(req)
+
+
+def test_score_requests_stay_plain_prefills_on_a_dllm_server():
+    score_params = SimpleNamespace(
+        custom_params={"dream_score_attention_mask": "causal"}
+    )
+    assert is_score_request(score_params)
+    assert not is_score_request(SimpleNamespace(custom_params=None))
+    assert not is_score_request(
+        SimpleNamespace(custom_params={"dllm_position_start": 3})
+    )
+
+    dllm_config = SimpleNamespace(needs_full_prefill=True, max_running_requests=4)
+    score_req = SimpleNamespace(
+        sampling_params=score_params,
+        origin_input_ids=array("q", [1, 2, 3]),
+        _parse_parallelcomp_state=lambda: None,
+        _parse_partial_draft_state=lambda: None,
+        _parse_token_eviction_state=lambda: None,
+        is_scoring_token_eviction=lambda: False,
+    )
+    ReqDllmMixin.init_diffusion_llm(score_req, dllm_config)
+    assert score_req.dllm_config is None
+    assert not ReqDllmMixin.is_dllm(score_req)
+    assert score_req.dllm_phase is None and score_req.dllm_algo_state is None
+
+    # The dLLM manager only takes generation requests; scoring requests wait
+    # in the scheduler queue for an ordinary prefill batch.
+    generation_req = SimpleNamespace(is_dllm=lambda: True)
+    score_req.is_dllm = lambda: False
+    manager = SimpleNamespace(waiting_queue=[], add_waiting_reqs=MagicMock())
+    scheduler = SimpleNamespace(
+        max_running_requests=4,
+        dllm_config=dllm_config,
+        dllm_manager=manager,
+        waiting_queue=[score_req, generation_req],
+    )
+    SchedulerDllmMixin._fetch_waiting_reqs(scheduler)
+    manager.add_waiting_reqs.assert_called_once_with([generation_req])
+    assert scheduler.waiting_queue == [score_req]

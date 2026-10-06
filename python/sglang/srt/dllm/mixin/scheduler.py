@@ -59,6 +59,10 @@ class SchedulerDllmMixin:
         if self._should_skip_prefill(running_batch=running_batch):
             return None
 
+        score_batch = self._get_new_score_batch(running_batch)
+        if score_batch is not None:
+            return score_batch
+
         running_bs = len(running_batch.reqs)
         self.policy.calc_priority(self.waiting_queue)
 
@@ -702,6 +706,65 @@ class SchedulerDllmMixin:
         req.set_extend_range(prompt_len, seq_len)
         req.dllm_phase = DllmReqPhase.STAGING_DECODE
 
+    def _get_new_score_batch(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
+        """Batch waiting chunk-scoring requests as one ordinary prefill."""
+        score_reqs = [req for req in self.waiting_queue if not req.is_dllm()]
+        if not score_reqs:
+            return None
+
+        adder = PrefillAdder(
+            self.page_size,
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
+            running_batch,
+            self.new_token_ratio_tracker.current,
+            self.max_prefill_tokens,
+            self.chunked_prefill_size,
+            0,
+            self.priority_scheduling_preemption_threshold,
+            prefill_max_requests=get_schedule().prefill_max_requests,
+        )
+        for req in score_reqs:
+            req.init_next_round_input(self.tree_cache)
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=False,
+                truncation_align_size=self.truncation_align_size,
+            )
+            if res != AddReqResult.CONTINUE:
+                break
+        can_run_list = adder.can_run_list
+        if not can_run_list:
+            return None
+
+        scheduled = {id(req) for req in can_run_list}
+        self.waiting_queue = [
+            req for req in self.waiting_queue if id(req) not in scheduled
+        ]
+        set_time_batch(can_run_list, "set_forward_entry_time")
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.prepare_for_extend()
+        new_batch.decoding_reqs = None
+
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
+
+        new_batch.prefill_stats = PrefillStats.from_adder(
+            adder, running_batch.reqs, self.enable_priority_scheduling
+        )
+        return new_batch
+
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
         max_running_reqs = (
@@ -710,12 +773,16 @@ class SchedulerDllmMixin:
             else self.dllm_config.max_running_requests
         )
         max_dllm_capacity = max_running_reqs - len(self.dllm_manager.waiting_queue)
-        num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
+        # Scoring requests stay behind for _get_new_score_batch.
+        dllm_reqs = [req for req in self.waiting_queue if req.is_dllm()]
+        requests_to_add = dllm_reqs[: max(max_dllm_capacity, 0)]
 
-        if num_requests_to_add > 0:
-            requests_to_add = self.waiting_queue[:num_requests_to_add]
+        if requests_to_add:
             self.dllm_manager.add_waiting_reqs(requests_to_add)
-            self.waiting_queue = self.waiting_queue[num_requests_to_add:]
+            added = {id(req) for req in requests_to_add}
+            self.waiting_queue = [
+                req for req in self.waiting_queue if id(req) not in added
+            ]
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""

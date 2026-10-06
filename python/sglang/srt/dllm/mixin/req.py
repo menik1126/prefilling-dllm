@@ -12,6 +12,7 @@ from sglang.srt.dllm.head_token_eviction import (
     parse_head_token_eviction,
     score_stage_input_ids,
 )
+from sglang.srt.dllm.score_attention import is_score_request
 from sglang.srt.dllm.token_eviction import (
     parallelcomp_chunk_query_len,
     parse_token_eviction,
@@ -30,6 +31,9 @@ class DllmReqPhase(str, enum.Enum):
 
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
+        if dllm_config is not None and is_score_request(self.sampling_params):
+            # Chunk scoring returns prompt logprobs from one plain forward.
+            dllm_config = None
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
         # Physical generation KV slots retained by dual-cache rounds.

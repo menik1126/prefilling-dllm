@@ -634,7 +634,8 @@ class TpModelWorker(BaseTpWorker):
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
-        if self.is_dllm():
+        # A dLLM server still runs chunk-scoring batches as ordinary prefills.
+        if self.is_dllm() and (batch is None or batch.is_dllm()):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:

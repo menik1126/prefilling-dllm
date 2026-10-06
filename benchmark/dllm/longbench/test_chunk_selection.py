@@ -389,27 +389,6 @@ def test_main_rejects_unsupported_partial_draft_slot_count_before_io(
         MODULE.main()
 
 
-def test_main_requires_dedicated_causal_scorer_before_io(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            str(MODULE.__file__),
-            "--model-path",
-            "unused",
-            "--data-path",
-            str(tmp_path / "missing-data.jsonl"),
-            "--prompt-config",
-            str(tmp_path / "missing-prompts.json"),
-            "--output-dir",
-            str(tmp_path / "output"),
-        ],
-    )
-
-    with pytest.raises(ValueError, match="requires a dedicated --score-base-url"):
-        MODULE.main()
-
-
 def test_score_chunk_groups_flattens_and_scatters_variable_groups():
     client = MODULE.SGLangClient("http://example.invalid", timeout=1)
     batch_shapes = []

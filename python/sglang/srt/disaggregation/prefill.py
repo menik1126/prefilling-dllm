@@ -329,6 +329,10 @@ class PrefillBootstrapQueue:
         if self._check_if_req_exceed_kv_capacity(req):
             return False
 
+        if self.scheduler.dllm_config is not None and not req.is_dllm():
+            # A chunk-scoring request has no decode phase: it is sent straight
+            # to this server and finishes here without a KV transfer.
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
         backend = (
             TransferBackend.FAKE
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST

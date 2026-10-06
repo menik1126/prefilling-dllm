@@ -150,7 +150,9 @@ class SGLangClient:
         *,
         causal_prompt_logprobs: bool = False,
         score_attention_mask: str = "full",
+        score_on_prefill_server: bool = False,
     ):
+        self.score_on_prefill_server = score_on_prefill_server
         base_url = base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
@@ -234,15 +236,20 @@ class SGLangClient:
                     "dream_score_attention_mask": "causal",
                 },
             }
-        result = self.post(
-            {
-                "input_ids": rows,
-                "sampling_params": sampling_params,
-                "return_logprob": True,
-                "return_text_in_logprobs": False,
-                "logprob_start_len": list(logprob_start_lens),
-            }
-        )
+        payload = {
+            "input_ids": rows,
+            "sampling_params": sampling_params,
+            "return_logprob": True,
+            "return_text_in_logprobs": False,
+            "logprob_start_len": list(logprob_start_lens),
+        }
+        if self.score_on_prefill_server:
+            # A PD prefill server only accepts requests that carry a bootstrap
+            # room; scoring requests finish there without a decode peer.
+            payload["bootstrap_room"] = [
+                int.from_bytes(os.urandom(7), "big") for _ in rows
+            ]
+        result = self.post(payload)
         payloads = result if isinstance(result, list) else [result]
         return [row["meta_info"]["input_token_logprobs"] for row in payloads]
 
@@ -734,8 +741,8 @@ def score_chunk_groups(
     if invalid:
         raise RuntimeError(
             "Chunk selector received non-finite prompt logprobs for candidate "
-            f"coordinates {invalid}; Dream scoring requires a prompt-logprob "
-            "server passed through --score-base-url."
+            f"coordinates {invalid}; the scoring endpoint did not return input "
+            "token logprobs."
         )
     return [[float(score) for score in group_scores] for group_scores in scores]
 
@@ -769,9 +776,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--score-base-url",
         help=(
-            "Separate SGLang endpoint for Dream prompt logprobs; required "
-            "by --selection-mode=query_logprob. The generation endpoint remains "
-            "--base-url."
+            "SGLang endpoint for chunk-scoring requests; defaults to --base-url, "
+            "since a PrefillingDream server answers them itself. Point it at "
+            "the prefill server (with --score-on-prefill-server) when "
+            "--base-url is a PD router."
         ),
     )
     parser.add_argument(
@@ -783,6 +791,15 @@ def build_parser() -> argparse.ArgumentParser:
             "the prefix and chunk see prefix+chunk+query while the query and "
             "draft stay causal; it needs a scoring server launched with "
             "--disable-radix-cache. causal keeps the previous all-triangle path."
+        ),
+    )
+    parser.add_argument(
+        "--score-on-prefill-server",
+        action="store_true",
+        help=(
+            "--score-base-url is a PD prefill server launched with a dLLM "
+            "algorithm: send scoring requests with a bootstrap room so they "
+            "finish there without a decode server."
         ),
     )
     parser.add_argument("--model-path", required=True)
@@ -946,15 +963,6 @@ def main() -> None:
         )
     if args.selection_only and args.dry_run:
         raise ValueError("--selection-only and --dry-run cannot be combined")
-    if (
-        args.selection_mode == "query_logprob"
-        and not args.dry_run
-        and args.score_base_url is None
-    ):
-        raise ValueError(
-            "--selection-mode=query_logprob requires a dedicated "
-            "--score-base-url for isolated causal scoring"
-        )
     fixed_chunk_indices = [
         int(value) for value in args.fixed_chunk_indices.split(",") if value.strip()
     ]
@@ -988,6 +996,7 @@ def main() -> None:
             args.timeout,
             causal_prompt_logprobs=args.score_attention_mask == "causal",
             score_attention_mask=args.score_attention_mask,
+            score_on_prefill_server=args.score_on_prefill_server,
         )
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
