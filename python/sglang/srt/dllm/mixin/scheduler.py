@@ -726,7 +726,12 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=get_schedule().prefill_max_requests,
         )
+        # Generation requests keep their request slots between rounds, so a
+        # scoring batch can only take the slots that are free right now.
+        free_req_slots = self.req_to_token_pool.available_size()
         for req in score_reqs:
+            if len(adder.can_run_list) >= free_req_slots:
+                break
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,

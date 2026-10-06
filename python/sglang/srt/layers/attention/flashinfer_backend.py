@@ -510,7 +510,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
             self.disable_cuda_graph_kv_split = True
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
+            # The fixed split tiles need about 0.85 GB per 4K-token
+            # bidirectional prompt in one forward; a larger value from the
+            # environment is kept so concurrent long prompts fit.
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(
+                max(envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(), 2048 * 1024 * 1024)
+            )
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 

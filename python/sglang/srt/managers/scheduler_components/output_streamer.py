@@ -19,6 +19,7 @@ from sglang.srt.beam_search.output import (
     pack_beam_search_output,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.dllm.score_attention import is_score_request
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -539,8 +540,12 @@ class _GenerationStreamAccumulator:
             if (
                 req.return_logprob
                 and not req.input_logprob_sent
-                # Decode server does not send input logprobs
-                and self.disaggregation_mode != DisaggregationMode.DECODE
+                # Decode server does not send input logprobs, except for a
+                # Dream chunk-scoring request, which it prefilled itself.
+                and (
+                    self.disaggregation_mode != DisaggregationMode.DECODE
+                    or is_score_request(req.sampling_params)
+                )
                 # Only send when input logprobs have been computed (after prefill)
                 and req.logprob.input_token_logprobs_val is not None
             ):

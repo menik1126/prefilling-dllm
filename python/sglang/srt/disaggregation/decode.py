@@ -189,9 +189,12 @@ class DecodeReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        assert (
-            len(reusing) <= 1
-        ), "only one chunked request may reuse req_pool_idx in a batch"
+        # Every dLLM request re-enters with its slot on each denoising round,
+        # matching the relaxed check in ReqToTokenPool.alloc.
+        if not any(r.is_dllm() for r in reqs):
+            assert (
+                len(reusing) <= 1
+            ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
@@ -631,6 +634,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ``pop_preallocated``).
         """
         if self.scheduler.dllm_config is not None:
+            if not req.is_dllm():
+                # A chunk-scoring request has no prefill peer: it runs on this
+                # server as an ordinary prefill.
+                self.scheduler.waiting_queue.append(req)
+                return
             req.adopt_dllm_handoff_layout()
         if self._check_if_req_exceed_kv_capacity(req):
             return
@@ -2470,7 +2478,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                running_batch=self.running_batch, last_batch=self.last_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
@@ -2564,13 +2572,16 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch] = None,
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         if self.dllm_config is not None:
             # Transferred Dream requests were already resumed mid-generation,
-            # so the regular dLLM scheduler builds their rounds.
-            return self.get_next_batch_to_run(running_batch, self.last_batch)
+            # so the regular dLLM scheduler builds their rounds; it is the
+            # only consumer of last_batch here.
+            return self.get_next_batch_to_run(running_batch, last_batch)
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:

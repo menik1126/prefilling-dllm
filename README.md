@@ -58,6 +58,21 @@ drafting or chunk scoring.
 
 "Recompute every step" is the same server launched with `dual_cache: false`.
 
+Throughput of the same 150 requests under concurrent clients (`flashinfer`,
+`--enable-deterministic-inference`, requests per second):
+
+| Deployment | 1 client | 4 clients | 8 clients | 16 clients |
+| --- | ---: | ---: | ---: | ---: |
+| One server, one H20 | 0.89 | 1.54 | 1.61 | 1.62 |
+| Two independent servers, two H20s | | 2.33 | 2.97 | 3.17 |
+
+Outputs are identical across all of these runs.
+
+Prefill-decode disaggregation needs more prefill servers than decode servers:
+with about three prefill servers per decode server it matches or slightly
+exceeds the same number of independent servers (measured on H100s), and it
+falls behind when the two pools are the same size.
+
 ## Running it
 
 All commands assume the repository's `python/` directory is on `PYTHONPATH`
@@ -101,15 +116,15 @@ term).
 ### Prefill-decode disaggregation
 
 Prefill and denoising can run on separate servers through SGLang's built-in
-PD. The prefill server answers chunk-scoring requests and does the draft prompt
-pass, the eviction scoring forwards, the full-prompt pass, and per-head
-compaction; it then sends the prompt KV and the first generated token to the
-decode server, which runs the denoising rounds.
+PD. The prefill server does the draft prompt pass, the eviction scoring
+forwards, the full-prompt pass, and per-head compaction; it then sends the
+prompt KV and the first generated token to the decode server, which runs the
+denoising rounds. Either server can answer chunk-scoring requests.
 
 ```bash
 DLLM="--model-path $MODEL --trust-remote-code --attention-backend torch_native \
   --dtype bfloat16 --disable-cuda-graph --disable-radix-cache \
-  --chunked-prefill-size -1 --disable-overlap-schedule \
+  --chunked-prefill-size -1 \
   --disaggregation-transfer-backend nixl --mem-fraction-static 0.55 \
   --dllm-algorithm PrefillingDream \
   --dllm-algorithm-config benchmark/dllm/prefilling_dream_longbench.yaml"
@@ -129,8 +144,9 @@ python -m sglang_router.launch_router --mini-lb --pd-disaggregation \
 
 Run the same client with `--base-url http://127.0.0.1:30000` (the router, for
 drafts and generation) and
-`--score-base-url http://127.0.0.1:30010 --score-on-prefill-server` (scoring
-requests go straight to the prefill server and finish there). `--mini-lb` is
+`--score-base-url http://127.0.0.1:30020 --score-on-pd-server`. Scoring requests
+go straight to one PD server and finish there; sending them to the decode
+server keeps the heavy prompt forwards off the prefill server. `--mini-lb` is
 required for now because the Rust router drops `sampling_params.custom_params`.
 
 ## Request parameters
@@ -154,6 +170,11 @@ The dLLM-specific inputs travel in `sampling_params.custom_params`:
 - Token eviction needs `--dllm-fdfo` (the default), tensor parallel size 1,
   and KV page size 1.
 - Every measured run used `--disable-cuda-graph`.
+- SGLang always disables the overlap scheduler for dLLM servers.
+- `flashinfer` with `--enable-deterministic-inference` needs about 0.85 GB of
+  workspace per 4K-token prompt prefilled in the same forward. The default 2 GB
+  overflows at three concurrent long prompts; set
+  `SGLANG_FLASHINFER_WORKSPACE_SIZE` (bytes) higher for concurrent load.
 - Malformed custom parameters raise inside the scheduler instead of returning
   HTTP 400.
 
@@ -167,7 +188,7 @@ Roughly in priority order:
       pass, and per-head compaction, then hands the prompt KV and the first
       canvas token to the decode server, which resumes at draft suffix
       initialization or directly in dual-cache denoising; chunk-scoring requests
-      finish on the prefill server. Tested layout: prefill server on one H20,
+      finish on whichever PD server they are sent to. Tested layout: prefill server on one H20,
       decode server on another, NIXL transfer, `launch_router --mini-lb`.
       Predictions, selected chunks, and drafts are identical to the
       single-server pipeline, with and without eviction. Still open:
@@ -175,9 +196,12 @@ Roughly in priority order:
   - the Rust `sglang_router` drops `sampling_params.custom_params`, which
     carries the sparse position offset, the draft config, and the eviction
     spans, so use `launch_router --mini-lb` until the router forwards it;
-  - only tested with `--disable-overlap-schedule`; decode-side retraction,
-    decode radix cache, and abort cleanup are untested;
-  - no throughput measurement yet.
+  - decode-side retraction and the decode radix cache are untested; an abort
+    storm (connections dropped at every phase) leaves both servers healthy and
+    leak-free, but it did not cover draft or scoring requests;
+  - throughput depends on the prefill-to-decode ratio (see Speed); the
+    ratio sweep covered final generation requests only, without scoring,
+    drafts, or eviction.
 - [ ] **YaRN x64 (128K) RoPE** for Dream, the paper's main-table setting; only
       native RoPE has been run.
 - [ ] **Multi-block generation.** Everything assumes
@@ -185,9 +209,8 @@ Roughly in priority order:
 - [ ] **Server-side orchestration.** Chunking, drafting, chunk scoring, top-k
       selection, and prompt assembly live in the benchmark client: one answer
       still takes several requests to the server.
-- [ ] **Speed.** Only sequential single-request latency is measured; no
-      concurrent throughput numbers, eviction scores one chunk per forward, and
-      every run so far used `--disable-cuda-graph`.
+- [ ] **Speed.** Eviction scores one chunk per forward and roughly halves
+      throughput; every run so far used `--disable-cuda-graph`.
 - [ ] **Backend consistency.** `flashinfer` and `torch_native` do not produce
       identical outputs on identical inputs; the cause is not isolated.
 - [ ] **More attention backends** for the scoring mask (Triton, FA3).

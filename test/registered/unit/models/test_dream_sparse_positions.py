@@ -1419,3 +1419,28 @@ def test_score_requests_stay_plain_prefills_on_a_dllm_server():
     SchedulerDllmMixin._fetch_waiting_reqs(scheduler)
     manager.add_waiting_reqs.assert_called_once_with([generation_req])
     assert scheduler.waiting_queue == [score_req]
+
+
+def test_decode_server_slot_pool_lets_concurrent_dllm_requests_keep_their_slots():
+    from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
+    pool = DecodeReqToTokenPool(
+        size=4,
+        max_context_len=8,
+        device="cpu",
+        enable_memory_saver=False,
+        pre_alloc_size=2,
+    )
+
+    def resumed(slot, *, dllm):
+        return SimpleNamespace(
+            req_pool_idx=slot,
+            inflight_middle_chunks=0,
+            kv_committed_len=5,
+            is_dllm=lambda: dllm,
+        )
+
+    # Every Dream request returns with its slot on each denoising round.
+    assert pool.alloc([resumed(1, dllm=True), resumed(2, dllm=True)]) == [1, 2]
+    with pytest.raises(AssertionError, match="only one chunked request"):
+        pool.alloc([resumed(1, dllm=False), resumed(2, dllm=False)])

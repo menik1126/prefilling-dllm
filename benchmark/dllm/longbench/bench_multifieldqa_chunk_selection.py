@@ -150,9 +150,9 @@ class SGLangClient:
         *,
         causal_prompt_logprobs: bool = False,
         score_attention_mask: str = "full",
-        score_on_prefill_server: bool = False,
+        score_on_pd_server: bool = False,
     ):
-        self.score_on_prefill_server = score_on_prefill_server
+        self.score_on_pd_server = score_on_pd_server
         base_url = base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
@@ -243,9 +243,9 @@ class SGLangClient:
             "return_text_in_logprobs": False,
             "logprob_start_len": list(logprob_start_lens),
         }
-        if self.score_on_prefill_server:
-            # A PD prefill server only accepts requests that carry a bootstrap
-            # room; scoring requests finish there without a decode peer.
+        if self.score_on_pd_server:
+            # A PD server only accepts requests that carry a bootstrap room;
+            # scoring requests finish on the server they are sent to.
             payload["bootstrap_room"] = [
                 int.from_bytes(os.urandom(7), "big") for _ in rows
             ]
@@ -778,7 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "SGLang endpoint for chunk-scoring requests; defaults to --base-url, "
             "since a PrefillingDream server answers them itself. Point it at "
-            "the prefill server (with --score-on-prefill-server) when "
+            "the prefill server (with --score-on-pd-server) when "
             "--base-url is a PD router."
         ),
     )
@@ -794,12 +794,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--score-on-prefill-server",
+        "--score-on-pd-server",
         action="store_true",
         help=(
-            "--score-base-url is a PD prefill server launched with a dLLM "
-            "algorithm: send scoring requests with a bootstrap room so they "
-            "finish there without a decode server."
+            "--score-base-url is a PD prefill or decode server launched with "
+            "a dLLM algorithm: send scoring requests with a bootstrap room so "
+            "they finish on that server."
         ),
     )
     parser.add_argument("--model-path", required=True)
@@ -996,7 +996,7 @@ def main() -> None:
             args.timeout,
             causal_prompt_logprobs=args.score_attention_mask == "causal",
             score_attention_mask=args.score_attention_mask,
-            score_on_prefill_server=args.score_on_prefill_server,
+            score_on_pd_server=args.score_on_pd_server,
         )
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
