@@ -2568,7 +2568,9 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         if self.dllm_config is not None:
-            return self.get_next_dllm_disagg_decode_batch_to_run(running_batch)
+            # Transferred Dream requests were already resumed mid-generation,
+            # so the regular dLLM scheduler builds their rounds.
+            return self.get_next_batch_to_run(running_batch, self.last_batch)
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -2700,6 +2702,9 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+            if self.dllm_config is not None:
+                for req in transferred_reqs:
+                    self.resume_dllm_after_prompt_transfer(req)
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging

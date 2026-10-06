@@ -722,19 +722,22 @@ isolation, and confirm that the GPU remains visible. If a card enters
 
 Not done yet for the Dream Prefilling-dLLM path, roughly in priority order:
 
-- [ ] **Prefill-decode disaggregation (in progress).** The final generation
-      request now runs on stock SGLang PD: the prefill server does the eviction
-      scoring forwards, the full-prompt pass, and per-head compaction, then
-      hands the prompt KV and the first canvas token to the decode server,
-      which resumes directly in dual-cache denoising. On MF-en (150 examples,
-      `torch_native`, prefill on one H20, decode on another, NIXL transfer) the
-      predictions are identical to the single-server run, with and without
-      eviction (49.55 and 48.33). Still open:
-  - draft requests (`dllm_partial_draft`) and `dllm_parallelcomp` have no
-    handoff, and chunk scoring stays on a separate non-dLLM server;
+- [ ] **Prefill-decode disaggregation (in progress).** Drafts and the final
+      generation request now run on stock SGLang PD. The prefill server does
+      the draft prompt pass, the eviction scoring forwards, the full-prompt
+      pass, and per-head compaction, then hands the prompt KV and the first
+      canvas token to the decode server, which resumes at draft suffix
+      initialization or directly in dual-cache denoising. Tested layout: scoring
+      server and prefill server on one H20, decode server on another, NIXL
+      transfer, `launch_router --mini-lb`. On MF-en (150 examples,
+      `torch_native`) predictions, selected chunks, and drafts are identical to
+      the single-server pipeline, with and without eviction (49.07 and 48.36).
+      Still open:
+  - chunk scoring stays on a separate non-dLLM server, and
+    `dllm_parallelcomp` has no handoff;
   - the Rust `sglang_router` drops `sampling_params.custom_params`, which
-    carries the sparse position offset and the eviction spans, so use
-    `launch_router --mini-lb` until the router forwards it;
+    carries the sparse position offset, the draft config, and the eviction
+    spans, so use `launch_router --mini-lb` until the router forwards it;
   - only tested with `--disable-overlap-schedule`; decode-side retraction,
     decode radix cache, and abort cleanup are untested;
   - no throughput measurement yet.

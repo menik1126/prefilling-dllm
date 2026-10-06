@@ -296,6 +296,11 @@ class SchedulerDllmMixin:
                         req.dllm_initialized = False
                         req.dllm_canvas_output_len = -1
                         req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                            self._hand_off_dllm_prompt_kv(
+                                req,
+                                first_token=next_state["partial_draft_first_token"],
+                            )
                         continue
 
                     if last_partial_draft_stage == "suffix_init":
@@ -485,7 +490,10 @@ class SchedulerDllmMixin:
                                     if req.dllm_token_eviction_state is not None:
                                         self._evict_prompt_tokens_per_head(req)
                                     if hands_off:
-                                        self._hand_off_dllm_prompt_kv(req)
+                                        self._hand_off_dllm_prompt_kv(
+                                            req,
+                                            first_token=req.dllm_incomplete_ids[0],
+                                        )
                         else:
                             release_kv_cache(req, self.tree_cache, is_insert=False)
                     continue
@@ -620,17 +628,20 @@ class SchedulerDllmMixin:
         req.full_untruncated_fill_ids = req.origin_input_ids + canvas
         req.dllm_algo_state["prompt_len"] = prompt_len
 
-    def _hand_off_dllm_prompt_kv(self: Scheduler, req: Req) -> None:
+    def _hand_off_dllm_prompt_kv(
+        self: Scheduler, req: Req, *, first_token: int
+    ) -> None:
         """Send a prefilled Dream prompt to the decode server and stop here.
 
         The handoff is the prompt KV plus the first canvas token; the decode
-        server recomputes canvas KV in every denoise round.
+        server computes canvas KV itself in every round.
         """
         prompt_len = len(req.prefix_indices)
-        self.token_to_kv_pool_allocator.free(req.dllm_kv_indices)
+        if req.dllm_kv_indices is not None:
+            self.token_to_kv_pool_allocator.free(req.dllm_kv_indices)
         req.kv.kv_allocated_len = prompt_len
         req.kv_committed_len = prompt_len
-        req.output_ids = array("q", req.dllm_incomplete_ids[:1])
+        req.output_ids = array("q", [first_token])
         req.dllm_incomplete_ids = array("q")
         req.dllm_kv_indices = None
         req.dllm_algo_state = None
@@ -644,29 +655,36 @@ class SchedulerDllmMixin:
             self.send_kv_chunk(req, last_chunk=True)
         req.time_stats.set_prefill_transfer_queue_entry_time()
 
-    def get_next_dllm_disagg_decode_batch_to_run(
-        self: Scheduler, running_batch: ScheduleBatch
-    ) -> NextBatchPlan:
-        """Resume transferred Dream requests, then schedule a denoise round."""
-        for req in self.waiting_queue:
-            if not req.dllm_algo_state.get("dual_cache_ready", False):
-                self._resume_dllm_from_prompt_kv(req)
-        return self.get_next_batch_to_run(running_batch, self.last_batch)
-
-    def _resume_dllm_from_prompt_kv(self: Scheduler, req: Req) -> None:
-        """Rebuild the state a request has right after its first full pass."""
-        canvas_len = req.sampling_params.max_new_tokens
+    def resume_dllm_after_prompt_transfer(self: Scheduler, req: Req) -> None:
+        """Rebuild, on a decode server, the state the prefill server stopped in."""
         prompt_len = len(req.origin_input_ids)
-        seq_len = prompt_len + canvas_len
         first_token = req.output_ids.pop()
+        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        req.prefix_indices = req_row[:prompt_len].to(dtype=torch.int64, copy=True)
+
+        if req.dllm_partial_draft_state is not None:
+            # A draft left its prompt stage: the next forward initializes the
+            # masked suffix behind the cached prompt.
+            state = req.dllm_algo_state
+            state["prompt_len"] = prompt_len
+            state["partial_draft_stage"] = "suffix_init"
+            state["partial_draft_first_token"] = first_token
+            req.dllm_incomplete_ids = array("q")
+            req.dllm_kv_indices = None
+            req.dllm_initialized = False
+            req.dllm_canvas_output_len = -1
+            req.init_next_round_input()
+            return
+
+        # A generation request left its first full pass: denoising continues
+        # on a canvas holding only the first token.
+        canvas_len = req.sampling_params.max_new_tokens
+        seq_len = prompt_len + canvas_len
         canvas = array(
             "q", [first_token] + [self.dllm_config.mask_id] * (canvas_len - 1)
         )
-
-        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
         canvas_slots = alloc_token_slots(self.tree_cache, canvas_len)
         req_row[prompt_len:seq_len] = canvas_slots
-        req.prefix_indices = req_row[:prompt_len].to(dtype=torch.int64, copy=True)
         req.dllm_kv_indices = canvas_slots.clone()
         req.kv.kv_allocated_len = seq_len
         req.kv_committed_len = seq_len

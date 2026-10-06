@@ -1271,7 +1271,7 @@ def test_dream_prompt_handoff_resumes_in_dual_cache_denoising_on_the_decode_serv
         disagg_prefill_inflight_queue=[],
         send_kv_chunk=lambda req, last_chunk: sent.append(("send", last_chunk)),
     )
-    SchedulerDllmMixin._hand_off_dllm_prompt_kv(prefill, prefill_req)
+    SchedulerDllmMixin._hand_off_dllm_prompt_kv(prefill, prefill_req, first_token=42)
 
     assert freed == [13, 14, 15, 16]
     assert list(prefill_req.output_ids) == [42]
@@ -1289,6 +1289,7 @@ def test_dream_prompt_handoff_resumes_in_dual_cache_denoising_on_the_decode_serv
         req_pool_idx=0,
         sampling_params=SimpleNamespace(max_new_tokens=block_size),
         dllm_algo_state={"prompt_len": 3, "step": 0},
+        dllm_partial_draft_state=None,
         kv=SimpleNamespace(kv_allocated_len=3),
         kv_committed_len=3,
         set_extend_range=lambda start, end: extend_ranges.append((start, end)),
@@ -1304,7 +1305,7 @@ def test_dream_prompt_handoff_resumes_in_dual_cache_denoising_on_the_decode_serv
         "sglang.srt.dllm.mixin.scheduler.alloc_token_slots",
         return_value=torch.tensor([30, 31, 32, 33]),
     ):
-        SchedulerDllmMixin._resume_dllm_from_prompt_kv(decode, decode_req)
+        SchedulerDllmMixin.resume_dllm_after_prompt_transfer(decode, decode_req)
 
     assert decode_req.prefix_indices.tolist() == [20, 21, 22]
     assert decode_req.dllm_kv_indices.tolist() == [30, 31, 32, 33]
@@ -1344,3 +1345,36 @@ def test_decode_server_adopts_the_evicted_prompt_layout_without_scoring():
     # The canvas keeps the positions that follow the uncompacted prompt.
     req.extend_range = SimpleNamespace(start=11, end=13)
     assert _compute_dllm_positions(req) == [16, 17]
+
+
+def test_transferred_draft_resumes_at_suffix_initialization():
+    row = torch.zeros(1, 16, dtype=torch.int32)
+    row[0, :3] = torch.tensor([20, 21, 22])
+    decode = SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=row))
+    draft_state = {
+        "partial_draft": True,
+        "partial_draft_stage": "prompt",
+        "partial_draft_first_token": None,
+        "partial_draft_rounds_done": 0,
+        "partial_draft_round_limit": 1,
+        "partial_draft_confirmed_mask": [False] * 4,
+        "canvas_len": 4,
+    }
+    req = SimpleNamespace(
+        origin_input_ids=array("q", [5, 6, 7]),
+        output_ids=array("q", [42]),
+        req_pool_idx=0,
+        dllm_partial_draft_state=dict(draft_state),
+        dllm_algo_state={"prompt_len": 3, "step": 0, **draft_state},
+        init_next_round_input=MagicMock(),
+    )
+
+    SchedulerDllmMixin.resume_dllm_after_prompt_transfer(decode, req)
+
+    assert req.prefix_indices.tolist() == [20, 21, 22]
+    assert req.dllm_algo_state["partial_draft_stage"] == "suffix_init"
+    assert req.dllm_algo_state["partial_draft_first_token"] == 42
+    assert list(req.output_ids) == [] and req.dllm_kv_indices is None
+    # The masked suffix is built behind the cached prompt on the next round.
+    req.init_next_round_input.assert_called_once_with()
+    assert ReqDllmMixin.has_partial_draft_prompt_cache(req)
