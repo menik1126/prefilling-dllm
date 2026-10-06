@@ -81,6 +81,21 @@ class DllmHeadEvictionState(msgspec.Struct):
     def compacted(self) -> bool:
         return self.full_input_ids is not None
 
+    @property
+    def compact_prompt_len(self) -> int:
+        """Prompt length after eviction; known before any chunk is scored."""
+        return (
+            self.prefix_len
+            + sum(self.chunk_lens)
+            - sum(self.removed_per_chunk)
+            + self.query_len
+        )
+
+    def skip_scoring(self) -> None:
+        """Go straight to generation; another server owns the keep tables."""
+        self.chunk_cursor = len(self.chunk_lens)
+        self.stage = STAGE_GENERATE
+
     def full_token_index(self, compact_index: int) -> int:
         """Map an index of the compacted sequence back to the full prompt."""
         removed = 0

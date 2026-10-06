@@ -630,6 +630,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        if self.scheduler.dllm_config is not None:
+            req.adopt_dllm_handoff_layout()
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -2565,6 +2567,8 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        if self.dllm_config is not None:
+            return self.get_next_dllm_disagg_decode_batch_to_run(running_batch)
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:

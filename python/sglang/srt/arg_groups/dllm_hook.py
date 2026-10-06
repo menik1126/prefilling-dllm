@@ -118,9 +118,12 @@ def handle_dllm_inference(server_args: Any):
         logger.warning("Currently LoRA is not supported by diffusion LLM inference.")
         declare_resolution(server_args, "_handle_dllm_inference", enable_lora=False)
 
-    if cfg.disaggregation_mode != "null":
+    # PrefillingDream hands the prompt KV and first canvas token to the decode
+    # server after its first full pass; other algorithms have no handoff.
+    if cfg.disaggregation_mode != "null" and cfg.dllm_algorithm != "PrefillingDream":
         logger.warning(
-            "Currently disaggregation is not supported by diffusion LLM inference."
+            "Currently disaggregation is only supported by the PrefillingDream "
+            "diffusion LLM algorithm."
         )
         declare_resolution(
             server_args,

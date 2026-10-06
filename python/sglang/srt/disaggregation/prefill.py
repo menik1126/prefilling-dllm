@@ -370,6 +370,9 @@ class PrefillBootstrapQueue:
         req.time_stats.set_bootstrap_done_time()
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         num_kv_indices = len(req.origin_input_ids)
+        if self.scheduler.dllm_config is not None:
+            # Per-head token eviction shortens the prompt before it is sent.
+            num_kv_indices = req.dllm_handoff_prompt_len()
         req.start_send_idx = decode_prefix_len
         # Base of the staging chunk grid (suffix-relative send coordinates).
         req.disagg_decode_prefix_len = decode_prefix_len
@@ -405,6 +408,10 @@ class PrefillBootstrapQueue:
         """
         Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
         """
+        if self.scheduler.dllm_config is not None:
+            # A full-prefill dLLM prompt attends its whole mask canvas, so the
+            # prefill forward needs the real generation length.
+            return
         req.sampling_params.max_new_tokens = 1
 
     def pop_bootstrapped(
@@ -578,6 +585,11 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch.batch_is_full = False
 
         self.resolve_waiting_queue_bootstrap()
+
+        if self.dllm_config is not None:
+            # Dream prompts are never chunk-prefilled; the dLLM scheduler builds
+            # the batch and hands the prompt KV off after the first full pass.
+            return self.get_next_batch_to_run(running_batch, last_batch)
 
         self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
 

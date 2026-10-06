@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.head_token_eviction import compact_prompt_kv_per_head
 from sglang.srt.dllm.mixin.req import DllmReqPhase
@@ -13,8 +14,14 @@ from sglang.srt.dllm.token_eviction import (
     parallelcomp_chunk_query_len,
     split_kept_kv_indices,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    NextBatchPlan,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.allocation import alloc_token_slots
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -381,7 +388,13 @@ class SchedulerDllmMixin:
                         req.full_untruncated_fill_ids = round_tokens
                     canvas = req.full_untruncated_fill_ids
 
-                    if result.dllm_done_per_req_cpu[idx]:
+                    # A prefill server never answers: even a canvas completed
+                    # by the first pass goes to the decode server.
+                    hands_off = (
+                        self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and not dual_cache_round
+                    )
+                    if result.dllm_done_per_req_cpu[idx] and not hands_off:
                         partial_draft = bool(
                             req.dllm_algo_state
                             and req.dllm_algo_state.get("partial_draft", False)
@@ -471,6 +484,8 @@ class SchedulerDllmMixin:
                                     ].clone()
                                     if req.dllm_token_eviction_state is not None:
                                         self._evict_prompt_tokens_per_head(req)
+                                    if hands_off:
+                                        self._hand_off_dllm_prompt_kv(req)
                         else:
                             release_kv_cache(req, self.tree_cache, is_insert=False)
                     continue
@@ -604,6 +619,70 @@ class SchedulerDllmMixin:
         req.compact_token_eviction_input_ids()
         req.full_untruncated_fill_ids = req.origin_input_ids + canvas
         req.dllm_algo_state["prompt_len"] = prompt_len
+
+    def _hand_off_dllm_prompt_kv(self: Scheduler, req: Req) -> None:
+        """Send a prefilled Dream prompt to the decode server and stop here.
+
+        The handoff is the prompt KV plus the first canvas token; the decode
+        server recomputes canvas KV in every denoise round.
+        """
+        prompt_len = len(req.prefix_indices)
+        self.token_to_kv_pool_allocator.free(req.dllm_kv_indices)
+        req.kv.kv_allocated_len = prompt_len
+        req.kv_committed_len = prompt_len
+        req.output_ids = array("q", req.dllm_incomplete_ids[:1])
+        req.dllm_incomplete_ids = array("q")
+        req.dllm_kv_indices = None
+        req.dllm_algo_state = None
+        # send_kv_chunk transfers the request row up to extend_range.end.
+        req.set_extend_range(0, prompt_len)
+        self.dllm_manager.remove_req(req)
+
+        req.time_stats.set_prefill_finished_time()
+        self.disagg_prefill_inflight_queue.append(req)
+        if not req.pending_bootstrap:
+            self.send_kv_chunk(req, last_chunk=True)
+        req.time_stats.set_prefill_transfer_queue_entry_time()
+
+    def get_next_dllm_disagg_decode_batch_to_run(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> NextBatchPlan:
+        """Resume transferred Dream requests, then schedule a denoise round."""
+        for req in self.waiting_queue:
+            if not req.dllm_algo_state.get("dual_cache_ready", False):
+                self._resume_dllm_from_prompt_kv(req)
+        return self.get_next_batch_to_run(running_batch, self.last_batch)
+
+    def _resume_dllm_from_prompt_kv(self: Scheduler, req: Req) -> None:
+        """Rebuild the state a request has right after its first full pass."""
+        canvas_len = req.sampling_params.max_new_tokens
+        prompt_len = len(req.origin_input_ids)
+        seq_len = prompt_len + canvas_len
+        first_token = req.output_ids.pop()
+        canvas = array(
+            "q", [first_token] + [self.dllm_config.mask_id] * (canvas_len - 1)
+        )
+
+        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        canvas_slots = alloc_token_slots(self.tree_cache, canvas_len)
+        req_row[prompt_len:seq_len] = canvas_slots
+        req.prefix_indices = req_row[:prompt_len].to(dtype=torch.int64, copy=True)
+        req.dllm_kv_indices = canvas_slots.clone()
+        req.kv.kv_allocated_len = seq_len
+        req.kv_committed_len = seq_len
+
+        req.dllm_incomplete_ids = canvas
+        req.full_untruncated_fill_ids = req.origin_input_ids + canvas
+        req.dllm_canvas_output_len = len(req.output_ids)
+        req.dllm_initialized = True
+        req.dllm_algo_state = {
+            "prompt_len": prompt_len,
+            "step": 0,
+            "is_prefill": False,
+            "dual_cache_ready": True,
+        }
+        req.set_extend_range(prompt_len, seq_len)
+        req.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
@@ -929,6 +1008,11 @@ class DllmManager:
         """Increment chunked count for all staging requests."""
         for req in self.staging_queue:
             req.inflight_middle_chunks += 1
+
+    def remove_req(self, req: Req) -> None:
+        """Stop scheduling a request that leaves this server unfinished."""
+        self.waiting_queue = [r for r in self.waiting_queue if r is not req]
+        self.staging_queue = [r for r in self.staging_queue if r is not req]
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""

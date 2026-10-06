@@ -1240,3 +1240,107 @@ def test_head_eviction_leaves_the_request_ready_for_dual_cache_denoising():
     assert req.kv.kv_allocated_len == req.kv_committed_len == compact_len + block_size
     assert len(req.origin_input_ids) == compact_len
     assert list(req.full_untruncated_fill_ids[compact_len:]) == [7, 8, 9]
+
+
+def test_dream_prompt_handoff_resumes_in_dual_cache_denoising_on_the_decode_server():
+    block_size, mask_id = 4, 99
+    prompt_ids = array("q", [5, 6, 7])
+    dllm_config = SimpleNamespace(block_size=block_size, mask_id=mask_id)
+
+    # Prefill server: the first full pass wrote prompt slots 10..12 and canvas
+    # slots 13..16; only the prompt KV and the first canvas token leave.
+    freed, sent = [], []
+    prefill_req = SimpleNamespace(
+        prefix_indices=torch.tensor([10, 11, 12]),
+        dllm_kv_indices=torch.tensor([13, 14, 15, 16]),
+        dllm_incomplete_ids=array("q", [42, mask_id, mask_id, mask_id]),
+        dllm_algo_state={"prompt_len": 3, "dual_cache_ready": True},
+        kv=SimpleNamespace(kv_allocated_len=7),
+        kv_committed_len=7,
+        output_ids=array("q"),
+        pending_bootstrap=False,
+        time_stats=MagicMock(),
+        set_extend_range=lambda start, end: sent.append(("range", start, end)),
+    )
+    manager = SimpleNamespace(remove_req=MagicMock())
+    prefill = SimpleNamespace(
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free=lambda indices: freed.extend(indices.tolist())
+        ),
+        dllm_manager=manager,
+        disagg_prefill_inflight_queue=[],
+        send_kv_chunk=lambda req, last_chunk: sent.append(("send", last_chunk)),
+    )
+    SchedulerDllmMixin._hand_off_dllm_prompt_kv(prefill, prefill_req)
+
+    assert freed == [13, 14, 15, 16]
+    assert list(prefill_req.output_ids) == [42]
+    assert (prefill_req.kv.kv_allocated_len, prefill_req.kv_committed_len) == (3, 3)
+    assert sent == [("range", 0, 3), ("send", True)]
+    assert prefill.disagg_prefill_inflight_queue == [prefill_req]
+    manager.remove_req.assert_called_once_with(prefill_req)
+
+    # Decode server: the transfer filled request-row slots 20..22 and committed
+    # the handoff token as the request's only output id.
+    extend_ranges = []
+    decode_req = SimpleNamespace(
+        origin_input_ids=prompt_ids,
+        output_ids=array("q", [42]),
+        req_pool_idx=0,
+        sampling_params=SimpleNamespace(max_new_tokens=block_size),
+        dllm_algo_state={"prompt_len": 3, "step": 0},
+        kv=SimpleNamespace(kv_allocated_len=3),
+        kv_committed_len=3,
+        set_extend_range=lambda start, end: extend_ranges.append((start, end)),
+    )
+    row = torch.zeros(1, 16, dtype=torch.int32)
+    row[0, :3] = torch.tensor([20, 21, 22])
+    decode = SimpleNamespace(
+        dllm_config=dllm_config,
+        req_to_token_pool=SimpleNamespace(req_to_token=row),
+        tree_cache=None,
+    )
+    with patch(
+        "sglang.srt.dllm.mixin.scheduler.alloc_token_slots",
+        return_value=torch.tensor([30, 31, 32, 33]),
+    ):
+        SchedulerDllmMixin._resume_dllm_from_prompt_kv(decode, decode_req)
+
+    assert decode_req.prefix_indices.tolist() == [20, 21, 22]
+    assert decode_req.dllm_kv_indices.tolist() == [30, 31, 32, 33]
+    assert row[0, :7].tolist() == [20, 21, 22, 30, 31, 32, 33]
+    assert list(decode_req.dllm_incomplete_ids) == [42, mask_id, mask_id, mask_id]
+    assert list(decode_req.full_untruncated_fill_ids) == [5, 6, 7, 42, 99, 99, 99]
+    assert list(decode_req.output_ids) == []
+    assert decode_req.dllm_algo_state["dual_cache_ready"] is True
+    assert decode_req.dllm_algo_state["is_prefill"] is False
+    assert decode_req.dllm_algo_state["prompt_len"] == 3
+    assert (decode_req.kv.kv_allocated_len, decode_req.kv_committed_len) == (7, 7)
+    assert extend_ranges == [(3, 7)]
+
+
+def test_decode_server_adopts_the_evicted_prompt_layout_without_scoring():
+    state, input_ids = _head_eviction_state()
+    req = SimpleNamespace(
+        dllm_token_eviction_state=state,
+        origin_input_ids=input_ids,
+        dllm_algo_state={"prompt_len": len(input_ids), "step": 0},
+        dllm_phase=None,
+        sampling_params=SimpleNamespace(custom_params=None),
+        is_scoring_token_eviction=lambda: ReqDllmMixin.is_scoring_token_eviction(req),
+    )
+    req.compact_token_eviction_input_ids = lambda: (
+        ReqDllmMixin.compact_token_eviction_input_ids(req)
+    )
+    # The prefill server announces this length before it has scored anything.
+    assert ReqDllmMixin.dllm_handoff_prompt_len(req) == len(input_ids) - 5
+
+    ReqDllmMixin.adopt_dllm_handoff_layout(req)
+
+    assert not req.is_scoring_token_eviction()
+    assert len(req.origin_input_ids) == len(input_ids) - 5
+    assert req.dllm_algo_state["prompt_len"] == len(input_ids) - 5
+    assert ReqDllmMixin.dllm_handoff_prompt_len(req) == len(req.origin_input_ids)
+    # The canvas keeps the positions that follow the uncompacted prompt.
+    req.extend_range = SimpleNamespace(start=11, end=13)
+    assert _compute_dllm_positions(req) == [16, 17]

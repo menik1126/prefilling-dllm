@@ -211,6 +211,27 @@ class ReqDllmMixin:
         self.dllm_incomplete_ids = array("q")
         self.dllm_kv_indices = None
 
+    def dllm_handoff_prompt_len(self: Req) -> int:
+        """Prompt tokens whose KV a prefill server hands to the decode server."""
+        state = self.dllm_token_eviction_state
+        if state is None:
+            return len(self.origin_input_ids)
+        return state.compact_prompt_len
+
+    def adopt_dllm_handoff_layout(self: Req) -> None:
+        """On a decode server, take the prompt layout the prefill server sends.
+
+        Per-head eviction ran on the prefill server, so this side only needs
+        the compacted prompt length and its RoPE position mapping.
+        """
+        state = self.dllm_token_eviction_state
+        if state is None or state.compacted:
+            return
+        state.skip_scoring()
+        self.compact_token_eviction_input_ids()
+        self.dllm_algo_state["prompt_len"] = len(self.origin_input_ids)
+        self.dllm_phase = DllmReqPhase.INCOMING_DECODE
+
     def compact_token_eviction_input_ids(self: Req) -> None:
         """Shrink the prompt ids to the per-head compacted KV layout."""
         state = self.dllm_token_eviction_state

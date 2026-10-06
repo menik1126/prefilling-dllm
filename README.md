@@ -722,13 +722,22 @@ isolation, and confirm that the GPU remains visible. If a card enters
 
 Not done yet for the Dream Prefilling-dLLM path, roughly in priority order:
 
-- [ ] **Prefill-decode disaggregation.** Prefill and denoising still run in one
-      server. Stock SGLang PD (prefill server, decode server, router, NIXL
-      transfer) was smoke-tested on two H20s with the Dream weights in plain
-      causal mode, but dLLM batches bypass it. Needed: send the prompt and canvas
-      KV after the first full pass (after per-head compaction), resume the
-      request on the decode server directly in dual-cache denoising, and carry
-      the canvas tokens, prompt length, and eviction position offsets with the KV.
+- [ ] **Prefill-decode disaggregation (in progress).** The final generation
+      request now runs on stock SGLang PD: the prefill server does the eviction
+      scoring forwards, the full-prompt pass, and per-head compaction, then
+      hands the prompt KV and the first canvas token to the decode server,
+      which resumes directly in dual-cache denoising. On MF-en (150 examples,
+      `torch_native`, prefill on one H20, decode on another, NIXL transfer) the
+      predictions are identical to the single-server run, with and without
+      eviction (49.55 and 48.33). Still open:
+  - draft requests (`dllm_partial_draft`) and `dllm_parallelcomp` have no
+    handoff, and chunk scoring stays on a separate non-dLLM server;
+  - the Rust `sglang_router` drops `sampling_params.custom_params`, which
+    carries the sparse position offset and the eviction spans, so use
+    `launch_router --mini-lb` until the router forwards it;
+  - only tested with `--disable-overlap-schedule`; decode-side retraction,
+    decode radix cache, and abort cleanup are untested;
+  - no throughput measurement yet.
 - [ ] **YaRN x64 (128K) RoPE** for Dream, the paper's main-table setting; only
       native RoPE has been run.
 - [ ] **Other benchmarks.** Only LongBench MF-en is validated; the other
