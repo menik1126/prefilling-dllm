@@ -16,7 +16,6 @@ from sglang.srt.dllm.token_eviction import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
-    NextBatchPlan,
     Req,
     ScheduleBatch,
 )
