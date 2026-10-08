@@ -49,6 +49,9 @@ class ReqDllmMixin:
         # Later-block mask tokens that sit before the block being denoised in
         # the request row; see SchedulerDllmMixin._enter_dllm_block.
         self.dllm_block_position_shift = 0
+        # Mask tokens a decode server appended to origin_input_ids so that its
+        # prompt-sized KV allocation and transfer also cover the canvas.
+        self.dllm_handoff_canvas_len = 0
         self.dllm_config = dllm_config
         # Why the request's dLLM parameters are invalid; the scheduler answers
         # such a request with HTTP 400 instead of running it.
@@ -278,26 +281,51 @@ class ReqDllmMixin:
         self.dllm_incomplete_ids = array("q")
         self.dllm_kv_indices = None
 
-    def dllm_handoff_prompt_len(self: Req) -> int:
-        """Prompt tokens whose KV a prefill server hands to the decode server."""
+    def dllm_canvas_handoff_len(self: Req) -> int:
+        """Canvas tokens whose KV a prefill server hands over with the prompt.
+
+        Block rounds read the later blocks' mask KV of the first pass. A
+        one-block canvas is recomputed whole in every round, so it stays.
+        """
+        config = self.dllm_config
+        if (
+            config is None
+            or not config.needs_full_prefill
+            or self.dllm_partial_draft_state is not None
+            or self.dllm_parallelcomp_state is not None
+        ):
+            return 0
+        canvas_len = self.sampling_params.max_new_tokens
+        return canvas_len if canvas_len > config.block_size else 0
+
+    def dllm_handoff_len(self: Req) -> int:
+        """Tokens whose KV a prefill server hands to the decode server."""
         state = self.dllm_token_eviction_state
-        if state is None:
-            return len(self.origin_input_ids)
-        return state.compact_prompt_len
+        prompt_len = (
+            len(self.origin_input_ids) if state is None else state.compact_prompt_len
+        )
+        return prompt_len + self.dllm_canvas_handoff_len()
 
     def adopt_dllm_handoff_layout(self: Req) -> None:
-        """On a decode server, take the prompt layout the prefill server sends.
+        """On a decode server, take the layout the prefill server sends.
 
         Per-head eviction ran on the prefill server, so this side only needs
         the compacted prompt length and its RoPE position mapping.
         """
         state = self.dllm_token_eviction_state
-        if state is None or state.compacted:
-            return
-        state.skip_scoring()
-        self.compact_token_eviction_input_ids()
-        self.dllm_algo_state["prompt_len"] = len(self.origin_input_ids)
-        self.dllm_phase = DllmReqPhase.INCOMING_DECODE
+        if state is not None and not state.compacted:
+            state.skip_scoring()
+            self.compact_token_eviction_input_ids()
+            self.dllm_algo_state["prompt_len"] = len(self.origin_input_ids)
+            self.dllm_phase = DllmReqPhase.INCOMING_DECODE
+        canvas_len = self.dllm_canvas_handoff_len()
+        if canvas_len and not self.dllm_handoff_canvas_len:
+            # The decode server sizes its preallocation and the transfer by
+            # the input length; resume_dllm_after_prompt_transfer strips these.
+            self.origin_input_ids = self.origin_input_ids + array(
+                "q", [self.dllm_config.mask_id] * canvas_len
+            )
+            self.dllm_handoff_canvas_len = canvas_len
 
     def compact_token_eviction_input_ids(self: Req) -> None:
         """Shrink the prompt ids to the per-head compacted KV layout."""

@@ -768,20 +768,24 @@ class SchedulerDllmMixin:
     ) -> None:
         """Send a prefilled Dream prompt to the decode server and stop here.
 
-        The handoff is the prompt KV plus the first canvas token; the decode
-        server computes canvas KV itself in every round.
+        The handoff is the prompt KV plus the first canvas token. The decode
+        server computes a one-block canvas itself in every round; a longer
+        canvas is handed over too, since block rounds read the first pass's
+        mask KV of the later blocks.
         """
-        prompt_len = len(req.prefix_indices)
-        if req.dllm_kv_indices is not None:
+        handoff_len = len(req.prefix_indices)
+        if req.dllm_canvas_handoff_len():
+            handoff_len += len(req.dllm_kv_indices)
+        elif req.dllm_kv_indices is not None:
             self.token_to_kv_pool_allocator.free(req.dllm_kv_indices)
-        req.kv.kv_allocated_len = prompt_len
-        req.kv_committed_len = prompt_len
+        req.kv.kv_allocated_len = handoff_len
+        req.kv_committed_len = handoff_len
         req.output_ids = array("q", [first_token])
         req.dllm_incomplete_ids = array("q")
         req.dllm_kv_indices = None
         req.dllm_algo_state = None
         # send_kv_chunk transfers the request row up to extend_range.end.
-        req.set_extend_range(0, prompt_len)
+        req.set_extend_range(0, handoff_len)
         self.dllm_manager.remove_req(req)
 
         req.time_stats.set_prefill_finished_time()
@@ -792,6 +796,10 @@ class SchedulerDllmMixin:
 
     def resume_dllm_after_prompt_transfer(self: Scheduler, req: Req) -> None:
         """Rebuild, on a decode server, the state the prefill server stopped in."""
+        handoff_canvas_len = req.dllm_handoff_canvas_len
+        if handoff_canvas_len:
+            req.origin_input_ids = req.origin_input_ids[:-handoff_canvas_len]
+            req.dllm_handoff_canvas_len = 0
         prompt_len = len(req.origin_input_ids)
         first_token = req.output_ids.pop()
         req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
@@ -811,33 +819,19 @@ class SchedulerDllmMixin:
             req.init_next_round_input()
             return
 
-        canvas_len = req.sampling_params.max_new_tokens
-        if canvas_len > self.dllm_config.block_size:
-            # Block rounds need the later blocks' mask KV, which the prefill
-            # server did not send: initialize the whole canvas here first.
-            req.dllm_algo_state = {
-                "prompt_len": prompt_len,
-                "step": 0,
-                "is_prefill": False,
-                "dual_cache_ready": True,
-                "block_stage": "suffix_init",
-                "block_first_token": first_token,
-            }
-            req.dllm_incomplete_ids = array("q")
-            req.dllm_kv_indices = None
-            req.dllm_initialized = False
-            req.dllm_canvas_output_len = -1
-            req.init_next_round_input()
-            return
-
         # A generation request left its first full pass: denoising continues
         # on a canvas holding only the first token.
+        canvas_len = req.sampling_params.max_new_tokens
         seq_len = prompt_len + canvas_len
         canvas = array(
             "q", [first_token] + [self.dllm_config.mask_id] * (canvas_len - 1)
         )
-        canvas_slots = alloc_token_slots(self.tree_cache, canvas_len)
-        req_row[prompt_len:seq_len] = canvas_slots
+        if handoff_canvas_len:
+            # The canvas KV of the first pass arrived with the prompt.
+            canvas_slots = req_row[prompt_len:seq_len].to(dtype=torch.int64, copy=True)
+        else:
+            canvas_slots = alloc_token_slots(self.tree_cache, canvas_len)
+            req_row[prompt_len:seq_len] = canvas_slots
         req.dllm_kv_indices = canvas_slots.clone()
         req.kv.kv_allocated_len = seq_len
         req.kv_committed_len = seq_len
@@ -854,6 +848,7 @@ class SchedulerDllmMixin:
         }
         req.set_extend_range(prompt_len, seq_len)
         req.dllm_phase = DllmReqPhase.STAGING_DECODE
+        self._enter_dllm_block(req)
 
     def _get_new_score_batch(
         self: Scheduler, running_batch: ScheduleBatch

@@ -178,7 +178,9 @@ Prefill and denoising can run on separate servers through SGLang's built-in
 PD. The prefill server does the draft prompt pass, the eviction scoring
 forwards, the full-prompt pass, and per-head compaction; it then sends the
 prompt KV and the first generated token to the decode server, which runs the
-denoising rounds. Either server can answer chunk-scoring requests.
+denoising rounds. An answer longer than one block also takes its canvas KV
+along, which the later blocks' rounds read. Either server can answer
+chunk-scoring requests.
 
 ```bash
 DLLM="--model-path $MODEL --trust-remote-code --attention-backend torch_native \
@@ -246,13 +248,15 @@ Roughly in priority order:
 - [ ] **Prefill-decode disaggregation (in progress).** Drafts and the final
       generation request now run on stock SGLang PD. The prefill server does
       the draft prompt pass, the eviction scoring forwards, the full-prompt
-      pass, and per-head compaction, then hands the prompt KV and the first
-      canvas token to the decode server, which resumes at draft suffix
+      pass, and per-head compaction, then hands the prompt KV (plus the
+      canvas KV of a multi-block answer) and the first canvas token to the
+      decode server, which resumes at draft suffix
       initialization or directly in dual-cache denoising; chunk-scoring requests
       finish on whichever PD server they are sent to. Tested layout: prefill server on one H20,
       decode server on another, NIXL transfer, `launch_router --mini-lb`.
       Predictions, selected chunks, and drafts are identical to the
-      single-server pipeline, with and without eviction. Still open:
+      single-server pipeline, with and without eviction, for one-block and
+      two-block answers. Still open:
   - `dllm_parallelcomp` has no handoff;
   - the Rust `sglang_router` drops `sampling_params.custom_params`, which
     carries the sparse position offset, the draft config, and the eviction

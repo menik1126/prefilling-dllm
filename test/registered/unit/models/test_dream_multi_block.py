@@ -177,32 +177,68 @@ def test_block_with_a_stop_token_ends_the_request_without_later_blocks():
     assert req.dllm_block_position_shift == 0
 
 
-def test_transferred_multi_block_prompt_initializes_the_whole_canvas_first():
-    row = torch.zeros(1, 16, dtype=torch.int32)
-    row[0, :3] = torch.tensor([20, 21, 22])
-    decode = SimpleNamespace(
-        dllm_config=_dllm_config(),
-        req_to_token_pool=SimpleNamespace(req_to_token=row),
-    )
-    req = SimpleNamespace(
-        origin_input_ids=array("q", [1, 2, 3]),
-        output_ids=array("q", [42]),
-        req_pool_idx=0,
-        sampling_params=SimpleNamespace(max_new_tokens=5),
-        dllm_algo_state={"prompt_len": 3, "step": 0},
-        dllm_partial_draft_state=None,
-        init_next_round_input=MagicMock(),
-    )
+def test_multi_block_canvas_kv_travels_with_the_prompt_over_pd():
+    # Prefill server: prompt slots 10..12 and the five canvas slots 20..24 of
+    # the first pass are sent; nothing is freed before the transfer.
+    freed, ranges = [], []
+    prefill_req = _req_after_first_pass()
+    prefill_req.pending_bootstrap = True
+    prefill_req.time_stats = MagicMock()
+    prefill_req.set_extend_range = lambda start, end: ranges.append((start, end))
+    prefill_req.dllm_canvas_handoff_len = lambda: 5
+    prefill = _scheduler(freed)
+    prefill.dllm_manager = SimpleNamespace(remove_req=MagicMock())
+    prefill.disagg_prefill_inflight_queue = []
 
-    SchedulerDllmMixin.resume_dllm_after_prompt_transfer(decode, req)
+    SchedulerDllmMixin._hand_off_dllm_prompt_kv(prefill, prefill_req, first_token=7)
 
-    assert req.prefix_indices.tolist() == [20, 21, 22]
-    assert list(req.output_ids) == []
-    assert req.dllm_algo_state["block_stage"] == "suffix_init"
-    assert req.dllm_algo_state["block_first_token"] == 42
-    assert req.dllm_algo_state["dual_cache_ready"] is True
-    assert req.dllm_kv_indices is None
-    req.init_next_round_input.assert_called_once_with()
+    assert freed == []
+    assert ranges == [(0, 8)]
+    assert (prefill_req.kv.kv_allocated_len, prefill_req.kv_committed_len) == (8, 8)
+    assert list(prefill_req.output_ids) == [7]
+
+    # Decode server: the request is sized as prompt + canvas before the
+    # transfer, then takes the transferred canvas slots as its retained KV.
+    req = _Req(input_ids=[1, 2, 3], max_new_tokens=5)
+    req.init_diffusion_llm(_dllm_config())
+    assert req.dllm_handoff_len() == 8
+    req.adopt_dllm_handoff_layout()
+    req.adopt_dllm_handoff_layout()
+    assert list(req.origin_input_ids) == [1, 2, 3] + [MASK] * 5
+
+    decode = _scheduler([])
+    decode._enter_dllm_block = lambda r: SchedulerDllmMixin._enter_dllm_block(decode, r)
+    row = decode.req_to_token_pool.req_to_token
+    row[0, :8] = torch.tensor([30, 31, 32, 40, 41, 42, 43, 44])
+    req.req_pool_idx = 0
+    req.output_ids = array("q", [7])
+    req.kv = SimpleNamespace(kv_allocated_len=8)
+    req.kv_committed_len = 8
+    req.set_extend_range = MagicMock()
+    with patch("sglang.srt.dllm.mixin.scheduler.alloc_token_slots") as alloc:
+        SchedulerDllmMixin.resume_dllm_after_prompt_transfer(decode, req)
+
+    alloc.assert_not_called()
+    assert list(req.origin_input_ids) == [1, 2, 3]
+    assert req.dllm_handoff_canvas_len == 0
+    # Block rounds start on the first two canvas slots, behind the later three.
+    assert req.prefix_indices.tolist() == [30, 31, 32, 42, 43, 44]
+    assert req.dllm_kv_indices.tolist() == [40, 41]
+    assert list(req.dllm_incomplete_ids) == [7, MASK]
+    assert req.dllm_block_position_shift == 3
+    assert req.dllm_algo_state["more_blocks"] is True
+
+
+def test_one_block_canvas_and_drafts_hand_off_the_prompt_only():
+    assert _init_req(input_ids=[1, 2, 3], max_new_tokens=BLOCK).dllm_handoff_len() == 3
+    draft = _init_req(
+        config=_dllm_config(block_size=32),
+        input_ids=[1, 2, 3],
+        max_new_tokens=4,
+        custom_params={"dllm_partial_draft": {"rounds": 1}},
+    )
+    assert draft.dllm_request_error is None
+    assert draft.dllm_handoff_len() == 3
 
 
 def _step(algorithm, *, input_ids, logits, state, canvas_len):

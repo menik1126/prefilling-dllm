@@ -1269,6 +1269,7 @@ def test_dream_prompt_handoff_resumes_in_dual_cache_denoising_on_the_decode_serv
         pending_bootstrap=False,
         time_stats=MagicMock(),
         set_extend_range=lambda start, end: sent.append(("range", start, end)),
+        dllm_canvas_handoff_len=lambda: 0,
     )
     manager = SimpleNamespace(remove_req=MagicMock())
     prefill = SimpleNamespace(
@@ -1300,6 +1301,7 @@ def test_dream_prompt_handoff_resumes_in_dual_cache_denoising_on_the_decode_serv
         dllm_partial_draft_state=None,
         kv=SimpleNamespace(kv_allocated_len=3),
         kv_committed_len=3,
+        dllm_handoff_canvas_len=0,
         set_extend_range=lambda start, end: extend_ranges.append((start, end)),
     )
     row = torch.zeros(1, 16, dtype=torch.int32)
@@ -1308,6 +1310,9 @@ def test_dream_prompt_handoff_resumes_in_dual_cache_denoising_on_the_decode_serv
         dllm_config=dllm_config,
         req_to_token_pool=SimpleNamespace(req_to_token=row),
         tree_cache=None,
+    )
+    decode._enter_dllm_block = lambda req: SchedulerDllmMixin._enter_dllm_block(
+        decode, req
     )
     with patch(
         "sglang.srt.dllm.mixin.scheduler.alloc_token_slots",
@@ -1336,6 +1341,8 @@ def test_decode_server_adopts_the_evicted_prompt_layout_without_scoring():
         dllm_algo_state={"prompt_len": len(input_ids), "step": 0},
         dllm_phase=None,
         dllm_block_position_shift=0,
+        dllm_handoff_canvas_len=0,
+        dllm_canvas_handoff_len=lambda: 0,
         sampling_params=SimpleNamespace(custom_params=None),
         is_scoring_token_eviction=lambda: ReqDllmMixin.is_scoring_token_eviction(req),
     )
@@ -1343,14 +1350,14 @@ def test_decode_server_adopts_the_evicted_prompt_layout_without_scoring():
         ReqDllmMixin.compact_token_eviction_input_ids(req)
     )
     # The prefill server announces this length before it has scored anything.
-    assert ReqDllmMixin.dllm_handoff_prompt_len(req) == len(input_ids) - 5
+    assert ReqDllmMixin.dllm_handoff_len(req) == len(input_ids) - 5
 
     ReqDllmMixin.adopt_dllm_handoff_layout(req)
 
     assert not req.is_scoring_token_eviction()
     assert len(req.origin_input_ids) == len(input_ids) - 5
     assert req.dllm_algo_state["prompt_len"] == len(input_ids) - 5
-    assert ReqDllmMixin.dllm_handoff_prompt_len(req) == len(req.origin_input_ids)
+    assert ReqDllmMixin.dllm_handoff_len(req) == len(req.origin_input_ids)
     # The canvas keeps the positions that follow the uncompacted prompt.
     req.extend_range = SimpleNamespace(start=11, end=13)
     assert _compute_dllm_positions(req) == [16, 17]
@@ -1375,6 +1382,7 @@ def test_transferred_draft_resumes_at_suffix_initialization():
         req_pool_idx=0,
         dllm_partial_draft_state=dict(draft_state),
         dllm_algo_state={"prompt_len": 3, "step": 0, **draft_state},
+        dllm_handoff_canvas_len=0,
         init_next_round_input=MagicMock(),
     )
 

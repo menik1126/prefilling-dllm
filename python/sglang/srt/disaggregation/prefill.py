@@ -375,8 +375,9 @@ class PrefillBootstrapQueue:
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         num_kv_indices = len(req.origin_input_ids)
         if self.scheduler.dllm_config is not None:
-            # Per-head token eviction shortens the prompt before it is sent.
-            num_kv_indices = req.dllm_handoff_prompt_len()
+            # Per-head token eviction shortens the prompt before it is sent,
+            # and a multi-block canvas travels with it.
+            num_kv_indices = req.dllm_handoff_len()
         req.start_send_idx = decode_prefix_len
         # Base of the staging chunk grid (suffix-relative send coordinates).
         req.disagg_decode_prefix_len = decode_prefix_len
@@ -1188,6 +1189,8 @@ class SchedulerDisaggregationPrefillMixin:
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
+        if self.dllm_config is not None:
+            transfer_input_len = req.dllm_handoff_len()
         end_idx = (
             end_idx
             if end_idx is not None
