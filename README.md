@@ -29,6 +29,9 @@ Instead, for one request:
 6. **Denoise.** Every later step recomputes only the 32 generation positions
    against the cached prompt KV (dual cache), accepting tokens whose confidence
    reaches 0.9.
+7. **Continue (answers longer than 32 tokens).** The canvas is denoised one
+   32-token block at a time against the same prompt KV: the last position of a
+   finished block predicts the first token of the next one.
 
 ## Status
 
@@ -38,8 +41,12 @@ Instead, for one request:
 | Shared draft (partial draft rounds) | done |
 | Query-conditioned chunk scoring mask | done, `flashinfer` and `torch_native` |
 | Scoring, drafting, and generation on one server | done |
+| One call per answer (pipeline service and library outside SGLang) | done |
 | Full-prompt prefill with sparse RoPE positions | done |
 | Per-head token eviction, bidirectional score | done |
+| Multi-block generation (`max_new_tokens` above the block size) | done |
+| YaRN RoPE scaling (x64, 128K positions) | done |
+| HTTP 400 for malformed dLLM request parameters | done |
 | Prefill-decode disaggregation on stock SGLang PD | drafts and generation done; see TODO |
 | Server-side chunk prefill with whole-token eviction (`--server-chunk-prefill`) | works, accuracy not aligned |
 
@@ -93,10 +100,62 @@ python -m sglang.launch_server --model-path $MODEL --trust-remote-code \
   --mem-fraction-static 0.60 --port 30000
 ```
 
+### Pipeline service
+
+`prefilling_dllm/` puts the whole method behind one call: a document and a
+question go in, the answer comes out. It sits outside the SGLang package and
+holds no model; it tokenizes, then sends the draft, chunk-scoring, and
+generation requests to the server above. Run it from the repository root (or
+put the root on `PYTHONPATH`); it needs only `transformers` and `msgspec`.
+
+```bash
+python -m prefilling_dllm.server --model-path $MODEL \
+  --base-url http://127.0.0.1:30000 --port 8080
+```
+
+```bash
+curl -s http://127.0.0.1:8080/answer -H 'Content-Type: application/json' \
+  -d '{"context": "<long document>", "question": "<question>"}'
+```
+
+The response carries `answer`, the selected chunk indices and their scores,
+token counts, and the seconds spent drafting, scoring, and generating. An
+optional `template` field with `{context}` and `{question}` slots replaces
+the default prompt. `--token-capacity 512` turns on per-head token eviction;
+`--chunk-size`, `--top-k`, `--draft-tokens`, and `--score-batch-size` default
+to 1024, 4, 4, and 8.
+
+The same pipeline as a library:
+
+```python
+from transformers import AutoTokenizer
+
+from prefilling_dllm import PrefillingDreamPipeline, SGLangClient
+
+pipeline = PrefillingDreamPipeline(
+    tokenizer=AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True),
+    client=SGLangClient("http://127.0.0.1:30000", timeout=600),
+)
+print(pipeline.answer(context=document, question=question).answer)
+```
+
+### YaRN RoPE scaling
+
+The reference's 128K setting scales Dream's RoPE with YaRN. Add this to the
+server command (every server of a PD deployment):
+
+```bash
+--json-model-override-args '{"rope_scaling": {"rope_type": "yarn", "factor": 64.0, "original_max_position_embeddings": 131072, "max_cached_positions": 131072}}'
+```
+
+`max_cached_positions` keeps the precomputed cos/sin table at 131072 rows
+instead of `original_max_position_embeddings * factor`; the table still grows
+on demand.
+
 ### Benchmark client
 
-The client does the chunking, drafting, scoring requests, selection, and
-prompt assembly:
+The LongBench client runs the same steps over a dataset, with batching across
+examples and the experimental modes, and scores the answers:
 
 ```bash
 python benchmark/dllm/longbench/bench_multifieldqa_chunk_selection.py \
@@ -148,6 +207,7 @@ drafts and generation) and
 go straight to one PD server and finish there; sending them to the decode
 server keeps the heavy prompt forwards off the prefill server. `--mini-lb` is
 required for now because the Rust router drops `sampling_params.custom_params`.
+The pipeline service takes the same three flags.
 
 ## Request parameters
 
@@ -163,7 +223,8 @@ The dLLM-specific inputs travel in `sampling_params.custom_params`:
 
 ## Limits
 
-- One generation block: `max_new_tokens == block_size == 32`.
+- A canvas longer than one block needs `dual_cache` and `--dllm-fdfo`. Drafts
+  are 4 slots and `dllm_parallelcomp` generates one block.
 - Scoring mask and eviction need the `flashinfer` or `torch_native` attention
   backend, a disabled radix cache, and a scoring row that fits one forward
   (`--chunked-prefill-size -1` is the simple way).
@@ -175,8 +236,8 @@ The dLLM-specific inputs travel in `sampling_params.custom_params`:
   workspace per 4K-token prompt prefilled in the same forward. The default 2 GB
   overflows at three concurrent long prompts; set
   `SGLANG_FLASHINFER_WORKSPACE_SIZE` (bytes) higher for concurrent load.
-- Malformed custom parameters raise inside the scheduler instead of returning
-  HTTP 400.
+- `torch_native` has no deterministic mode: a few outputs change with the
+  batch a request happens to share under concurrent load.
 
 ## TODO
 
@@ -202,21 +263,12 @@ Roughly in priority order:
   - throughput depends on the prefill-to-decode ratio (see Speed); the
     ratio sweep covered final generation requests only, without scoring,
     drafts, or eviction.
-- [ ] **YaRN x64 (128K) RoPE** for Dream, the paper's main-table setting; only
-      native RoPE has been run.
-- [ ] **Multi-block generation.** Everything assumes
-      `max_new_tokens == block_size == 32`.
-- [ ] **Server-side orchestration.** Chunking, drafting, chunk scoring, top-k
-      selection, and prompt assembly live in the benchmark client: one answer
-      still takes several requests to the server.
 - [ ] **Speed.** Eviction scores one chunk per forward and roughly halves
       throughput; every run so far used `--disable-cuda-graph`.
 - [ ] **Backend consistency.** `flashinfer` and `torch_native` do not produce
       identical outputs on identical inputs; the cause is not isolated.
 - [ ] **More attention backends** for the scoring mask (Triton, FA3).
 - [ ] **Token eviction with tensor parallelism** or a KV page size above 1.
-- [ ] **Request validation.** Malformed custom params raise inside the scheduler
-      instead of returning HTTP 400.
 - [ ] **LLaDA / UltraLLaDA.**
 
 ## Acknowledgment
