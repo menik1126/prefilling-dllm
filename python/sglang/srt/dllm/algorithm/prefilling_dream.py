@@ -16,8 +16,13 @@ class PrefillingDream(DllmAlgorithm):
     Prefilling-dLLM shifts Dream logits by one position, accepts the first
     generated token during prefill, then accepts every masked token whose
     greedy probability reaches the threshold. If none qualifies, it forces the
-    single highest-confidence token. This implementation intentionally targets
-    the one-block LongBench setting (block_size == max_new_tokens == 32).
+    single highest-confidence token.
+
+    A canvas longer than one block is denoised block by block against the
+    prompt KV of the first pass. The scheduler drives the block stages through
+    ``block_stage``: "finalize" reads the finished block's last raw logit as
+    the next block's first token, and "suffix_init" writes that token into the
+    freshly initialized remaining canvas.
     """
 
     def __init__(self, config: DllmConfig):
@@ -83,6 +88,8 @@ class PrefillingDream(DllmAlgorithm):
             and all(
                 isinstance(state, dict)
                 and state.get("partial_draft_stage") is None
+                and state.get("block_stage") is None
+                and not state.get("more_blocks", False)
                 and not state.get("partial_draft", False)
                 and not state.get("is_prefill", True)
                 and state.get("dual_cache_ready", False)
@@ -224,6 +231,30 @@ class PrefillingDream(DllmAlgorithm):
             # server-wide block size.
             state["last_round_was_dual_cache"] = dual_cache_round
 
+            block_stage = state.get("block_stage")
+            state["last_block_stage"] = block_stage
+            if block_stage == "finalize":
+                if not dual_cache_round or logits.shape[0] != 1:
+                    raise RuntimeError(
+                        "PrefillingDream block finalize requires one raw final logit"
+                    )
+                state["block_first_token"] = int(
+                    F.softmax(logits[0], dim=-1).argmax(dim=-1).item()
+                )
+                state["block_stage"] = "suffix_init"
+                done.append(False)
+                continue
+
+            if block_stage == "suffix_init":
+                if not bool(ids.eq(self.mask_id).all().item()):
+                    raise RuntimeError(
+                        "PrefillingDream block suffix must start fully masked"
+                    )
+                ids[0] = state["block_first_token"]
+                state["block_stage"] = None
+                done.append(False)
+                continue
+
             if partial_draft_stage == "prompt":
                 if dual_cache_round or logits.shape[0] != 1:
                     raise RuntimeError(
@@ -293,7 +324,8 @@ class PrefillingDream(DllmAlgorithm):
             else:
                 mask = generation_ids.eq(self.mask_id)
             if not bool(mask.any().item()):
-                done.append(True)
+                # A finished block that is not the last one is not the answer.
+                done.append(not state.get("more_blocks", False))
                 continue
 
             # DreamModel.forward already right-shifts each request's hidden
@@ -358,7 +390,9 @@ class PrefillingDream(DllmAlgorithm):
                 # here is equivalent when every remaining candidate was
                 # accepted and none was rewritten to mask_id itself. Only the
                 # possible final round pays the small device-to-host check.
-                request_done = accepted.numel() == mask_positions.numel()
+                request_done = accepted.numel() == mask_positions.numel() and (
+                    not state.get("more_blocks", False)
+                )
                 if request_done:
                     request_done = not bool(
                         accepted_tokens.eq(self.mask_id).any().item()

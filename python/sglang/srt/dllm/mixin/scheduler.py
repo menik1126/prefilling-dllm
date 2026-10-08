@@ -349,6 +349,21 @@ class SchedulerDllmMixin:
                         req.dllm_phase = DllmReqPhase.STAGING_DECODE
                         continue
 
+                    # Popped: the vectorized step does not rewrite it.
+                    last_block_stage = algo_state.pop("last_block_stage", None)
+                    if last_block_stage == "finalize":
+                        self._drop_later_dllm_blocks(req)
+                        continue
+                    if last_block_stage == "suffix_init":
+                        self._adopt_dllm_block_suffix(
+                            req,
+                            round_tokens=round_tokens,
+                            round_cache_loc=_round_cache_loc(batch, idx),
+                        )
+                        self._enter_dllm_block(req)
+                        self._commit_dllm_block_if_complete(req)
+                        continue
+
                     # step() mutates the carried state in place, so the first
                     # full-canvas pass already appears dual-cache-ready here.
                     # The returned token span is the authoritative round type.
@@ -412,7 +427,10 @@ class SchedulerDllmMixin:
                             if parallelcomp is not None
                             else req.dllm_algo_state["prompt_len"]
                         )
-                        req.output_ids = array("q", canvas[prompt_len:])
+                        # Earlier blocks of a multi-block canvas are already
+                        # in output_ids.
+                        final_tokens = array("q", canvas[prompt_len:])
+                        req.output_ids = req.output_ids + final_tokens
                         if partial_draft:
                             confirmed_mask = req.dllm_algo_state.get(
                                 "partial_draft_confirmed_mask"
@@ -437,9 +455,7 @@ class SchedulerDllmMixin:
                         req.dllm_incomplete_ids = array("q")
                         req.dllm_kv_indices = None
                         req.dllm_algo_state = None
-                        self.metrics_reporter.num_generated_tokens += len(
-                            req.output_ids
-                        )
+                        self.metrics_reporter.num_generated_tokens += len(final_tokens)
                         if req.output_ids:
                             req.update_finish_state(
                                 new_accepted_len=len(req.output_ids)
@@ -497,6 +513,10 @@ class SchedulerDllmMixin:
                                             req,
                                             first_token=req.dllm_incomplete_ids[0],
                                         )
+                                    else:
+                                        self._enter_dllm_block(req)
+                            if req.dllm_algo_state is not None:
+                                self._commit_dllm_block_if_complete(req)
                         else:
                             release_kv_cache(req, self.tree_cache, is_insert=False)
                     continue
@@ -631,6 +651,118 @@ class SchedulerDllmMixin:
         req.full_untruncated_fill_ids = req.origin_input_ids + canvas
         req.dllm_algo_state["prompt_len"] = prompt_len
 
+    def _enter_dllm_block(self: Scheduler, req: Req) -> None:
+        """Narrow a canvas longer than one block to its first block.
+
+        The request row is [prompt + finished blocks][remaining canvas] and
+        ``dllm_incomplete_ids`` / ``dllm_kv_indices`` cover the remaining
+        canvas. The later blocks' mask KV moves in front of the first block,
+        so a denoising round still extends the row's tail; attention is
+        bidirectional and positions are explicit, so row order is free.
+        """
+        block_size = self.dllm_config.block_size
+        later_len = len(req.dllm_incomplete_ids) - block_size
+        if later_len <= 0:
+            req.dllm_algo_state["more_blocks"] = False
+            return
+        done_len = len(req.prefix_indices)
+        canvas_slots = req.dllm_kv_indices
+        block_slots = canvas_slots[:block_size].clone()
+        later_slots = canvas_slots[block_size:]
+        req.prefix_indices = torch.cat([req.prefix_indices, later_slots])
+        req.dllm_kv_indices = block_slots
+        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        req_row[done_len : done_len + later_len] = later_slots
+        req_row[done_len + later_len : done_len + len(canvas_slots)] = block_slots
+
+        canvas = req.dllm_incomplete_ids
+        req.full_untruncated_fill_ids = (
+            req.full_untruncated_fill_ids[:done_len]
+            + canvas[block_size:]
+            + canvas[:block_size]
+        )
+        req.dllm_incomplete_ids = canvas[:block_size]
+        req.dllm_block_position_shift = later_len
+        state = req.dllm_algo_state
+        state["prompt_len"] = done_len + later_len
+        state["canvas_len"] = block_size
+        state["more_blocks"] = True
+
+    def _commit_dllm_block_if_complete(self: Scheduler, req: Req) -> None:
+        """Move a finished non-final block into the output ids."""
+        state = req.dllm_algo_state
+        if not state.get("more_blocks", False) or state.get("block_stage") is not None:
+            return
+        block = req.dllm_incomplete_ids
+        if self.dllm_config.mask_id in block:
+            return
+        req.output_ids = req.output_ids + block
+        req.dllm_canvas_output_len = len(req.output_ids)
+        self.metrics_reporter.num_generated_tokens += len(block)
+        req.update_finish_state(new_accepted_len=len(block))
+        if req.finished():
+            # The block holds a stop token: later blocks are never read.
+            req.dllm_incomplete_ids = array("q")
+            req.dllm_kv_indices = None
+            req.dllm_algo_state = None
+            req.dllm_block_position_shift = 0
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            req.time_stats.set_completion_time()
+            return
+        # One more forward of the block refreshes its KV with the final tokens
+        # and yields the next block's first token.
+        state["canvas_len"] = 1
+        state["block_stage"] = "finalize"
+
+    def _drop_later_dllm_blocks(self: Scheduler, req: Req) -> None:
+        """After a block's finalize forward, free the later blocks' mask KV.
+
+        The next forward initializes the remaining canvas again, behind the
+        prompt and every finished block.
+        """
+        later_len = req.dllm_block_position_shift
+        done_len = len(req.prefix_indices) - later_len
+        block_slots = req.dllm_kv_indices
+        self.token_to_kv_pool_allocator.free(req.prefix_indices[done_len:])
+        req.prefix_indices = torch.cat([req.prefix_indices[:done_len], block_slots])
+        seq_len = len(req.prefix_indices)
+        req_row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        req_row[done_len:seq_len] = block_slots
+        req.kv.kv_allocated_len = seq_len
+        req.kv_committed_len = seq_len
+
+        req.dllm_block_position_shift = 0
+        req.dllm_incomplete_ids = array("q")
+        req.dllm_kv_indices = None
+        req.dllm_initialized = False
+        req.dllm_canvas_output_len = -1
+        req.dllm_algo_state["prompt_len"] = seq_len
+        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+
+    def _adopt_dllm_block_suffix(
+        self: Scheduler,
+        req: Req,
+        *,
+        round_tokens: array,
+        round_cache_loc: torch.Tensor,
+    ) -> None:
+        """Take the freshly initialized remaining canvas as retained KV."""
+        prompt_len = len(req.prefix_indices)
+        if len(round_tokens) != len(round_cache_loc) or prompt_len + len(
+            round_tokens
+        ) != len(req.full_untruncated_fill_ids):
+            raise RuntimeError(
+                "Dream block suffix token/KV span mismatch: "
+                f"tokens={len(round_tokens)}, kv={len(round_cache_loc)}, "
+                f"prefix={prompt_len}, "
+                f"canvas={len(req.full_untruncated_fill_ids)}"
+            )
+        req.full_untruncated_fill_ids[prompt_len:] = round_tokens
+        req.dllm_incomplete_ids = array("q", round_tokens)
+        req.dllm_kv_indices = round_cache_loc.clone()
+        req.dllm_algo_state["prompt_len"] = prompt_len
+        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+
     def _hand_off_dllm_prompt_kv(
         self: Scheduler, req: Req, *, first_token: int
     ) -> None:
@@ -679,9 +811,27 @@ class SchedulerDllmMixin:
             req.init_next_round_input()
             return
 
+        canvas_len = req.sampling_params.max_new_tokens
+        if canvas_len > self.dllm_config.block_size:
+            # Block rounds need the later blocks' mask KV, which the prefill
+            # server did not send: initialize the whole canvas here first.
+            req.dllm_algo_state = {
+                "prompt_len": prompt_len,
+                "step": 0,
+                "is_prefill": False,
+                "dual_cache_ready": True,
+                "block_stage": "suffix_init",
+                "block_first_token": first_token,
+            }
+            req.dllm_incomplete_ids = array("q")
+            req.dllm_kv_indices = None
+            req.dllm_initialized = False
+            req.dllm_canvas_output_len = -1
+            req.init_next_round_input()
+            return
+
         # A generation request left its first full pass: denoising continues
         # on a canvas holding only the first token.
-        canvas_len = req.sampling_params.max_new_tokens
         seq_len = prompt_len + canvas_len
         canvas = array(
             "q", [first_token] + [self.dllm_config.mask_id] * (canvas_len - 1)
@@ -726,10 +876,13 @@ class SchedulerDllmMixin:
             prefill_max_requests=get_schedule().prefill_max_requests,
         )
         # Generation requests keep their request slots between rounds, so a
-        # scoring batch can only take the slots that are free right now.
-        free_req_slots = self.req_to_token_pool.available_size()
+        # scoring batch can only take the slots that are free right now. A
+        # decode server's slot pool is larger than the forward batch limit.
+        max_score_reqs = min(
+            self.req_to_token_pool.available_size(), self.max_running_requests
+        )
         for req in score_reqs:
-            if len(adder.can_run_list) >= free_req_slots:
+            if len(adder.can_run_list) >= max_score_reqs:
                 break
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

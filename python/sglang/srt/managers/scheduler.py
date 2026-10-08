@@ -2554,6 +2554,14 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            if req.dllm_request_error is not None:
+                logger.error(req.dllm_request_error)
+                prepare_abort(
+                    req, req.dllm_request_error, status_code=HTTPStatus.BAD_REQUEST
+                )
+                self.output_streamer.stream_output([req], req.return_logprob)
+                return
+
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     recv_req.session_id

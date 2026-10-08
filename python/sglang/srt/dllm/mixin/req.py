@@ -12,7 +12,8 @@ from sglang.srt.dllm.head_token_eviction import (
     parse_head_token_eviction,
     score_stage_input_ids,
 )
-from sglang.srt.dllm.score_attention import is_score_request
+from sglang.srt.dllm.score_attention import is_score_request, parse_score_attention
+from sglang.srt.dllm.sparse_positions import parse_sparse_position_shift
 from sglang.srt.dllm.token_eviction import (
     parallelcomp_chunk_query_len,
     parse_token_eviction,
@@ -45,17 +46,20 @@ class ReqDllmMixin:
         )
         self.dllm_block_offset = 0
         self.dllm_canvas_output_len = 0
+        # Later-block mask tokens that sit before the block being denoised in
+        # the request row; see SchedulerDllmMixin._enter_dllm_block.
+        self.dllm_block_position_shift = 0
         self.dllm_config = dllm_config
-        self.dllm_parallelcomp_state = self._parse_parallelcomp_state()
-        self.dllm_partial_draft_state = self._parse_partial_draft_state()
-        if (
-            self.dllm_parallelcomp_state is not None
-            and self.dllm_partial_draft_state is not None
-        ):
-            raise ValueError(
-                "dllm_partial_draft cannot be combined with dllm_parallelcomp"
-            )
-        self.dllm_token_eviction_state = self._parse_token_eviction_state()
+        # Why the request's dLLM parameters are invalid; the scheduler answers
+        # such a request with HTTP 400 instead of running it.
+        self.dllm_request_error: Optional[str] = None
+        try:
+            self._parse_dllm_request_params()
+        except ValueError as error:
+            self.dllm_request_error = str(error)
+            self.dllm_parallelcomp_state = None
+            self.dllm_partial_draft_state = None
+            self.dllm_token_eviction_state = None
         if self.dllm_partial_draft_state is not None:
             # Keep request-specific algorithm controls in the state that FDFO
             # already carries across denoising rounds.  The server-wide Dream
@@ -77,6 +81,47 @@ class ReqDllmMixin:
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
             else:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+
+    def _parse_dllm_request_params(self: Req) -> None:
+        """Parse every dLLM custom parameter; ValueError names the bad one."""
+        custom_params = self.sampling_params.custom_params
+        parse_score_attention(custom_params, input_len=len(self.origin_input_ids))
+        parse_sparse_position_shift(
+            custom_params, prompt_len=len(self.origin_input_ids)
+        )
+        self.dllm_parallelcomp_state = self._parse_parallelcomp_state()
+        self.dllm_partial_draft_state = self._parse_partial_draft_state()
+        if (
+            self.dllm_parallelcomp_state is not None
+            and self.dllm_partial_draft_state is not None
+        ):
+            raise ValueError(
+                "dllm_partial_draft cannot be combined with dllm_parallelcomp"
+            )
+        self.dllm_token_eviction_state = self._parse_token_eviction_state()
+        self._validate_dllm_canvas()
+
+    def _validate_dllm_canvas(self: Req) -> None:
+        config = self.dllm_config
+        if config is None or not config.needs_full_prefill:
+            return
+        max_new_tokens = self.sampling_params.max_new_tokens
+        if (
+            max_new_tokens is None
+            or config.block_size is None
+            or max_new_tokens <= config.block_size
+        ):
+            return
+        if not (config.dual_cache and config.first_done_first_out_mode):
+            raise ValueError(
+                "max_new_tokens above the Dream block size requires dual_cache "
+                f"and --dllm-fdfo: {max_new_tokens} > {config.block_size}"
+            )
+        if self.dllm_parallelcomp_state is not None:
+            raise ValueError(
+                "dllm_parallelcomp generates one block: max_new_tokens "
+                f"{max_new_tokens} > block size {config.block_size}"
+            )
 
     def is_dllm(self: Req) -> bool:
         return self.dllm_config is not None
@@ -103,6 +148,8 @@ class ReqDllmMixin:
         config = custom_params["dllm_partial_draft"]
         if not isinstance(config, dict):
             raise ValueError("dllm_partial_draft must be an object")
+        if not self.origin_input_ids:
+            raise ValueError("dllm_partial_draft requires a non-empty prompt")
         if set(config) != {"rounds"}:
             raise ValueError("dllm_partial_draft only accepts the 'rounds' field")
 
@@ -189,14 +236,6 @@ class ReqDllmMixin:
             raise ValueError("dllm_token_eviction requires Dream dual_cache")
         if not self.dllm_config.first_done_first_out_mode:
             raise ValueError("dllm_token_eviction requires --dllm-fdfo")
-        if self.sampling_params.max_new_tokens != self.dllm_config.block_size:
-            # Later blocks would re-prefill a prompt whose KV no longer
-            # corresponds to one token per slot.
-            raise ValueError(
-                "dllm_token_eviction requires max_new_tokens == block_size: "
-                f"{self.sampling_params.max_new_tokens} != "
-                f"{self.dllm_config.block_size}"
-            )
         return parse_head_token_eviction(config, input_ids=self.origin_input_ids)
 
     def is_scoring_token_eviction(self: Req) -> bool:
@@ -212,6 +251,30 @@ class ReqDllmMixin:
             self.origin_input_ids = state.full_input_ids
         state.restart()
         self.dllm_algo_state = {"prompt_len": len(self.origin_input_ids), "step": 0}
+        self.dllm_incomplete_ids = array("q")
+        self.dllm_kv_indices = None
+
+    def reset_dllm_block_state(self: Req) -> None:
+        """Restart a retracted multi-block request with a full pass.
+
+        Committed blocks stay in ``output_ids``; the remaining canvas is
+        prefilled again together with the prompt.
+        """
+        self.dllm_block_position_shift = 0
+        state = self.dllm_algo_state
+        if not isinstance(state, dict) or "more_blocks" not in state:
+            return
+        for key in (
+            "more_blocks",
+            "block_stage",
+            "block_first_token",
+            "last_block_stage",
+            "canvas_len",
+            "dual_cache_ready",
+            "is_prefill",
+            "last_round_was_dual_cache",
+        ):
+            state.pop(key, None)
         self.dllm_incomplete_ids = array("q")
         self.dllm_kv_indices = None
 
@@ -250,8 +313,10 @@ class ReqDllmMixin:
         if not isinstance(custom_params, dict):
             return None
         config = custom_params.get("dllm_parallelcomp")
-        if not isinstance(config, dict):
+        if config is None:
             return None
+        if not isinstance(config, dict):
+            raise ValueError("dllm_parallelcomp must be an object")
         if not self.dllm_config.dual_cache:
             raise ValueError("dllm_parallelcomp requires Dream dual_cache")
         if not self.dllm_config.first_done_first_out_mode:
@@ -582,6 +647,13 @@ class ReqDllmMixin:
             remaining = max(
                 self.sampling_params.max_new_tokens - len(self.output_ids), 0
             )
+            if self.dllm_algo_state is not None:
+                # The model returns logits for the last canvas_len rows only;
+                # the default is one block.
+                if remaining == self.dllm_config.block_size:
+                    self.dllm_algo_state.pop("canvas_len", None)
+                else:
+                    self.dllm_algo_state["canvas_len"] = remaining
             self.dllm_block_offset = 0
             self.full_untruncated_fill_ids = (
                 self.origin_input_ids

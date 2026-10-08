@@ -42,6 +42,8 @@ from sglang.srt.dllm.head_token_eviction import (
     DllmHeadEvictionCapture,
     build_head_eviction_capture,
 )
+from sglang.srt.dllm.score_attention import parse_score_attention
+from sglang.srt.dllm.sparse_positions import parse_sparse_position_shift
 from sglang.srt.dllm.token_eviction import (
     DllmTokenEvictionCapture,
     build_token_eviction_capture,
@@ -855,6 +857,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         state.get("partial_draft", False)
                         and state.get("partial_draft_stage") == "prompt"
                     )
+                    # A finished block's last raw logit picks the first token
+                    # of the next block.
+                    use_raw_last |= state.get("block_stage") == "finalize"
                     raw_last_logits.append(use_raw_last)
                     canvas_lens.append(
                         1
@@ -2019,53 +2024,10 @@ def _parse_dream_score_attention(req) -> Optional[tuple]:
     if not isinstance(custom_params, dict):
         return None
 
-    raw_mask = custom_params.get("dream_score_attention_mask")
-    if raw_mask is None and custom_params.get("dream_causal_prompt_logprob") is True:
-        raw_mask = "causal"
-    if raw_mask is None:
-        return None
-    if not isinstance(raw_mask, str):
-        raise ValueError(
-            f"dream_score_attention_mask must be a string, got {type(raw_mask)}"
-        )
-    mask = raw_mask.lower()
-    if mask not in {"causal", "full"}:
-        raise ValueError(
-            "dream_score_attention_mask must be 'causal' or 'full', "
-            f"got {raw_mask!r}"
-        )
-    if mask == "causal":
-        return ("causal", None)
-
     origin_ids = getattr(req, "origin_input_ids", None)
-    seq_len = len(origin_ids) if origin_ids is not None else None
-
-    def _require_nonneg_int(name: str) -> int:
-        value = custom_params.get(name)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ValueError(
-                f"{name} must be a non-negative int for full Dream scoring"
-            )
-        return value
-
-    prefix_len = _require_nonneg_int("dream_score_prefix_len")
-    chunk_len = _require_nonneg_int("dream_score_chunk_len")
-    query_len = _require_nonneg_int("dream_score_query_len")
-    draft_len = (
-        _require_nonneg_int("dream_score_draft_len")
-        if "dream_score_draft_len" in custom_params
-        else 0
+    return parse_score_attention(
+        custom_params, input_len=len(origin_ids) if origin_ids is not None else None
     )
-    span_len = prefix_len + chunk_len + query_len + draft_len
-    if span_len <= 0:
-        raise ValueError("full Dream scoring spans must cover at least one token")
-    if seq_len is not None and span_len != seq_len:
-        raise ValueError(
-            "full Dream scoring spans do not cover the input: "
-            f"prefix={prefix_len}, chunk={chunk_len}, query={query_len}, "
-            f"draft={draft_len}, input={seq_len}"
-        )
-    return ("full", (prefix_len, chunk_len, query_len, draft_len))
 
 
 def _dllm_attention_override(
@@ -2193,7 +2155,12 @@ def _compute_dllm_positions(req) -> List[int]:
     if parallelcomp_positions is not None:
         return parallelcomp_positions
 
-    token_indices = range(req.extend_range.start, req.extend_range.end)
+    # A block being denoised sits behind the later blocks' mask KV in the
+    # request row; its positions are those of the natural canvas order.
+    block_shift = req.dllm_block_position_shift
+    token_indices = range(
+        req.extend_range.start - block_shift, req.extend_range.end - block_shift
+    )
     eviction = req.dllm_token_eviction_state
     if eviction is not None:
         if req.is_scoring_token_eviction():
@@ -2206,32 +2173,15 @@ def _compute_dllm_positions(req) -> List[int]:
                 eviction.full_token_index(index) for index in token_indices
             ]
 
-    custom_params = getattr(req.sampling_params, "custom_params", None)
-    if not isinstance(custom_params, dict):
-        return list(token_indices)
-
-    position_start = custom_params.get("dllm_position_start")
-    position_offset = custom_params.get("dllm_position_offset")
-    if position_start is None and position_offset is None:
-        return list(token_indices)
-    if (
-        not isinstance(position_start, int)
-        or isinstance(position_start, bool)
-        or not isinstance(position_offset, int)
-        or isinstance(position_offset, bool)
-    ):
-        raise ValueError("Dream sparse position start and offset must be integers")
     prompt_len = len(req.origin_input_ids)
     if eviction is not None and eviction.compacted:
         prompt_len = len(eviction.full_input_ids)
-    if not 0 <= position_start <= prompt_len:
-        raise ValueError(
-            f"Dream sparse position start is outside the prompt: {position_start}"
-        )
-    if position_offset < 0:
-        raise ValueError(
-            f"Dream sparse position offset must be non-negative: {position_offset}"
-        )
+    sparse_shift = parse_sparse_position_shift(
+        getattr(req.sampling_params, "custom_params", None), prompt_len=prompt_len
+    )
+    if sparse_shift is None:
+        return list(token_indices)
+    position_start, position_offset = sparse_shift
 
     return [
         position + position_offset if position >= position_start else position

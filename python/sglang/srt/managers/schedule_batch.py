@@ -1754,6 +1754,7 @@ class Req(ReqDllmMixin):
         self.reset_parallelcomp_prefill_state()
         self.reset_partial_draft_state()
         self.reset_token_eviction_state()
+        self.reset_dllm_block_state()
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None

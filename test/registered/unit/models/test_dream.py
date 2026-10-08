@@ -10,6 +10,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.algorithm.dream import Dream, sample_tokens
 from sglang.srt.dllm.algorithm.prefilling_dream import PrefillingDream
@@ -420,18 +421,21 @@ class TestDreamRequestCanvas(CustomTestCase):
             block_size=32,
             first_done_first_out_mode=True,
         )
-        with self.assertRaisesRegex(ValueError, "max_new_tokens=4"):
-            self._make_req(
-                config,
-                max_new_tokens=3,
-                custom_params={"dllm_partial_draft": {"rounds": 1}},
-            )
-        with self.assertRaisesRegex(ValueError, "rounds=1"):
-            self._make_req(
-                config,
-                max_new_tokens=4,
-                custom_params={"dllm_partial_draft": {"rounds": 2}},
-            )
+        # The scheduler answers a malformed request with HTTP 400, so the
+        # request records the reason instead of raising.
+        req = self._make_req(
+            config,
+            max_new_tokens=3,
+            custom_params={"dllm_partial_draft": {"rounds": 1}},
+        )
+        self.assertIn("max_new_tokens=4", req.dllm_request_error)
+        self.assertIsNone(req.dllm_partial_draft_state)
+        req = self._make_req(
+            config,
+            max_new_tokens=4,
+            custom_params={"dllm_partial_draft": {"rounds": 2}},
+        )
+        self.assertIn("rounds=1", req.dllm_request_error)
 
 
 class TestDreamAlgorithm(CustomTestCase):
@@ -1421,7 +1425,9 @@ class TestDreamSchedulerAdmission(CustomTestCase):
 
     def test_dream_fetch_uses_resolved_scheduler_capacity(self):
         scheduler = self._scheduler(_config(max_running_requests=1))
-        requests = [SimpleNamespace(rid=f"req-{i}") for i in range(4)]
+        requests = [
+            SimpleNamespace(rid=f"req-{i}", is_dllm=lambda: True) for i in range(4)
+        ]
         scheduler.waiting_queue = requests
 
         scheduler._fetch_waiting_reqs()
@@ -1438,7 +1444,9 @@ class TestDreamSchedulerAdmission(CustomTestCase):
             max_running_requests=1,
         )
         scheduler = self._scheduler(config)
-        scheduler.waiting_queue = [SimpleNamespace(rid=f"req-{i}") for i in range(4)]
+        scheduler.waiting_queue = [
+            SimpleNamespace(rid=f"req-{i}", is_dllm=lambda: True) for i in range(4)
+        ]
 
         scheduler._fetch_waiting_reqs()
 
@@ -1490,6 +1498,18 @@ class TestDreamSchedulerAdmission(CustomTestCase):
         )
 
 
+class _FakeScheduler(SchedulerDllmMixin):
+    """Carries the mixin's helper methods; the test sets the collaborators."""
+
+
+def _fake_scheduler(**attrs):
+    scheduler = _FakeScheduler()
+    scheduler.disaggregation_mode = DisaggregationMode.NULL
+    for name, value in attrs.items():
+        setattr(scheduler, name, value)
+    return scheduler
+
+
 class TestDreamFDFOResultProcessing(CustomTestCase):
     def test_unresolved_canvas_and_state_survive_scheduler_round(self):
         config = _config(
@@ -1507,7 +1527,7 @@ class TestDreamFDFOResultProcessing(CustomTestCase):
         )
         req.init_next_round_input()
 
-        scheduler = SimpleNamespace(
+        scheduler = _fake_scheduler(
             dllm_config=config,
             metrics_reporter=SimpleNamespace(
                 num_generated_tokens=0,
@@ -1585,7 +1605,7 @@ class TestDreamFDFOResultProcessing(CustomTestCase):
         req.init_next_round_input()
         self.assertEqual(list(req.full_untruncated_fill_ids), [10, 11])
 
-        scheduler = SimpleNamespace(
+        scheduler = _fake_scheduler(
             dllm_config=config,
             metrics_reporter=SimpleNamespace(
                 num_generated_tokens=0,
@@ -1708,7 +1728,7 @@ class TestDreamFDFOResultProcessing(CustomTestCase):
             False,
         ]
 
-        scheduler = SimpleNamespace(
+        scheduler = _fake_scheduler(
             dllm_config=config,
             metrics_reporter=SimpleNamespace(
                 num_generated_tokens=0,

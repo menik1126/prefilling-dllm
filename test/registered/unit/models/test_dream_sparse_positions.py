@@ -62,6 +62,7 @@ def test_sparse_query_positions_preserve_fixed_chunk_slots():
         origin_input_ids=list(range(7)),
         extend_range=SimpleNamespace(start=0, end=9),
         dllm_token_eviction_state=None,
+        dllm_block_position_shift=0,
     )
 
     assert _compute_dllm_positions(req) == [0, 1, 2, 3, 4, 8, 9, 10, 11]
@@ -73,6 +74,7 @@ def test_sparse_query_positions_default_to_contiguous():
         origin_input_ids=list(range(7)),
         extend_range=SimpleNamespace(start=2, end=6),
         dllm_token_eviction_state=None,
+        dllm_block_position_shift=0,
     )
 
     assert _compute_dllm_positions(req) == [2, 3, 4, 5]
@@ -84,6 +86,7 @@ def test_sparse_query_positions_reject_partial_metadata():
         origin_input_ids=list(range(7)),
         extend_range=SimpleNamespace(start=0, end=7),
         dllm_token_eviction_state=None,
+        dllm_block_position_shift=0,
     )
 
     with pytest.raises(ValueError, match="must be integers"):
@@ -1151,6 +1154,7 @@ def test_head_eviction_gives_each_head_its_own_tokens_and_keeps_rope_positions()
         origin_input_ids=input_ids,
         sampling_params=SimpleNamespace(custom_params=None),
         is_scoring_token_eviction=lambda: False,
+        dllm_block_position_shift=0,
     )
     ReqDllmMixin.compact_token_eviction_input_ids(req)
     assert list(req.origin_input_ids) == list(compact_input_ids(state, input_ids))
@@ -1331,6 +1335,7 @@ def test_decode_server_adopts_the_evicted_prompt_layout_without_scoring():
         origin_input_ids=input_ids,
         dllm_algo_state={"prompt_len": len(input_ids), "step": 0},
         dllm_phase=None,
+        dllm_block_position_shift=0,
         sampling_params=SimpleNamespace(custom_params=None),
         is_scoring_token_eviction=lambda: ReqDllmMixin.is_scoring_token_eviction(req),
     )
@@ -1395,17 +1400,16 @@ def test_score_requests_stay_plain_prefills_on_a_dllm_server():
     )
 
     dllm_config = SimpleNamespace(needs_full_prefill=True, max_running_requests=4)
-    score_req = SimpleNamespace(
-        sampling_params=score_params,
-        origin_input_ids=array("q", [1, 2, 3]),
-        _parse_parallelcomp_state=lambda: None,
-        _parse_partial_draft_state=lambda: None,
-        _parse_token_eviction_state=lambda: None,
-        is_scoring_token_eviction=lambda: False,
-    )
-    ReqDllmMixin.init_diffusion_llm(score_req, dllm_config)
+
+    class ScoreReq(ReqDllmMixin):
+        sampling_params = score_params
+        origin_input_ids = array("q", [1, 2, 3])
+
+    score_req = ScoreReq()
+    score_req.init_diffusion_llm(dllm_config)
     assert score_req.dllm_config is None
-    assert not ReqDllmMixin.is_dllm(score_req)
+    assert score_req.dllm_request_error is None
+    assert not score_req.is_dllm()
     assert score_req.dllm_phase is None and score_req.dllm_algo_state is None
 
     # The dLLM manager only takes generation requests; scoring requests wait
