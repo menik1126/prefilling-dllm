@@ -11,6 +11,12 @@ MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
+# Loading the script puts the repository root on sys.path.
+from prefilling_dllm.chunk_selection import (  # noqa: E402
+    mean_query_logprob,
+)
+from prefilling_dllm.client import PartialDraft  # noqa: E402
+
 
 def test_prompt_split():
     parts = MODULE.render_prompt_parts(
@@ -241,7 +247,7 @@ def test_partial_draft_preserves_all_slots_and_confirmed_mask():
 
     draft = client.partial_draft([1, 2], 4, rounds=1)
 
-    assert draft == MODULE.PartialDraft(
+    assert draft == PartialDraft(
         token_ids=[10, 151666, 12, 151666],
         confirmed_mask=[True, False, True, False],
     )
@@ -275,11 +281,11 @@ def test_partial_draft_batch_preserves_response_order():
     drafts = client.partial_draft_batch([[1], [2]], 4, rounds=1)
 
     assert drafts == [
-        MODULE.PartialDraft(
+        PartialDraft(
             token_ids=[10, 151666, 12, 151666],
             confirmed_mask=[True, False, True, False],
         ),
-        MODULE.PartialDraft(
+        PartialDraft(
             token_ids=[20, 21, 151666, 151666],
             confirmed_mask=[True, True, False, False],
         ),
@@ -463,7 +469,7 @@ def test_masked_mean_uses_trailing_target_positions_only():
         [-100.0, 151666, None],
     ]
     assert (
-        MODULE.mean_query_logprob(
+        mean_query_logprob(
             values,
             5,
             [True, True, False, True, False],
@@ -474,10 +480,10 @@ def test_masked_mean_uses_trailing_target_positions_only():
 
 def test_mean_query_logprob_rejects_missing_scored_target():
     with pytest.raises(ValueError, match="missing a scored target at offset 0"):
-        MODULE.mean_query_logprob([[None, 100, None]], 1)
+        mean_query_logprob([[None, 100, None]], 1)
 
     assert (
-        MODULE.mean_query_logprob(
+        mean_query_logprob(
             [[None, 100, None], [-2.0, 101, None]],
             2,
             [False, True],
@@ -784,7 +790,7 @@ def test_selection_only_writes_selector_artifacts_without_generation(
         ):
             self.partial_calls.append((input_ids, max_new_tokens, rounds))
             return [
-                MODULE.PartialDraft(
+                PartialDraft(
                     [30, 151666, 31, 151666],
                     [True, False, True, False],
                 )
@@ -887,7 +893,7 @@ def test_selection_only_writes_selector_artifacts_without_generation(
 
 def test_mean_query_logprob_rejects_empty_scoring_target():
     try:
-        MODULE.mean_query_logprob([[-1.0, 1, None]], 0)
+        mean_query_logprob([[-1.0, 1, None]], 0)
     except ValueError as error:
         assert str(error) == "expected_tokens must be positive"
     else:
