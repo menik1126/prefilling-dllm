@@ -308,6 +308,7 @@ def get_rope(
                     is_neox_style,
                     scaling_factor,
                     dtype,
+                    max_cached_positions=rope_scaling.get("max_cached_positions"),
                     **extra_kwargs,
                 )
         elif scaling_type == "deepseek_yarn":

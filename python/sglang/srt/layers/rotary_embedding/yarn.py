@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 
 
@@ -85,8 +86,12 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         truncate: bool = True,
         mscale: float = None,
         mscale_all_dim: float = None,
+        max_cached_positions: Optional[int] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
+        # Caps the cos/sin table below max_position_embeddings * scaling_factor
+        # rows; None keeps the full table.
+        self.max_cached_positions = max_cached_positions
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
@@ -136,11 +141,29 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
-        t = torch.arange(
-            self.max_position_embeddings * self.scaling_factor, dtype=torch.float32
-        )
+        num_positions = self.max_position_embeddings * self.scaling_factor
+        if self.max_cached_positions is not None:
+            num_positions = min(num_positions, self.max_cached_positions)
+        t = torch.arange(num_positions, dtype=torch.float32)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos() * self.mscale
         sin = freqs.sin() * self.mscale
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        """Grow the table past ``needed_max_pos`` with the YaRN frequencies."""
+        cur_len = int(self.cos_sin_cache.shape[0])
+        if needed_max_pos < cur_len:
+            return
+        align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+        new_len = ((needed_max_pos + align) // align) * align
+        device = self.cos_sin_cache.device
+        dtype = self.cos_sin_cache.dtype
+        inv_freq = self._compute_inv_freq(self.scaling_factor).to(device=device)
+        t_new = torch.arange(cur_len, new_len, dtype=inv_freq.dtype, device=device)
+        freqs = torch.einsum("i,j -> ij", t_new, inv_freq)
+        new_rows = torch.cat(
+            (freqs.cos() * self.mscale, freqs.sin() * self.mscale), dim=-1
+        ).to(dtype=dtype)
+        self.cos_sin_cache = torch.cat((self.cos_sin_cache, new_rows), dim=0)
